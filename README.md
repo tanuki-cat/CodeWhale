@@ -35,22 +35,18 @@ cargo install codewhale-tui --locked
 Every other path:
 
 ```bash
-# Docker
-docker pull ghcr.io/hmbown/codewhale:latest
-
 # Nix
 nix run github:Hmbown/CodeWhale
 
 # Windows
 scoop install codewhale        # or the NSIS installer from GitHub Releases
 
+# Docker (build from source; images are not auto-published to GHCR)
+docker build -t codewhale .
+
 # CNB mirror for users who cannot reliably reach GitHub
 cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.61 codewhale-cli --locked --force
 cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.61 codewhale-tui --locked --force
-
-# Legacy Homebrew compatibility while the formula is renamed
-brew tap Hmbown/deepseek-tui
-brew install deepseek-tui
 ```
 
 Prebuilt archives for every platform — including Linux riscv64 — are attached
@@ -109,9 +105,14 @@ rails are runtime mechanisms, not advice the model has to remember:
 - **Hooks v2** *(0.8.58)*. `tool_call_before` hooks return JSON
   `allow`/`deny`/`ask` decisions with deny-wins precedence, glob matchers, and
   project-local `.codewhale/hooks.toml`.
-- **Concurrent sub-agents with provider-aware routing** *(0.8.58)*. Parallel
-  investigation and implementation, with big/cheap model tiers resolved per
-  provider — no hardcoded model ids.
+- **Concurrent sub-agents with per-role model routing** *(0.8.61)*. Parallel
+  investigation and implementation with heterogeneous models per worker role —
+  verifiers can use a fast model while synthesis uses a large one, resolved per
+  provider.
+- **Durable goal mode** *(0.8.61)*. Cross-turn goal progress with token/time
+  accounting and a verifier-as-judge gate before a goal may complete.
+- **Constitution v4** *(0.8.61)*. Six articles, zero ceremony — the runtime
+  authority and safety rails live in the harness, not in the model's prompt.
 - **Durable sessions.** Forks, relay handoffs, and a cross-session
   disk-backed prompt cache that stays byte-stable across Plan/Agent/YOLO mode
   flips *(0.8.56)*. Turns survive system sleep *(0.8.57)*: suspend mid-stream,
@@ -119,8 +120,14 @@ rails are runtime mechanisms, not advice the model has to remember:
 - **Headless mode.** `codewhale exec` with `--allowed-tools`,
   `--disallowed-tools` (deny wins), `--max-turns`, and
   `--append-system-prompt` *(0.8.58)* for scripts and CI.
+- **Remote setup** *(0.8.61)*. `codewhale remote-setup` — guided cloud
+  deployment and chat-bridge (Telegram/Feishu) provisioning in one command.
 - **Embedded everywhere.** HTTP/SSE and ACP runtime APIs, a VS Code extension
   (Phase 0), and Telegram/Feishu bridges.
+- **Provider balance query** *(0.8.61)*. `/balance` and `codewhale balance` query
+  the active provider's account credits over the network — DeepSeek surfaces
+  granted promotional credit, OpenRouter reports total credits. The footer chip
+  shows live balance at a glance.
 - **Daily-driver polish.** MCP client *and* server, reusable skills, 7-locale
   localization (approval dialogs included since 0.8.56), and speech/TTS via
   Xiaomi MiMo.
@@ -150,8 +157,8 @@ system prompt's model facts are templated per-model instead of hardcoded
 registry — credentials, base URLs, capability boundaries — lives in
 [docs/PROVIDERS.md](docs/PROVIDERS.md).
 
-The version tags above mark what landed in the last three releases
-(0.8.56 → 0.8.58). Full details in [CHANGELOG.md](CHANGELOG.md).
+The version tags above mark what landed in the last several releases
+(0.8.56 → 0.8.61). Full details in [CHANGELOG.md](CHANGELOG.md).
 
 ## The Idea
 
