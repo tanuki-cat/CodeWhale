@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Package/release version to publish to npm, without the leading v'
+        description: 'Release version tag (without the leading v)'
         required: true
         type: string
 
@@ -384,76 +384,8 @@ jobs:
           path: scripts/installer/CodeWhaleSetup.exe
           if-no-files-found: error
 
-  docker:
-    needs: [build, resolve]
-    if: ${{ !cancelled() && needs.build.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Checkout release source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.resolve.outputs.source_ref }}
-          path: source
-      - name: Checkout release infrastructure
-        uses: actions/checkout@v4
-        with:
-          path: infra
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Normalize image name
-        id: image
-        shell: bash
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ${{ steps.image.outputs.name }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern=v{{major}}
-            type=ref,event=tag
-            type=semver,pattern={{version}},value=${{ needs.resolve.outputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve.outputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=semver,pattern=v{{major}},value=${{ needs.resolve.outputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=v${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=latest
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        env:
-          # The build record is useful in CI, but it is uploaded as a
-          # `.dockerbuild` artifact. The release job intentionally downloads
-          # all binary artifacts, so suppress the extra record artifact there.
-          DOCKER_BUILD_RECORD_UPLOAD: false
-          DOCKER_BUILD_SUMMARY: false
-        with:
-          context: source
-          file: infra/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          build-args: |
-            DEEPSEEK_BUILD_SHA=${{ needs.resolve.outputs.sha }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
   release:
-    needs: [build, bundle, windows-installer, docker, resolve]
+    needs: [build, bundle, windows-installer, resolve]
     if: ${{ !cancelled() && needs.build.result == 'success' && needs.bundle.result == 'success' && needs.windows-installer.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
@@ -512,50 +444,8 @@ jobs:
           prerelease: false
           body_path: release-body.md
 
-  homebrew:
-    needs: [release, resolve]
-    if: ${{ !cancelled() && needs.release.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Check Homebrew tap token
-        id: homebrew-token
-        env:
-          TOKEN: ${{ secrets.HOMEBREW_TAP_PAT || secrets.RELEASE_TAG_PAT }}
-        run: |
-          if [ -z "${TOKEN:-}" ]; then
-            echo "No Homebrew tap token configured; skipping tap update."
-            echo "available=false" >> "${GITHUB_OUTPUT}"
-          else
-            echo "available=true" >> "${GITHUB_OUTPUT}"
-          fi
-      # Checkout main (not the tag) so the release-infra script is always
-      # available, even for tags created before this workflow was added.
-      - uses: actions/checkout@v4
-        if: steps.homebrew-token.outputs.available == 'true'
-        with:
-          ref: main
-      - name: Download checksum manifest
-        if: steps.homebrew-token.outputs.available == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release download ${{ needs.resolve.outputs.tag }} \
-            --repo ${{ github.repository }} \
-            --pattern 'codewhale-artifacts-sha256.txt' \
-            --dir /tmp
-      - name: Update Homebrew tap
-        if: steps.homebrew-token.outputs.available == 'true'
-        env:
-          TAG: ${{ needs.resolve.outputs.tag }}
-          MANIFEST: /tmp/codewhale-artifacts-sha256.txt
-          TAP_REPO: Hmbown/homebrew-deepseek-tui
-          TOKEN: ${{ secrets.HOMEBREW_TAP_PAT || secrets.RELEASE_TAG_PAT }}
-        run: bash .github/scripts/update-homebrew-tap.sh
-
-# npm publish is intentionally not automated. The npm account requires 2FA OTP
-# on every publish, and a granular automation token that bypasses 2FA has not
-# been provisioned. Release the npm wrapper manually from a developer machine
-# after the GitHub Release has been created — see CLAUDE.md "Releases" for the
-# exact commands.
+# npm, Homebrew, and Docker publishing are intentionally excluded from CI.
+# npm requires 2FA OTP, Homebrew is a third-party distribution channel, and
+# Docker images are not needed for personal use. Publish to these registries
+# manually from a developer machine after the GitHub Release is created —
+# see CLAUDE.md "Releases" for the exact commands.
