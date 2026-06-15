@@ -5372,6 +5372,10 @@ pub enum AppAction {
     SendMessage(String),
     ListSubAgents,
     FetchModels,
+    /// Query the active provider's account balance / credits over the network
+    /// and print the result to the conversation. Handled in the UI event loop
+    /// where the live `Config` supplies provider credentials.
+    FetchBalance,
     CacheWarmup,
     /// Switch the active LLM backend (DeepSeek vs NVIDIA NIM) without
     /// restarting the process. The runtime rebuilds its API client from

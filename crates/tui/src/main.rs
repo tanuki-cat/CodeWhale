@@ -250,6 +250,8 @@ enum Commands {
     Logout,
     /// List available models from the configured API endpoint
     Models(ModelsArgs),
+    /// Show the configured provider's account balance / credits
+    Balance(BalanceArgs),
     /// Generate speech audio with Xiaomi MiMo TTS models
     #[command(visible_alias = "tts")]
     Speech(SpeechArgs),
@@ -711,6 +713,13 @@ struct ModelsArgs {
     json: bool,
 }
 
+#[derive(Args, Debug, Clone, Default)]
+struct BalanceArgs {
+    /// Print the balance as JSON
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
 #[derive(Args, Debug, Clone)]
 struct SpeechArgs {
     /// Text to synthesize. This is sent as the assistant message content.
@@ -1125,6 +1134,10 @@ async fn main() -> Result<()> {
             Commands::Models(args) => {
                 let config = load_config_from_cli(&cli)?;
                 run_models(&config, args).await
+            }
+            Commands::Balance(args) => {
+                let config = load_config_from_cli(&cli)?;
+                run_balance(&config, args).await
             }
             Commands::Speech(args) => {
                 let config = load_config_from_cli(&cli)?;
@@ -4274,6 +4287,53 @@ async fn run_models(config: &Config, args: ModelsArgs) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn run_balance(config: &Config, args: BalanceArgs) -> Result<()> {
+    let provider = config.api_provider();
+    if crate::pricing::balance_endpoint(provider).is_none() {
+        anyhow::bail!(
+            "Balance check is not supported for {} yet. Check the provider dashboard.",
+            provider.display_name()
+        );
+    }
+    let api_key = config.deepseek_api_key().unwrap_or_default();
+    if api_key.is_empty() {
+        anyhow::bail!(
+            "No API key configured for {}. Set one with `codewhale login` or in ~/.codewhale.",
+            provider.display_name()
+        );
+    }
+    let base_url = config.deepseek_base_url();
+
+    let balance = crate::pricing::fetch_provider_balance(provider, &api_key, &base_url)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to query balance from {}: {err}",
+                provider.display_name()
+            )
+        })?;
+
+    if args.json {
+        let value = serde_json::json!({
+            "provider": balance.provider_label,
+            "amount": balance.amount,
+            "currency_symbol": balance.currency_symbol,
+            "detail": balance.detail,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!(
+        "{} balance: {}{:.2}",
+        balance.provider_label, balance.currency_symbol, balance.amount
+    );
+    if let Some(detail) = balance.detail {
+        println!("{detail}");
+    }
     Ok(())
 }
 

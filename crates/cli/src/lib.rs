@@ -156,6 +156,8 @@ enum Commands {
     Doctor(TuiPassthroughArgs),
     /// List live provider API models via the TUI binary.
     Models(TuiPassthroughArgs),
+    /// Show the configured provider's account balance / credits via the TUI binary.
+    Balance(TuiPassthroughArgs),
     /// Generate speech audio with Xiaomi MiMo TTS models via the TUI binary.
     #[command(visible_alias = "tts")]
     Speech(TuiPassthroughArgs),
@@ -618,6 +620,10 @@ fn run() -> Result<()> {
         Some(Commands::Models(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("models", args))
+        }
+        Some(Commands::Balance(args)) => {
+            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            delegate_to_tui(&cli, &resolved_runtime, tui_args("balance", args))
         }
         Some(Commands::Speech(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);

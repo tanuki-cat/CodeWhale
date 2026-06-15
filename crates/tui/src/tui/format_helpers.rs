@@ -74,9 +74,49 @@ pub(super) fn available_models_message(current_model: &str, models: &[String]) -
     lines.join("\n")
 }
 
+/// Render the response body for `/balance` — the active provider's remaining
+/// balance / credits, with an optional usage breakdown on a second line.
+pub(super) fn balance_message(balance: &crate::pricing::ProviderBalance) -> String {
+    let main = format!(
+        "{} balance: {}{:.2}",
+        balance.provider_label, balance.currency_symbol, balance.amount
+    );
+    match &balance.detail {
+        Some(detail) => format!("{main}\n{detail}"),
+        None => main,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balance_message_renders_amount_and_detail() {
+        let balance = crate::pricing::ProviderBalance {
+            provider_label: "OpenRouter".to_string(),
+            amount: 6.75,
+            currency_symbol: "$",
+            detail: Some("used $3.25 of $10.00".to_string()),
+            footer_info: None,
+        };
+        let msg = balance_message(&balance);
+        assert!(msg.contains("OpenRouter balance: $6.75"), "got: {msg}");
+        assert!(msg.contains("used $3.25 of $10.00"), "got: {msg}");
+    }
+
+    #[test]
+    fn balance_message_without_detail_is_single_line() {
+        let balance = crate::pricing::ProviderBalance {
+            provider_label: "DeepSeek".to_string(),
+            amount: 57.73,
+            currency_symbol: "¥",
+            detail: None,
+            footer_info: None,
+        };
+        let msg = balance_message(&balance);
+        assert_eq!(msg, "DeepSeek balance: ¥57.73");
+    }
 
     #[test]
     fn available_models_message_marks_current_model() {

@@ -3,10 +3,14 @@
 //! Pricing is stored per million tokens. DeepSeek/Xiaomi MiMo rows include
 //! their published CNY rates; OpenRouter-curated rows are USD-only.
 
+use std::sync::LazyLock;
+use std::time::Duration;
+
 #[cfg(test)]
 use chrono::TimeZone;
 use chrono::{DateTime, Utc};
 
+use crate::config::ApiProvider;
 use crate::models::Usage;
 
 /// Cost display currency.
@@ -69,7 +73,7 @@ pub struct BalanceResponse {
 }
 
 /// Per-currency balance entry from the balance API.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 pub struct BalanceInfo {
     pub currency: String,
     #[serde(default)]
@@ -78,7 +82,6 @@ pub struct BalanceInfo {
     #[allow(dead_code)]
     pub topped_up_balance: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub granted_balance: String,
 }
 
@@ -89,6 +92,208 @@ impl BalanceInfo {
     pub fn total_balance_f64(&self) -> Option<f64> {
         self.total_balance.parse::<f64>().ok()
     }
+
+    /// Parse the `granted_balance` (promotional credit) field as an f64.
+    /// Returns `None` on parse failure or empty string.
+    #[must_use]
+    pub fn granted_balance_f64(&self) -> Option<f64> {
+        self.granted_balance.parse::<f64>().ok()
+    }
+}
+
+// === Provider-agnostic balance (for the `/balance` command) ===
+
+/// Normalized balance result for the `/balance` slash command.
+///
+/// Providers expose account balance / credits through differently shaped
+/// APIs (DeepSeek `/user/balance`, OpenRouter `/credits`, …). This type is the
+/// common shape the command renders and, for DeepSeek, also carries the raw
+/// [`BalanceInfo`] so the same fetch can refresh the footer balance chip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderBalance {
+    /// Human-friendly provider label, e.g. "DeepSeek".
+    pub provider_label: String,
+    /// Remaining balance / credits, in the provider's currency.
+    pub amount: f64,
+    /// Display currency symbol ("$" or "¥").
+    pub currency_symbol: &'static str,
+    /// Optional one-line breakdown, e.g. "used $1.20 of $5.00".
+    pub detail: Option<String>,
+    /// Raw DeepSeek balance entry, so the command can also refresh the footer
+    /// chip cache. `None` for non-DeepSeek providers.
+    pub footer_info: Option<BalanceInfo>,
+}
+
+/// Which balance/credit API dialect a provider speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BalanceApiKind {
+    /// DeepSeek `GET {origin}/user/balance` (always at the host root, even when
+    /// the chat base URL is suffixed with `/beta` or `/v1`).
+    DeepSeek,
+    /// OpenRouter `GET {base}/credits` (relative to the versioned `/api/v1`
+    /// base URL).
+    OpenRouter,
+}
+
+/// Endpoint description for a provider's balance API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalanceEndpoint {
+    /// Path appended to the resolved base URL (see [`BalanceApiKind`] for how
+    /// the base is treated per provider).
+    pub path: &'static str,
+    pub kind: BalanceApiKind,
+}
+
+/// Map a provider to its balance endpoint, or `None` when the provider has no
+/// supported balance API (local servers, dashboard-only billing, …).
+#[must_use]
+pub fn balance_endpoint(provider: ApiProvider) -> Option<BalanceEndpoint> {
+    match provider {
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN => Some(BalanceEndpoint {
+            path: "/user/balance",
+            kind: BalanceApiKind::DeepSeek,
+        }),
+        ApiProvider::Openrouter => Some(BalanceEndpoint {
+            path: "/credits",
+            kind: BalanceApiKind::OpenRouter,
+        }),
+        _ => None,
+    }
+}
+
+/// OpenRouter `GET /api/v1/credits` response: `{ data: { total_credits,
+/// total_usage } }`. Remaining credits are `total_credits - total_usage`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct OpenRouterCreditsResponse {
+    #[serde(default)]
+    pub data: OpenRouterCredits,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct OpenRouterCredits {
+    #[serde(default)]
+    pub total_credits: f64,
+    #[serde(default)]
+    pub total_usage: f64,
+}
+
+/// Parse a DeepSeek `/user/balance` body into a [`ProviderBalance`].
+///
+/// Returns `None` when the body is not valid JSON or has no balance entries.
+#[must_use]
+pub fn parse_deepseek_balance(label: &str, body: &[u8]) -> Option<ProviderBalance> {
+    let parsed: BalanceResponse = serde_json::from_slice(body).ok()?;
+    let info = parsed.balance_infos.into_iter().next()?;
+    let amount = info.total_balance_f64().unwrap_or(0.0);
+    let currency_symbol = match info.currency.as_str() {
+        "CNY" | "cny" => "¥",
+        _ => "$",
+    };
+    // Surface promotional (granted) credit when present; the common
+    // all-topped-up case (granted 0.00) stays a clean single line.
+    let detail = match info.granted_balance_f64() {
+        Some(granted) if granted > 0.0 => {
+            Some(format!("incl. {currency_symbol}{granted:.2} granted"))
+        }
+        _ => None,
+    };
+    Some(ProviderBalance {
+        provider_label: label.to_string(),
+        amount,
+        currency_symbol,
+        detail,
+        footer_info: Some(info),
+    })
+}
+
+/// Parse an OpenRouter `/credits` body into a [`ProviderBalance`].
+#[must_use]
+pub fn parse_openrouter_balance(label: &str, body: &[u8]) -> Option<ProviderBalance> {
+    let parsed: OpenRouterCreditsResponse = serde_json::from_slice(body).ok()?;
+    let remaining = parsed.data.total_credits - parsed.data.total_usage;
+    Some(ProviderBalance {
+        provider_label: label.to_string(),
+        amount: remaining,
+        currency_symbol: "$",
+        detail: Some(format!(
+            "used ${:.2} of ${:.2}",
+            parsed.data.total_usage, parsed.data.total_credits
+        )),
+        footer_info: None,
+    })
+}
+
+/// Shared `reqwest::Client` for balance fetches so connection pools are reused
+/// across the footer poll, the `/balance` slash command, and the CLI.
+static BALANCE_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    crate::tls::reqwest_client_builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default()
+});
+
+/// Reduce a chat base URL to its `scheme://host[:port]` origin, dropping any
+/// path suffix such as `/beta` or `/v1`. DeepSeek's balance endpoint lives at
+/// the host root regardless of the chat base path, so building the balance URL
+/// from the raw base (e.g. `https://api.deepseek.com/beta`) would 404.
+fn balance_origin(base_url: &str) -> String {
+    match base_url.find("://") {
+        Some(scheme_end) => {
+            let after = scheme_end + 3;
+            let host = &base_url[after..];
+            let host_end = host.find('/').unwrap_or(host.len());
+            format!("{}{}", &base_url[..after], &host[..host_end])
+        }
+        None => base_url.trim_end_matches('/').to_string(),
+    }
+}
+
+/// Fetch the active provider's account balance / credits over the network.
+///
+/// Returns `Err(message)` on any failure (unsupported provider, network, auth,
+/// parse). Shared by the footer balance chip, the `/balance` slash command, and
+/// the `balance` CLI subcommand. DeepSeek balance is read from the host-root
+/// `/user/balance`; OpenRouter credits from the versioned `/credits` endpoint.
+pub async fn fetch_provider_balance(
+    provider: ApiProvider,
+    api_key: &str,
+    base_url: &str,
+) -> Result<ProviderBalance, String> {
+    let endpoint = balance_endpoint(provider)
+        .ok_or_else(|| "balance API is not supported for this provider".to_string())?;
+    let url = match endpoint.kind {
+        BalanceApiKind::DeepSeek => format!("{}{}", balance_origin(base_url), endpoint.path),
+        BalanceApiKind::OpenRouter => format!(
+            "{}/{}",
+            base_url.trim_end_matches('/'),
+            endpoint.path.trim_start_matches('/')
+        ),
+    };
+    let response = BALANCE_CLIENT
+        .get(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+        .map_err(|err| format!("request failed: {err}"))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| format!("reading response failed: {err}"))?;
+    if !status.is_success() {
+        tracing::debug!(
+            "balance API returned {}: {}",
+            status.as_u16(),
+            String::from_utf8_lossy(&bytes)
+        );
+        return Err(format!("provider returned HTTP {}", status.as_u16()));
+    }
+    let label = provider.display_name();
+    let parsed = match endpoint.kind {
+        BalanceApiKind::DeepSeek => parse_deepseek_balance(label, &bytes),
+        BalanceApiKind::OpenRouter => parse_openrouter_balance(label, &bytes),
+    };
+    parsed.ok_or_else(|| "could not parse the provider balance response".to_string())
 }
 
 /// Per-million-token pricing for a model.
@@ -653,5 +858,104 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(info.total_balance_f64(), None);
+    }
+
+    // ── Provider-agnostic balance ──────────────────────────────────
+
+    #[test]
+    fn balance_endpoint_maps_supported_providers() {
+        assert_eq!(
+            balance_endpoint(ApiProvider::Deepseek).map(|e| e.kind),
+            Some(BalanceApiKind::DeepSeek)
+        );
+        assert_eq!(
+            balance_endpoint(ApiProvider::DeepseekCN).map(|e| e.kind),
+            Some(BalanceApiKind::DeepSeek)
+        );
+        assert_eq!(
+            balance_endpoint(ApiProvider::Openrouter).map(|e| e.kind),
+            Some(BalanceApiKind::OpenRouter)
+        );
+        assert!(balance_endpoint(ApiProvider::Ollama).is_none());
+        assert!(balance_endpoint(ApiProvider::Novita).is_none());
+    }
+
+    #[test]
+    fn parse_deepseek_balance_extracts_first_entry() {
+        let body = br#"{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"57.73","granted_balance":"0.00","topped_up_balance":"57.73"}]}"#;
+        let balance = parse_deepseek_balance("DeepSeek", body).expect("parsed");
+        assert_eq!(balance.provider_label, "DeepSeek");
+        assert_eq!(balance.amount, 57.73);
+        assert_eq!(balance.currency_symbol, "¥");
+        assert!(balance.footer_info.is_some());
+    }
+
+    #[test]
+    fn parse_deepseek_balance_surfaces_granted_credit() {
+        let body = br#"{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"110.00","granted_balance":"10.00","topped_up_balance":"100.00"}]}"#;
+        let balance = parse_deepseek_balance("DeepSeek", body).expect("parsed");
+        assert_eq!(balance.amount, 110.00);
+        assert_eq!(balance.currency_symbol, "¥");
+        assert_eq!(balance.detail.as_deref(), Some("incl. ¥10.00 granted"));
+    }
+
+    #[test]
+    fn parse_deepseek_balance_hides_zero_granted_credit() {
+        let body = br#"{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"57.73","granted_balance":"0.00","topped_up_balance":"57.73"}]}"#;
+        let balance = parse_deepseek_balance("DeepSeek", body).expect("parsed");
+        assert_eq!(balance.amount, 57.73);
+        assert!(balance.detail.is_none());
+    }
+
+    #[test]
+    fn parse_deepseek_balance_usd_uses_dollar_symbol() {
+        let body = br#"{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"12.50"}]}"#;
+        let balance = parse_deepseek_balance("DeepSeek", body).expect("parsed");
+        assert_eq!(balance.currency_symbol, "$");
+        assert_eq!(balance.amount, 12.50);
+    }
+
+    #[test]
+    fn parse_deepseek_balance_rejects_empty_list() {
+        let body = br#"{"is_available":false,"balance_infos":[]}"#;
+        assert!(parse_deepseek_balance("DeepSeek", body).is_none());
+    }
+
+    #[test]
+    fn parse_openrouter_balance_computes_remaining() {
+        let body = br#"{"data":{"total_credits":10.0,"total_usage":3.25}}"#;
+        let balance = parse_openrouter_balance("OpenRouter", body).expect("parsed");
+        assert_eq!(balance.provider_label, "OpenRouter");
+        assert!((balance.amount - 6.75).abs() < 1e-9);
+        assert_eq!(balance.currency_symbol, "$");
+        assert_eq!(balance.detail.as_deref(), Some("used $3.25 of $10.00"));
+        assert!(balance.footer_info.is_none());
+    }
+
+    #[test]
+    fn parse_openrouter_balance_rejects_garbage() {
+        assert!(parse_openrouter_balance("OpenRouter", b"not json").is_none());
+    }
+
+    #[test]
+    fn balance_origin_strips_path_suffix() {
+        // DeepSeek default base ends in /beta; balance lives at the host root.
+        assert_eq!(
+            balance_origin("https://api.deepseek.com/beta"),
+            "https://api.deepseek.com"
+        );
+        assert_eq!(
+            balance_origin("https://api.deepseek.com/v1/"),
+            "https://api.deepseek.com"
+        );
+        assert_eq!(
+            balance_origin("https://api.deepseek.com"),
+            "https://api.deepseek.com"
+        );
+        // Host with port is preserved.
+        assert_eq!(
+            balance_origin("http://localhost:8000/v1"),
+            "http://localhost:8000"
+        );
     }
 }

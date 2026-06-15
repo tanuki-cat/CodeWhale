@@ -1056,19 +1056,21 @@ mod tests {
     }
 
     #[test]
-    fn balance_command_reports_scaffold_without_claiming_dispatch() {
+    fn balance_command_dispatches_fetch_for_supported_provider() {
         let mut app = create_test_app();
         app.api_provider = ApiProvider::Deepseek;
 
         let result = execute("/balance", &mut app);
-        let msg = result
-            .message
-            .expect("balance scaffold should explain current state");
 
+        // DeepSeek balance is wired: the command hands off to the UI event
+        // loop (where the live Config supplies credentials) via FetchBalance,
+        // instead of printing a scaffold message.
         assert!(!result.is_error);
-        assert!(msg.contains("DeepSeek"));
-        assert!(msg.contains("not wired"));
-        assert!(!msg.contains("sent"));
+        assert!(matches!(
+            result.action,
+            Some(crate::tui::app::AppAction::FetchBalance)
+        ));
+        assert!(result.message.is_none());
     }
 
     #[test]

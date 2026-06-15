@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::{
-    Arc, LazyLock,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -1284,42 +1284,19 @@ fn active_rlm_task_entries(app: &App) -> Vec<TaskPanelEntry> {
 /// Minimum interval between balance API fetches to avoid flooding.
 const BALANCE_FETCH_COOLDOWN: Duration = Duration::from_secs(60);
 
-/// Shared `reqwest::Client` for balance fetches so connection pools are
-/// reused across successive background polls.
-static BALANCE_CLIENT: LazyLock<::reqwest::Client> = LazyLock::new(|| {
-    crate::tls::reqwest_client_builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_default()
-});
-
-/// Fetch the DeepSeek account balance from the balance API.
+/// Fetch the DeepSeek account balance for the footer chip.
 ///
-/// Returns `None` on any error (network, auth, parse) — callers should treat
-/// a `None` return as "balance unknown" and keep the previous value.
+/// Returns `None` on any error — callers treat that as "balance unknown" and
+/// keep the previous value. Thin wrapper over
+/// [`crate::pricing::fetch_provider_balance`].
 async fn fetch_deepseek_balance(
     api_key: &str,
     base_url: &str,
 ) -> Option<crate::pricing::BalanceInfo> {
-    let url = format!("{}/user/balance", base_url.trim_end_matches('/'));
-    let client = &*BALANCE_CLIENT;
-    let response = client
-        .get(url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .send()
+    crate::pricing::fetch_provider_balance(ApiProvider::Deepseek, api_key, base_url)
         .await
-        .ok()?;
-    if !response.status().is_success() {
-        tracing::debug!(
-            "balance API returned {}: {}",
-            response.status().as_u16(),
-            response.text().await.unwrap_or_default()
-        );
-        return None;
-    }
-    let body: crate::pricing::BalanceResponse = response.json().await.ok()?;
-    // Return the first balance entry (typically the user's primary currency).
-    body.balance_infos.into_iter().next()
+        .ok()?
+        .footer_info
 }
 
 fn should_fetch_deepseek_balance(app: &App) -> bool {
@@ -6836,6 +6813,48 @@ async fn apply_command_result(
                                 config.api_provider().display_name()
                             ),
                         });
+                    }
+                }
+            }
+            AppAction::FetchBalance => {
+                let provider = app.api_provider;
+                app.status_message = Some("Querying balance…".to_string());
+                let api_key = config.deepseek_api_key().unwrap_or_default();
+                let base_url = config.deepseek_base_url();
+                if api_key.is_empty() {
+                    app.add_message(HistoryCell::System {
+                        content: format!(
+                            "No API key configured for {}. Set one with /provider or in ~/.codewhale.",
+                            provider.display_name()
+                        ),
+                    });
+                    app.status_message = Some("Balance unavailable".to_string());
+                } else {
+                    match crate::pricing::fetch_provider_balance(provider, &api_key, &base_url)
+                        .await
+                    {
+                        Ok(balance) => {
+                            // Refresh the footer chip cache too (DeepSeek only).
+                            if let Some(info) = balance.footer_info.clone()
+                                && let Ok(mut guard) = app.balance_cell.lock()
+                            {
+                                *guard = Some(info);
+                            }
+                            app.last_balance_fetch = Some(Instant::now());
+                            app.add_message(HistoryCell::System {
+                                content: format_helpers::balance_message(&balance),
+                            });
+                            app.status_message = Some("Balance updated".to_string());
+                        }
+                        Err(error) => {
+                            app.add_message(HistoryCell::System {
+                                content: format!(
+                                    "Failed to query balance from {}: {error}",
+                                    provider.display_name()
+                                ),
+                            });
+                            app.status_message = Some("Balance query failed".to_string());
+                        }
                     }
                 }
             }
