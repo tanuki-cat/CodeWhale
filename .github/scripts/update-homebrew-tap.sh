@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Update the Homebrew tap at Hmbown/homebrew-deepseek-tui after a release.
+# Update the Homebrew tap at tanuki-cat/homebrew-codewhale after a release.
 #
 # Expected environment:
 #   TAG       – git tag, e.g. "v0.8.31"
@@ -52,12 +52,12 @@ trap 'rm -rf "${TAP_DIR}" "${FORMULA_FILE}"' EXIT
 
 # --- generate formula --------------------------------------------------
 
-readonly BASE_URL="https://github.com/Hmbown/CodeWhale/releases/download/${TAG}"
+readonly BASE_URL="https://github.com/tanuki-cat/CodeWhale/releases/download/${TAG}"
 
 cat > "${FORMULA_FILE}" << EOF
-class DeepseekTui < Formula
-  desc "Terminal-native coding agent for DeepSeek V4"
-  homepage "https://github.com/Hmbown/CodeWhale"
+class Codewhale < Formula
+  desc "Terminal-native coding agent for any model — open models first"
+  homepage "https://github.com/tanuki-cat/CodeWhale"
   version "${VERSION}"
   license "MIT"
 
@@ -116,13 +116,13 @@ TAP_URL="https://x-access-token:${ENCODED_TOKEN}@github.com/${TAP_REPO}.git"
 git clone --depth 1 "${TAP_URL}" "${TAP_DIR}"
 
 mkdir -p "${TAP_DIR}/Formula"
-cp "${FORMULA_FILE}" "${TAP_DIR}/Formula/deepseek-tui.rb"
+cp "${FORMULA_FILE}" "${TAP_DIR}/Formula/codewhale.rb"
 
 cd "${TAP_DIR}"
 git config user.name  "github-actions[bot]"
 git config user.email "github-actions[bot]@users.noreply.github.com"
 
-git add Formula/deepseek-tui.rb
+git add Formula/codewhale.rb
 
 if git diff --cached --quiet; then
   echo "Formula unchanged (already at ${VERSION}); nothing to push."
