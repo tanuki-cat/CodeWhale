@@ -62,4 +62,4 @@ jobs:
           MANIFEST: /tmp/codewhale-artifacts-sha256.txt
           TAP_REPO: tanuki-cat/homebrew-codewhale
           TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: .github/scripts/update-homebrew-tap.sh
+        run: bash .github/scripts/update-homebrew-tap.sh
