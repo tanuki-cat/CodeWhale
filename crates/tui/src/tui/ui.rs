@@ -48,7 +48,7 @@ use crate::client::{
 use crate::commands;
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::config::{
-    ApiProvider, Config, DEFAULT_NVIDIA_NIM_BASE_URL, ProviderConfig, ProvidersConfig, StatusItem,
+    ApiProvider, Config, DEFAULT_NVIDIA_NIM_BASE_URL, ProviderConfig, ProvidersConfig,
     UpdateConfig, provider_capability, save_provider_auth_mode_for,
 };
 use crate::config_ui::{self, ConfigUiMode, WebConfigSession, WebConfigSessionEvent};
@@ -1281,9 +1281,6 @@ fn active_rlm_task_entries(app: &App) -> Vec<TaskPanelEntry> {
         .collect()
 }
 
-/// Minimum interval between balance API fetches to avoid flooding.
-const BALANCE_FETCH_COOLDOWN: Duration = Duration::from_secs(60);
-
 /// Fetch the DeepSeek account balance for the footer chip.
 ///
 /// Returns `None` on any error — callers treat that as "balance unknown" and
@@ -1300,11 +1297,12 @@ async fn fetch_deepseek_balance(
 }
 
 fn should_fetch_deepseek_balance(app: &App) -> bool {
-    app.status_items.contains(&StatusItem::Balance)
-        && matches!(
-            app.api_provider,
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN
-        )
+    // Always fetch balance for DeepSeek providers — it is now shown inline
+    // after the session cost in the status line, not only as a separate chip.
+    matches!(
+        app.api_provider,
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2185,12 +2183,8 @@ async fn run_event_loop(
                         persistence_actor::persist(PersistRequest::ClearCheckpoint);
 
                         // Refresh DeepSeek account balance after each completed
-                        // turn so the footer balance chip stays current without
-                        // adding latency to any request path.
-                        let balance_cooldown_expired = app
-                            .last_balance_fetch
-                            .is_none_or(|t| t.elapsed() >= BALANCE_FETCH_COOLDOWN);
-                        if balance_cooldown_expired && should_fetch_deepseek_balance(app) {
+                        // turn so the cost chip shows the latest balance.
+                        if should_fetch_deepseek_balance(app) {
                             let cell = app.balance_cell.clone();
                             let api_key = config.deepseek_api_key().unwrap_or_default();
                             let base_url = config.deepseek_base_url();
@@ -6904,10 +6898,7 @@ async fn apply_command_result(
             AppAction::SwitchProvider { provider, model } => {
                 switch_provider(app, engine_handle, config, provider, model).await;
                 // Refresh balance after provider switch.
-                let balance_cooldown_expired = app
-                    .last_balance_fetch
-                    .is_none_or(|t| t.elapsed() >= BALANCE_FETCH_COOLDOWN);
-                if balance_cooldown_expired && should_fetch_deepseek_balance(app) {
+                if should_fetch_deepseek_balance(app) {
                     let cell = app.balance_cell.clone();
                     let api_key = config.deepseek_api_key().unwrap_or_default();
                     let base_url = config.deepseek_base_url();

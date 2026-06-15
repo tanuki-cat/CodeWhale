@@ -9229,21 +9229,21 @@ fn render_footer_from_without_balance_item_hides_balance() {
 }
 
 #[test]
-fn should_fetch_deepseek_balance_requires_balance_status_item() {
+fn should_fetch_deepseek_balance_independent_of_status_items() {
     let mut app = create_test_app();
     app.api_provider = ApiProvider::Deepseek;
+    // Default footer (no Balance chip) — should still fetch.
     app.status_items = crate::config::StatusItem::default_footer();
-
-    assert!(!should_fetch_deepseek_balance(&app));
-
-    app.status_items.push(crate::config::StatusItem::Balance);
     assert!(should_fetch_deepseek_balance(&app));
+
+    // Non-DeepSeek provider — should not fetch.
+    app.api_provider = ApiProvider::Openrouter;
+    assert!(!should_fetch_deepseek_balance(&app));
 }
 
 #[test]
 fn should_fetch_deepseek_balance_requires_deepseek_provider() {
     let mut app = create_test_app();
-    app.status_items = vec![crate::config::StatusItem::Balance];
 
     app.api_provider = ApiProvider::Openrouter;
     assert!(!should_fetch_deepseek_balance(&app));

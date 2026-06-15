@@ -676,7 +676,7 @@ pub(crate) fn footer_cost_spans(app: &App) -> Vec<Span<'static>> {
         return Vec::new();
     }
     let mut spans = vec![Span::styled(
-        app.format_cost_amount(displayed_cost),
+        format!("cost {}", app.format_cost_amount(displayed_cost)),
         Style::default().fg(palette::TEXT_MUTED),
     )];
     // Append cache-savings hint when the last turn had cache hits that
@@ -687,6 +687,30 @@ pub(crate) fn footer_cost_spans(app: &App) -> Vec<Span<'static>> {
         spans.push(Span::styled(
             format!(" · saved {}", app.format_cost_amount(saved)),
             Style::default().fg(palette::STATUS_SUCCESS),
+        ));
+    }
+    // Append DeepSeek account balance after the cost so it's always
+    // visible following each turn's expense.
+    if let Ok(balance) = app.balance_cell.lock()
+        && let Some(info) = balance.as_ref()
+        && let Some(total) = info.total_balance_f64()
+        && total > 0.0
+    {
+        let currency = match info.currency.as_str() {
+            "CNY" | "cny" => "¥",
+            _ => "$",
+        };
+        let label = if total >= 1000.0 {
+            format!("bal {currency}{total:.0}")
+        } else if total >= 10.0 {
+            format!("bal {currency}{total:.1}")
+        } else {
+            format!("bal {currency}{total:.2}")
+        };
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(
+            label,
+            Style::default().fg(palette::TEXT_MUTED),
         ));
     }
     spans
