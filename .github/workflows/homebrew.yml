@@ -24,11 +24,13 @@ jobs:
 
       - name: Resolve tag
         id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ inputs.version }}"
           else
-            TAG="${{ github.event.workflow_run.head_branch }}"
+            TAG="$(gh release list -R tanuki-cat/CodeWhale -L 1 --json tagName -q '.[0].tagName')"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Resolved tag: $TAG"
