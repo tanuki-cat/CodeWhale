@@ -9048,7 +9048,7 @@ fn render_footer_from_with_default_items_renders_mode_and_model() {
     assert!(!props.model.is_empty(), "footer should show a model name");
     // Tiny but real costs should render instead of disappearing as "$0.00".
     assert!(!props.cost.is_empty());
-    assert_eq!(spans_text(&props.cost), "<$0.0001");
+    assert_eq!(spans_text(&props.cost), "cost <$0.0001");
 }
 
 #[test]
