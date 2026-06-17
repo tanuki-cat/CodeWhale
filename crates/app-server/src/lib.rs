@@ -28,6 +28,8 @@ use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+mod chat_completions;
+
 const DEFAULT_CORS_ORIGINS: &[&str] = &[
     "http://localhost",
     "http://localhost:1420",
@@ -155,6 +157,10 @@ fn app_router(state: AppState, cors_origins: &[String]) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions::chat_completions_handler),
+        )
         .merge(protected_routes)
         .layer(cors_layer(cors_origins))
         .with_state(state)
@@ -1238,6 +1244,89 @@ mod tests {
         .expect("clear goal");
         assert_eq!(cleared.result["status"], "cleared");
         assert_eq!(cleared.result["data"]["cleared"], true);
+    }
+
+    // ── capability drift guard ─────────────────────────────────────────
+    //
+    // The stdio `capabilities` method is the benchmark/SDK contract: external
+    // harnesses probe it (without spending model tokens) to learn what the
+    // app-server can do. Pin the advertised method set so any change forces a
+    // deliberate update here, in the dispatcher, and in docs/RUNTIME_API.md.
+
+    /// Methods advertised by the top-level `capabilities` probe, in order.
+    const EXPECTED_CAPABILITY_METHODS: &[&str] = &[
+        "healthz",
+        "thread/capabilities",
+        "thread/request",
+        "thread/create",
+        "thread/start",
+        "thread/resume",
+        "thread/fork",
+        "thread/list",
+        "thread/read",
+        "thread/set_name",
+        "thread/goal/set",
+        "thread/goal/get",
+        "thread/goal/clear",
+        "thread/archive",
+        "thread/unarchive",
+        "thread/message",
+        "app/capabilities",
+        "app/request",
+        "app/config/get",
+        "app/config/set",
+        "app/config/unset",
+        "app/config/list",
+        "app/models",
+        "app/thread_loaded_list",
+        "prompt/capabilities",
+        "prompt/request",
+        "prompt/run",
+        "shutdown",
+    ];
+
+    fn capability_test_state() -> (AppState, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "").expect("write config");
+        let state = build_state(Some(config_path), None).expect("state");
+        (state, tmp)
+    }
+
+    #[tokio::test]
+    async fn capabilities_method_set_is_stable() {
+        let (state, _tmp) = capability_test_state();
+        let caps = dispatch_stdio_request(&state, "capabilities", json!({}))
+            .await
+            .expect("capabilities dispatch");
+        let methods: Vec<String> = caps.result["methods"]
+            .as_array()
+            .expect("methods array")
+            .iter()
+            .map(|m| m.as_str().expect("method string").to_string())
+            .collect();
+        assert_eq!(
+            methods, EXPECTED_CAPABILITY_METHODS,
+            "app-server stdio capability set drifted; update the dispatcher, this \
+             snapshot, and docs/RUNTIME_API.md together"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_advertised_capability_is_dispatchable() {
+        let (state, _tmp) = capability_test_state();
+        // Empty params: methods may fail validation (-32602), but none may report
+        // method-not-found (-32601). Required fields (e.g. PromptRequest.prompt)
+        // make the prompt routes fail at parse time, so no model tokens are spent.
+        for method in EXPECTED_CAPABILITY_METHODS {
+            if let Err(err) = dispatch_stdio_request(&state, method, json!({})).await {
+                assert_ne!(
+                    err.code,
+                    JsonRpcError::method_not_found(method).code,
+                    "advertised capability `{method}` is not dispatchable"
+                );
+            }
+        }
     }
 
     // ── resolve_auth_token ─────────────────────────────────────────────

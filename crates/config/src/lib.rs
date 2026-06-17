@@ -3,7 +3,6 @@ pub mod provider;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-#[cfg(unix)]
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -87,7 +86,7 @@ const DEFAULT_XIAOMI_MIMO_BASE_URL: &str = "https://token-plan-sgp.xiaomimimo.co
 const XIAOMI_MIMO_TOKEN_PLAN_CN_BASE_URL: &str = "https://token-plan-cn.xiaomimimo.com/v1";
 const XIAOMI_MIMO_TOKEN_PLAN_SGP_BASE_URL: &str = DEFAULT_XIAOMI_MIMO_BASE_URL;
 const XIAOMI_MIMO_TOKEN_PLAN_AMS_BASE_URL: &str = "https://token-plan-ams.xiaomimimo.com/v1";
-const DEFAULT_NOVITA_BASE_URL: &str = "https://api.novita.ai/v1";
+const DEFAULT_NOVITA_BASE_URL: &str = "https://api.novita.ai/openai/v1";
 const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
 const DEFAULT_SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.com/v1";
 const DEFAULT_SILICONFLOW_CN_BASE_URL: &str = "https://api.siliconflow.cn/v1";
@@ -122,6 +121,9 @@ const MINIMAX_M2_1_MODEL: &str = "MiniMax-M2.1";
 const MINIMAX_M2_1_HIGHSPEED_MODEL: &str = "MiniMax-M2.1-highspeed";
 const MINIMAX_M2_MODEL: &str = "MiniMax-M2";
 const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
+const DEFAULT_DEEPINFRA_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
+const DEFAULT_DEEPINFRA_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
+const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -192,10 +194,12 @@ pub enum ProviderKind {
     Stepfun,
     #[serde(alias = "mini-max", alias = "mini_max", alias = "minimax")]
     Minimax,
+    #[serde(alias = "deep-infra", alias = "deep_infra")]
+    Deepinfra,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::Deepseek,
         Self::NvidiaNim,
         Self::Openai,
@@ -220,6 +224,7 @@ impl ProviderKind {
         Self::Zai,
         Self::Stepfun,
         Self::Minimax,
+        Self::Deepinfra,
     ];
 
     #[must_use]
@@ -371,13 +376,15 @@ pub struct ProvidersToml {
     pub stepfun: ProviderConfigToml,
     #[serde(default, alias = "mini-max", alias = "mini_max", alias = "minimax")]
     pub minimax: ProviderConfigToml,
+    #[serde(default, alias = "deep-infra", alias = "deep_infra")]
+    pub deepinfra: ProviderConfigToml,
 }
 
 /// Sibling `permissions.toml` schema.
 ///
 /// This slice is intentionally ask-only: each rule is a typed condition that
 /// means "ask before this tool invocation." Typed allow/deny records and UI
-/// persistence are expected to land in follow-up PRs.
+/// actions are expected to land in follow-up PRs.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionsToml {
@@ -425,6 +432,7 @@ impl ProvidersToml {
             ProviderKind::Zai => &self.zai,
             ProviderKind::Stepfun => &self.stepfun,
             ProviderKind::Minimax => &self.minimax,
+            ProviderKind::Deepinfra => &self.deepinfra,
         }
     }
 
@@ -454,6 +462,7 @@ impl ProvidersToml {
             ProviderKind::Zai => &mut self.zai,
             ProviderKind::Stepfun => &mut self.stepfun,
             ProviderKind::Minimax => &mut self.minimax,
+            ProviderKind::Deepinfra => &mut self.deepinfra,
         }
     }
 }
@@ -1099,7 +1108,7 @@ pub struct FleetConfigToml {
 /// - [`DEFAULT_SPAWN_DEPTH`] is the default recursion budget (the sub-agent
 ///   runtime's `DEFAULT_MAX_SPAWN_DEPTH` is defined as this value).
 /// - [`MAX_SPAWN_DEPTH_CEILING`] is the hard safety cap; every configured
-///   value (fleet `max_spawn_depth`, `agent_open`'s `max_depth`) clamps to it.
+///   value (fleet `max_spawn_depth`, the `agent` tool's `max_depth`) clamps to it.
 ///
 /// A worker runs at `spawn_depth = 0` and may spawn while
 /// `spawn_depth + 1 <= max_spawn_depth`, so a depth of N affords N nested
@@ -1110,7 +1119,7 @@ pub const DEFAULT_SPAWN_DEPTH: u32 = 3;
 
 /// Hard ceiling on recursion depth for any worker/sub-agent. See
 /// [`DEFAULT_SPAWN_DEPTH`]. Raising this single constant lifts the limit
-/// everywhere (the fleet clamp and `agent_open` validation both read it).
+/// everywhere (the fleet clamp and `agent` validation both read it).
 pub const MAX_SPAWN_DEPTH_CEILING: u32 = 3;
 
 /// Headless worker execution constraints (#3027).
@@ -1132,7 +1141,7 @@ pub struct FleetExecConfig {
     /// Recursive child-agent budget for headless fleet workers.
     /// Defaults to [`DEFAULT_SPAWN_DEPTH`] (3) so a fleet worker has the SAME
     /// recursion budget as a standalone sub-agent — fleet and sub-agents are one
-    /// substrate, not two. Set 0 to block child `agent_open` (the root worker
+    /// substrate, not two. Set 0 to block child `agent` calls (the root worker
     /// still runs); the value is clamped to [`MAX_SPAWN_DEPTH_CEILING`].
     #[serde(default = "default_fleet_max_spawn_depth")]
     pub max_spawn_depth: u32,
@@ -2414,6 +2423,7 @@ impl ConfigToml {
                 ProviderKind::Zai => DEFAULT_ZAI_BASE_URL.to_string(),
                 ProviderKind::Stepfun => DEFAULT_STEPFUN_BASE_URL.to_string(),
                 ProviderKind::Minimax => DEFAULT_MINIMAX_BASE_URL.to_string(),
+                ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL.to_string(),
             })
         };
         // CLI flag wins outright. Otherwise: config-file → injected secrets/env.
@@ -2750,6 +2760,14 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
             "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner"
             | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
         ) => DEFAULT_TOGETHER_FLASH_MODEL.to_string(),
+        (ProviderKind::Deepinfra, "deepseek-v4-pro" | "deepseek-v4pro") => {
+            DEFAULT_DEEPINFRA_MODEL.to_string()
+        }
+        (
+            ProviderKind::Deepinfra,
+            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner"
+            | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
+        ) => DEFAULT_DEEPINFRA_FLASH_MODEL.to_string(),
         _ => model.to_string(),
     }
 }
@@ -2952,6 +2970,7 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Zai => DEFAULT_ZAI_MODEL,
         ProviderKind::Stepfun => DEFAULT_STEPFUN_MODEL,
         ProviderKind::Minimax => DEFAULT_MINIMAX_MODEL,
+        ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_MODEL,
     }
 }
 
@@ -2981,6 +3000,7 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Zai => DEFAULT_ZAI_BASE_URL,
         ProviderKind::Stepfun => DEFAULT_STEPFUN_BASE_URL,
         ProviderKind::Minimax => DEFAULT_MINIMAX_BASE_URL,
+        ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL,
     }
 }
 
@@ -3341,6 +3361,19 @@ impl ConfigStore {
             })?;
         }
         let body = toml::to_string_pretty(&self.config).context("failed to serialize config")?;
+        match fs::read_to_string(&self.path) {
+            Ok(existing) => {
+                if existing == body {
+                    return Ok(());
+                }
+                write_one_time_config_backup(&self.path)?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read config at {}", self.path.display()));
+            }
+        }
         #[cfg(unix)]
         {
             let mut file = fs::OpenOptions::new()
@@ -3391,6 +3424,103 @@ impl ConfigStore {
             ExecPolicyEngine::with_rulesets(vec![self.permissions.ruleset()])
         }
     }
+
+    /// Atomically append ask-only permission rules to the sibling
+    /// `permissions.toml` file.
+    ///
+    /// Existing comments and formatting are preserved. Exact duplicate rules
+    /// are ignored, and the in-memory permissions snapshot is refreshed after
+    /// a successful write.
+    pub fn append_ask_rules(&mut self, rules: &[ToolAskRule]) -> Result<usize> {
+        if rules.is_empty() {
+            return Ok(0);
+        }
+
+        let path = self.permissions_path();
+        let raw = if path.exists() {
+            fs::read_to_string(&path)
+                .with_context(|| format!("failed to read permissions at {}", path.display()))?
+        } else {
+            String::new()
+        };
+        let mut permissions = if raw.trim().is_empty() {
+            PermissionsToml::default()
+        } else {
+            toml::from_str(&raw)
+                .with_context(|| format!("failed to parse permissions at {}", path.display()))?
+        };
+        let mut document = if raw.trim().is_empty() {
+            toml_edit::DocumentMut::new()
+        } else {
+            raw.parse::<toml_edit::DocumentMut>()
+                .with_context(|| format!("failed to edit permissions at {}", path.display()))?
+        };
+
+        if !document.contains_key("rules") {
+            document["rules"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+        }
+        let rules_item = document
+            .get_mut("rules")
+            .expect("rules entry was inserted above");
+
+        let mut added = 0;
+        for rule in rules {
+            if permissions.rules.contains(rule) {
+                continue;
+            }
+            append_ask_rule(rules_item, rule)?;
+            permissions.rules.push(rule.clone());
+            added += 1;
+        }
+        if added == 0 {
+            self.permissions = permissions;
+            return Ok(0);
+        }
+
+        let body = document.to_string();
+        let persisted: PermissionsToml = toml::from_str(&body).with_context(|| {
+            format!(
+                "generated invalid permissions document for {}",
+                path.display()
+            )
+        })?;
+        write_permissions_atomic(&path, body.as_bytes())?;
+        self.permissions = persisted;
+        Ok(added)
+    }
+}
+
+fn config_backup_path(path: &Path) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_else(|| std::ffi::OsString::from(CONFIG_FILE_NAME));
+    file_name.push(".bak");
+    path.with_file_name(file_name)
+}
+
+fn write_one_time_config_backup(path: &Path) -> Result<()> {
+    let backup = config_backup_path(path);
+    if backup.exists() {
+        return Ok(());
+    }
+    fs::copy(path, &backup).with_context(|| {
+        format!(
+            "failed to create config backup {} from {}",
+            backup.display(),
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "failed to set config backup permissions at {}",
+                backup.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Process-wide default [`Secrets`] façade. The first caller wins; the
@@ -3564,6 +3694,91 @@ fn load_sibling_permissions(config_path: &Path) -> Result<PermissionsToml> {
             permissions_path.display()
         )
     })
+}
+
+fn append_ask_rule(item: &mut toml_edit::Item, rule: &ToolAskRule) -> Result<()> {
+    match item {
+        toml_edit::Item::ArrayOfTables(rules) => {
+            rules.push(ask_rule_table(rule));
+            Ok(())
+        }
+        toml_edit::Item::Value(value) => {
+            let Some(rules) = value.as_array_mut() else {
+                bail!("`rules` in permissions.toml must be an array");
+            };
+            rules.push(toml_edit::Value::InlineTable(ask_rule_inline_table(rule)));
+            Ok(())
+        }
+        _ => bail!("`rules` in permissions.toml must be an array"),
+    }
+}
+
+fn ask_rule_table(rule: &ToolAskRule) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    table["tool"] = toml_edit::value(rule.tool.clone());
+    if let Some(command) = rule.command.as_deref() {
+        table["command"] = toml_edit::value(command);
+    }
+    if let Some(path) = rule.path.as_deref() {
+        table["path"] = toml_edit::value(path);
+    }
+    table
+}
+
+fn ask_rule_inline_table(rule: &ToolAskRule) -> toml_edit::InlineTable {
+    let mut table = toml_edit::InlineTable::new();
+    table.insert("tool", toml_edit::Value::from(rule.tool.clone()));
+    if let Some(command) = rule.command.as_deref() {
+        table.insert("command", toml_edit::Value::from(command));
+    }
+    if let Some(path) = rule.path.as_deref() {
+        table.insert("path", toml_edit::Value::from(path));
+    }
+    table
+}
+
+fn write_permissions_atomic(path: &Path, body: &[u8]) -> Result<()> {
+    let parent = path.parent().with_context(|| {
+        format!(
+            "permissions path has no parent directory: {}",
+            path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create permissions directory {}",
+            parent.display()
+        )
+    })?;
+
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "failed to create temporary permissions file in {}",
+            parent.display()
+        )
+    })?;
+    #[cfg(unix)]
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| {
+            format!(
+                "failed to secure temporary permissions file for {}",
+                path.display()
+            )
+        })?;
+    temporary
+        .write_all(body)
+        .with_context(|| format!("failed to write permissions at {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync permissions at {}", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace permissions at {}", path.display()))?;
+    Ok(())
 }
 
 pub fn default_config_path() -> Result<PathBuf> {
@@ -3768,6 +3983,8 @@ struct EnvRuntimeOverrides {
     stepfun_model: Option<String>,
     minimax_base_url: Option<String>,
     minimax_model: Option<String>,
+    deepinfra_base_url: Option<String>,
+    deepinfra_model: Option<String>,
 }
 
 impl EnvRuntimeOverrides {
@@ -3961,6 +4178,12 @@ impl EnvRuntimeOverrides {
             minimax_model: std::env::var("MINIMAX_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            deepinfra_base_url: std::env::var("DEEPINFRA_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            deepinfra_model: std::env::var("DEEPINFRA_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
         }
     }
 
@@ -4007,6 +4230,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::Zai => self.zai_base_url.clone(),
             ProviderKind::Stepfun => self.stepfun_base_url.clone(),
             ProviderKind::Minimax => self.minimax_base_url.clone(),
+            ProviderKind::Deepinfra => self.deepinfra_base_url.clone(),
         }
     }
 
@@ -4030,6 +4254,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::Zai => self.zai_model.clone(),
             ProviderKind::Stepfun => self.stepfun_model.clone(),
             ProviderKind::Minimax => self.minimax_model.clone(),
+            ProviderKind::Deepinfra => self.deepinfra_model.clone(),
             _ => None,
         }?;
 
@@ -4364,6 +4589,152 @@ action = "mode.agent"
         );
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_store_appends_ask_rules_without_losing_comments_or_duplicates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join(CONFIG_FILE_NAME);
+        let permissions_path = dir.path().join(PERMISSIONS_FILE_NAME);
+        fs::write(&config_path, "model = \"deepseek-v4-flash\"\n").expect("write config");
+        fs::write(
+            &permissions_path,
+            r#"# keep this permission note
+[[rules]]
+tool = "exec_shell"
+command = "cargo check"
+"#,
+        )
+        .expect("write permissions");
+
+        let mut store = ConfigStore::load(Some(config_path)).expect("load config store");
+        let existing = ToolAskRule::exec_shell("cargo check");
+        let added_rule = ToolAskRule::file_path("read_file", "docs/README.md");
+        let added = store
+            .append_ask_rules(&[existing, added_rule.clone(), added_rule.clone()])
+            .expect("append ask rules");
+
+        assert_eq!(added, 1);
+        assert_eq!(
+            store.permissions().rules,
+            vec![ToolAskRule::exec_shell("cargo check"), added_rule.clone(),]
+        );
+        let body = fs::read_to_string(&permissions_path).expect("read permissions");
+        assert!(body.contains("# keep this permission note"));
+        assert_eq!(body.matches("docs/README.md").count(), 1);
+        assert!(!body.contains("decision"));
+
+        let before_duplicate_append = body;
+        assert_eq!(
+            store
+                .append_ask_rules(&[added_rule])
+                .expect("dedupe ask rule"),
+            0
+        );
+        assert_eq!(
+            fs::read_to_string(&permissions_path).expect("read unchanged permissions"),
+            before_duplicate_append
+        );
+
+        let reloaded = ConfigStore::load(Some(dir.path().join(CONFIG_FILE_NAME)))
+            .expect("reload config store");
+        assert_eq!(reloaded.permissions(), store.permissions());
+    }
+
+    #[test]
+    fn config_store_appends_ask_rule_to_inline_rules_array() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join(CONFIG_FILE_NAME);
+        let permissions_path = dir.path().join(PERMISSIONS_FILE_NAME);
+        fs::write(
+            &permissions_path,
+            "# inline rules stay valid\nrules = [{ tool = \"exec_shell\", command = \"cargo check\" }]\n",
+        )
+        .expect("write permissions");
+
+        let mut store = ConfigStore::load(Some(config_path)).expect("load config store");
+        assert_eq!(
+            store
+                .append_ask_rules(&[ToolAskRule::file_path("read_file", "README.md")])
+                .expect("append inline ask rule"),
+            1
+        );
+
+        let body = fs::read_to_string(&permissions_path).expect("read permissions");
+        assert!(body.contains("# inline rules stay valid"));
+        let parsed: PermissionsToml = toml::from_str(&body).expect("parse persisted permissions");
+        assert_eq!(
+            parsed.rules,
+            vec![
+                ToolAskRule::exec_shell("cargo check"),
+                ToolAskRule::file_path("read_file", "README.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn config_store_does_not_overwrite_invalid_permissions_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join(CONFIG_FILE_NAME);
+        let permissions_path = dir.path().join(PERMISSIONS_FILE_NAME);
+        let mut store = ConfigStore::load(Some(config_path)).expect("load config store");
+        let invalid = "rules = \"not-an-array\"\n";
+        fs::write(&permissions_path, invalid).expect("write invalid permissions");
+
+        let error = store
+            .append_ask_rules(&[ToolAskRule::exec_shell("cargo test")])
+            .expect_err("invalid permissions should fail");
+
+        assert!(error.to_string().contains("failed to parse permissions"));
+        assert_eq!(
+            fs::read_to_string(&permissions_path).expect("read invalid permissions"),
+            invalid
+        );
+        assert!(store.permissions().is_empty());
+    }
+
+    #[test]
+    fn duplicate_append_refreshes_permissions_changed_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join(CONFIG_FILE_NAME);
+        let permissions_path = dir.path().join(PERMISSIONS_FILE_NAME);
+        let mut store = ConfigStore::load(Some(config_path)).expect("load config store");
+        fs::write(
+            permissions_path,
+            "[[rules]]\ntool = \"exec_shell\"\ncommand = \"cargo check\"\n",
+        )
+        .expect("write external permissions update");
+
+        assert_eq!(
+            store
+                .append_ask_rules(&[ToolAskRule::exec_shell("cargo check")])
+                .expect("dedupe external ask rule"),
+            0
+        );
+        assert_eq!(
+            store.permissions().rules,
+            vec![ToolAskRule::exec_shell("cargo check")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_store_secures_persisted_permissions_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join(CONFIG_FILE_NAME);
+        let permissions_path = dir.path().join(PERMISSIONS_FILE_NAME);
+        let mut store = ConfigStore::load(Some(config_path)).expect("load config store");
+
+        store
+            .append_ask_rules(&[ToolAskRule::exec_shell("cargo test")])
+            .expect("append ask rule");
+
+        let mode = fs::metadata(permissions_path)
+            .expect("permissions metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     struct EnvGuard {
@@ -5682,6 +6053,85 @@ unix_socket_path = "/tmp/cw-hooks.sock"
     }
 
     #[test]
+    fn config_store_save_skips_identical_serialized_body() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "codewhale-config-noop-save-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(CONFIG_FILE_NAME);
+        let config = ConfigToml {
+            model: Some("deepseek-v4-flash".to_string()),
+            ..ConfigToml::default()
+        };
+        let body = toml::to_string_pretty(&config).expect("serialize");
+        fs::write(&path, &body).expect("seed config");
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("chmod seed");
+
+        let store = ConfigStore {
+            path: path.clone(),
+            config,
+            permissions: PermissionsToml::default(),
+        };
+        store.save().expect("identical save should not rewrite");
+
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod restore");
+        assert_eq!(fs::read_to_string(&path).expect("read config"), body);
+        assert!(
+            !config_backup_path(&path).exists(),
+            "no-op save must not create a migration backup"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_store_save_creates_one_time_backup_before_changed_write() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "codewhale-config-backup-save-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(CONFIG_FILE_NAME);
+        let original = "model = \"deepseek-v4-flash\"\n";
+        fs::write(&path, original).expect("seed config");
+
+        let store = ConfigStore {
+            path: path.clone(),
+            config: ConfigToml {
+                model: Some("deepseek-v4-pro".to_string()),
+                ..ConfigToml::default()
+            },
+            permissions: PermissionsToml::default(),
+        };
+        store.save().expect("changed save");
+
+        let backup_path = config_backup_path(&path);
+        assert_eq!(
+            fs::read_to_string(&backup_path).expect("read backup"),
+            original
+        );
+        let updated = fs::read_to_string(&path).expect("read updated config");
+        assert!(updated.contains("model = \"deepseek-v4-pro\""));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn provider_kind_parses_openrouter_and_novita_aliases() {
         assert_eq!(
             ProviderKind::parse("openrouter"),
@@ -5740,6 +6190,14 @@ unix_socket_path = "/tmp/cw-hooks.sock"
             let parsed: ConfigToml =
                 toml::from_str(&format!("provider = \"{alias}\"")).expect("huggingface alias");
             assert_eq!(parsed.provider, ProviderKind::Huggingface);
+        }
+
+        for alias in ["deepinfra", "deep-infra", "deep_infra"] {
+            assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Deepinfra));
+
+            let parsed: ConfigToml =
+                toml::from_str(&format!("provider = \"{alias}\"")).expect("deepinfra alias");
+            assert_eq!(parsed.provider, ProviderKind::Deepinfra);
         }
 
         let parsed: ConfigToml =
@@ -7414,7 +7872,7 @@ fallback_providers = ["deepseek", "openrouter"]
     }
 
     #[test]
-    fn fleet_exec_config_default_matches_subagent_spawn_depth() {
+    fn fleet_exec_config_default_matches_subagent_depth() {
         // Fleet workers and standalone sub-agents share one recursion axis:
         // the fleet default equals DEFAULT_SPAWN_DEPTH (3) and affords >=3
         // nested delegation levels out of the box.

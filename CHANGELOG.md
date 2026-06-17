@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.61] - 2026-06-14
+### Retroactive credits
+
+A credit-reconciliation pass found shipped community fixes that were never
+recorded in this changelog. Crediting them now, with the version they shipped in:
+
+- Global `~/.deepseek/AGENTS.md` fallback loading — thanks @manaskarra (fix) and @xfy6238 (report) (#1157, v0.8.27)
+- CRLF SSE event parsing for MCP — thanks @reidliu41 (fix) and @djairjr (report) (#1309, v0.8.29)
+- Reduce-motion default on VTE/flicker terminals — thanks @Geallier (report) (#1470, v0.8.34)
+- `portable-pty` 0.9 upgrade for LoongArch64 — thanks @quentin-lian (fix) and @k0tran (report) (#1531, #1992, v0.8.46)
+- `DEEPSEEK_ALLOW_INSECURE_HTTP` guard for LAN vLLM — thanks @F1LT3R (report) (#1656, v0.8.47)
+- Hidden `reasoning_content` kept in English regardless of locale — thanks @cmyyy (report) (#1842, v0.8.47)
+- `ExternalTool` abstraction layer — thanks @aboimpinto (#1794, #2294, v0.8.48)
+- Ephemeral generated project context — thanks @Final527 (report) (#3058, v0.8.59)
+
+## [0.8.61] - 2026-06-15
 
 This release lands the **runtime control plane** for multi-agent work: the TUI stays
 responsive while sub-agents run, sub-agents converge toward fleet-style durable workers
@@ -26,6 +40,8 @@ folds in several community contributions.
   verifier-as-judge gate before a goal may complete. (#3215, #891, #1976, #2058, #2029)
 - Parent-visible worker interaction contract — a recommended action per worker. (#3226)
 - Maintainer GitHub workflow skills; ACP registry submission prepared. (#3192)
+- OpenAI-compatible `/v1/chat/completions` endpoint on the legacy app-server HTTP transport,
+  provider-neutral, with model registry resolution and configured-credential forwarding.
 
 ### Changed
 
@@ -35,6 +51,9 @@ folds in several community contributions.
 - The per-turn runtime tag exposes capability posture instead of human-facing mode labels. (#3213)
 - Independent shell and verifier work defaults to background jobs with nonblocking waits and a
   completion notification; blocking now requires an explicit wait. (#3212)
+- Sub-agent launches now expose explicit `model_strength` and `thinking` controls to the model
+  instead of hidden child-model auto-routing; `explore` work is documented as a good fit for
+  faster models and `thinking: "off"`.
 - Plan mode is strictly read-only (no shell tools), consistent with its runtime posture.
 - `/swarm` is gated behind the durable worker substrate. (#3218)
 - Legacy `deepseek` install/update path resolves to `codewhale`. (#2960, #2924, #2917)
@@ -45,6 +64,8 @@ folds in several community contributions.
   off the render thread, AgentProgress events are coalesced, and sub-agents no longer park on
   input with no orchestrator to answer; a six-worker stress test guards input/render/cancel
   liveness. (#3216, #3096)
+- Idle sub-agent completion notifications now resume the parent turn instead of waiting for a
+  later user message; thanks @giovanni-paolilla for the deadlock report (#3266).
 - **Provider/model route isolation** — provider and model state is session-local, and a
   mismatched provider+model tuple is rejected at the route boundary. (#3227)
 - Route-effective context-window metadata, over-limit preflight, and bounded recovery from
@@ -57,6 +78,23 @@ folds in several community contributions.
   (#2982); CJK word-wrap (#963); clickable sidebar stop targets (#3028); live token throughput
   (#3190); auto-expiring terminal sub-agent cards (#3078).
 - Linux glibc preflight in the installer/update path with a clear error. (#3207, #1067)
+- Self-update retries transient GitHub metadata/asset failures and falls back from the GitHub
+  REST API to the public `releases/latest` redirect before constructing release asset URLs. (#3232)
+- Provider picker lists providers in neutral alphabetical order instead of hard-coding DeepSeek first; the active provider stays pre-selected. (#3076)
+- Work sidebar no longer shows stale `phase now:` / `phase next:` strategy rows once the checklist
+  is 100% complete.
+- Plan mode no longer shortcuts investigation for requests that name a repository, URL, version,
+  release, build state, benchmark, bug, PR, issue, API surface, or local code path.
+- Oversized pasted text stays editable in the composer, with a file backup appended at submit
+  time for model access; thanks @idling11 (#3267, closes #3263).
+- Bare digit keys `1`-`8` now insert text instead of firing hotbar slots; use `Alt+digit` for
+  hotbar actions. Thanks @wjq2026 for the report and @DieMoe233 for the paste-path note (#3243).
+- Kimi/Moonshot tool schemas normalize empty function parameters to a root object schema; thanks
+  @jghwwnq for the provider repro (#3265).
+- Novita defaults to its OpenAI-compatible `/openai/v1` endpoint so chat completions no longer
+  404 out of the box; thanks @buko for the report and endpoint verification (#3255).
+- Dependency security: `ws` pinned to 8.21.0 across npm packages to close remote memory-exhaustion
+  DoS (dependabot).
 
 ### Community contributions
 
@@ -67,6 +105,12 @@ folds in several community contributions.
 - Whale-accent rename — thanks @nightt5879 (#3197)
 - `DEEPSEEK_BASE_URL` / `MODEL` honored in `exec` — thanks @hongchen1993 (#3221)
 - VS Code read-only API documentation — thanks @cyq1017 (#3013)
+- Atomic ask-only permission rule persistence — thanks @greyfreedom (#3233)
+- DeepInfra provider support and release-surface follow-through — thanks @idling11 (#3235, closes #3231) and @nightt5879 (#3236)
+- Editable oversized paste composer flow — thanks @idling11 (#3267, closes #3263)
+- WeChat bridge (`integrations/weixin-bridge` via Feishu + Tencent OpenClaw) — thanks @VincentCorleone (#3206)
+- Config robustness: atomic permission-rule save, one-time config `.bak` backup before the first changed write, `CODEWHALE_HOME` as primary config home, and accepting the dispatcher-written config shape (camelCase aliases + `[features.enabled]` table) so legacy/dual-written configs parse cleanly
+- Dependency/CI bumps: docker login/qemu actions, softprops gh-release, download-artifact, vitest, @opennextjs/cloudflare, form-data, js-yaml, dompurify, ws
 
 ## [0.8.60] - 2026-06-13
 

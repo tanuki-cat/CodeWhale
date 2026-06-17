@@ -802,6 +802,27 @@ impl Default for ModelRegistry {
                 supports_tools: true,
                 supports_reasoning: true,
             },
+            // DeepInfra (https://deepinfra.com)
+            ModelInfo {
+                id: "deepseek-ai/DeepSeek-V4-Pro".to_string(),
+                provider: ProviderKind::Deepinfra,
+                aliases: vec![
+                    "deepseek-v4-pro".to_string(),
+                    "di-deepseek-v4-pro".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
+                provider: ProviderKind::Deepinfra,
+                aliases: vec![
+                    "deepseek-v4-flash".to_string(),
+                    "di-deepseek-v4-flash".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
         ];
         Self::new(models)
     }

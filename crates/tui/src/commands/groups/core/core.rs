@@ -845,8 +845,10 @@ mod tests {
         // changes only Z.ai's scoped model.
         let _settings = SettingsPathGuard::new();
         {
-            let mut seed = crate::settings::Settings::default();
-            seed.default_provider = Some("deepseek".to_string());
+            let seed = crate::settings::Settings {
+                default_provider: Some("deepseek".to_string()),
+                ..Default::default()
+            };
             seed.save().expect("seed settings");
         }
         let mut app = create_test_app();

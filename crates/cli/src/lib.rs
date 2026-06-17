@@ -47,6 +47,8 @@ enum ProviderArg {
     Zai,
     Stepfun,
     Minimax,
+    #[value(alias = "deep-infra", alias = "deep_infra")]
+    Deepinfra,
 }
 
 impl From<ProviderArg> for ProviderKind {
@@ -75,6 +77,7 @@ impl From<ProviderArg> for ProviderKind {
             ProviderArg::Zai => ProviderKind::Zai,
             ProviderArg::Stepfun => ProviderKind::Stepfun,
             ProviderArg::Minimax => ProviderKind::Minimax,
+            ProviderArg::Deepinfra => ProviderKind::Deepinfra,
         }
     }
 }
@@ -217,6 +220,23 @@ working-tree diff. `export` only writes the current diff.
     /// Inspect TUI feature flags.
     Features(TuiPassthroughArgs),
     /// Run a local TUI server.
+    #[command(after_help = "\
+Forwarded serve options:
+      --mcp                 Start MCP server over stdio
+      --http                Start runtime HTTP/SSE API server
+      --mobile              Start runtime HTTP/SSE API server with the mobile control page
+      --qr                  Show a QR code for the mobile URL (requires --mobile)
+      --acp                 Start ACP server over stdio for editor clients
+      --host <HOST>         Bind host (default 127.0.0.1; --mobile defaults to 0.0.0.0)
+      --port <PORT>         Bind port [default: 7878]
+      --workers <WORKERS>   Background task worker count (1-8)
+      --cors-origin <URL>   Additional CORS origin to allow (repeatable)
+      --auth-token <TOKEN>  Require this bearer token for /v1/* runtime API routes
+      --insecure            Disable runtime API auth when no token is configured
+
+`codewhale serve --http` and `codewhale serve --mobile` remain compatibility
+aliases for `codewhale app-server --http` and `codewhale app-server --mobile`.
+New integrations should prefer `codewhale app-server`.")]
     Serve(TuiPassthroughArgs),
     /// Generate shell completions for the TUI binary.
     Completions(TuiPassthroughArgs),
@@ -236,7 +256,19 @@ working-tree diff. `export` only writes the current diff.
     Thread(ThreadArgs),
     /// Evaluate sandbox/approval policy decisions.
     Sandbox(SandboxArgs),
-    /// Run the app-server transport.
+    /// Run the canonical runtime API / control plane (HTTP/SSE, mobile, stdio).
+    #[command(after_help = "\
+Transports:
+  codewhale app-server --http              Full HTTP/SSE runtime API (/v1/*) on 127.0.0.1:7878
+  codewhale app-server --mobile            Runtime API + phone control page (binds 0.0.0.0)
+  codewhale app-server --stdio             JSON-RPC control transport over stdio (no listener)
+  codewhale app-server                     Legacy in-process app-server HTTP on 127.0.0.1:8787
+
+`--http` and `--mobile` serve the same mature runtime API as `codewhale serve
+--http`/`--mobile`, which remain as compatibility aliases. The runtime API token
+is read from --auth-token, CODEWHALE_RUNTIME_TOKEN, or DEEPSEEK_RUNTIME_TOKEN.
+
+See docs/RUNTIME_API.md and scripts/release/app-server-smoke.sh.")]
     AppServer(AppServerArgs),
     /// Generate shell completions.
     #[command(after_help = r#"Examples:
@@ -544,10 +576,33 @@ impl From<ApprovalModeArg> for AskForApproval {
 
 #[derive(Debug, Args)]
 struct AppServerArgs {
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
-    #[arg(long, default_value_t = 8787)]
-    port: u16,
+    /// Serve the full HTTP/SSE runtime API (`/v1/*`: sessions, threads, turns,
+    /// approvals, events, usage, fleet, tasks). This is the canonical runtime
+    /// API surface; it delegates to the same server as `codewhale serve --http`.
+    #[arg(long, conflicts_with_all = ["stdio", "mobile"])]
+    http: bool,
+    /// Serve the runtime API plus the phone-friendly mobile control page.
+    /// Equivalent to the legacy `codewhale serve --mobile`.
+    #[arg(long, conflicts_with = "stdio")]
+    mobile: bool,
+    /// Run the app-server JSON-RPC control transport over stdio (no listener).
+    /// Used by local SDKs and the release benchmark smoke probe.
+    #[arg(long, default_value_t = false)]
+    stdio: bool,
+    /// Show a QR code for the mobile URL in the terminal (requires --mobile).
+    #[arg(long, requires = "mobile")]
+    qr: bool,
+    /// Bind host. Defaults to 127.0.0.1; with --mobile and no host, binds
+    /// 0.0.0.0 so LAN devices can reach the mobile page.
+    #[arg(long)]
+    host: Option<String>,
+    /// Bind port. Defaults to 7878 for --http/--mobile (the runtime API) and
+    /// 8787 for the legacy in-process app-server HTTP transport.
+    #[arg(long)]
+    port: Option<u16>,
+    /// Background task worker count (1-8). Only used with --http/--mobile.
+    #[arg(long)]
+    workers: Option<usize>,
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long = "auth-token")]
@@ -556,8 +611,6 @@ struct AppServerArgs {
     insecure_no_auth: bool,
     #[arg(long = "cors-origin")]
     cors_origin: Vec<String>,
-    #[arg(long, default_value_t = false)]
-    stdio: bool,
 }
 
 const MCP_SERVER_DEFINITIONS_KEY: &str = "mcp.server_definitions";
@@ -701,7 +754,18 @@ fn run() -> Result<()> {
         Some(Commands::Model(args)) => run_model_command(args.command, runtime_overrides.provider),
         Some(Commands::Thread(args)) => run_thread_command(args.command),
         Some(Commands::Sandbox(args)) => run_sandbox_command(args.command),
-        Some(Commands::AppServer(args)) => run_app_server_command(args),
+        Some(Commands::AppServer(args)) => {
+            // The HTTP/mobile runtime API is delegated to the mature `serve` path
+            // in the TUI binary, which reads the *global* --config. app-server has
+            // historically taken a subcommand-level --config, so bridge it before
+            // resolving runtime options (provider/keyring) for the delegated run.
+            if (args.http || args.mobile) && cli.config.is_none() && args.config.is_some() {
+                cli.config = args.config.clone();
+                store = ConfigStore::load(cli.config.clone())?;
+            }
+            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            run_app_server_command(&cli, &resolved_runtime, args)
+        }
         Some(Commands::Completion { shell }) => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "codewhale", &mut io::stdout());
@@ -875,11 +939,12 @@ fn provider_slot(provider: ProviderKind) -> &'static str {
         ProviderKind::Zai => "zai",
         ProviderKind::Stepfun => "stepfun",
         ProviderKind::Minimax => "minimax",
+        ProviderKind::Deepinfra => "deepinfra",
     }
 }
 
 /// Provider order used by the `auth list` and `auth status` outputs.
-const PROVIDER_LIST: [ProviderKind; 24] = [
+const PROVIDER_LIST: [ProviderKind; 25] = [
     ProviderKind::Deepseek,
     ProviderKind::NvidiaNim,
     ProviderKind::Openai,
@@ -904,6 +969,7 @@ const PROVIDER_LIST: [ProviderKind; 24] = [
     ProviderKind::Zai,
     ProviderKind::Stepfun,
     ProviderKind::Minimax,
+    ProviderKind::Deepinfra,
 ];
 
 fn provider_is_supported_by_tui(provider: ProviderKind) -> bool {
@@ -1026,6 +1092,7 @@ fn provider_env_vars(provider: ProviderKind) -> &'static [&'static str] {
         ProviderKind::Zai => &["ZAI_API_KEY", "Z_AI_API_KEY"],
         ProviderKind::Stepfun => &["STEPFUN_API_KEY", "STEP_API_KEY"],
         ProviderKind::Minimax => &["MINIMAX_API_KEY"],
+        ProviderKind::Deepinfra => &["DEEPINFRA_API_KEY", "DEEPINFRA_TOKEN"],
     }
 }
 
@@ -1669,7 +1736,19 @@ fn run_sandbox_command(command: SandboxCommand) -> Result<()> {
     }
 }
 
-fn run_app_server_command(args: AppServerArgs) -> Result<()> {
+fn run_app_server_command(
+    cli: &Cli,
+    resolved_runtime: &ResolvedRuntimeOptions,
+    args: AppServerArgs,
+) -> Result<()> {
+    // The full runtime API lives in the TUI crate behind `serve --http`/`--mobile`.
+    // Rather than duplicate ~6.5k lines or add a CLI→TUI crate dependency, the
+    // canonical `app-server --http`/`--mobile` entrypoint reuses that mature server
+    // by delegating to the sibling TUI binary (the same mechanism `serve` uses).
+    if args.http || args.mobile {
+        return delegate_to_tui(cli, resolved_runtime, app_server_serve_passthrough(&args));
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1677,14 +1756,14 @@ fn run_app_server_command(args: AppServerArgs) -> Result<()> {
     if args.stdio {
         return runtime.block_on(run_app_server_stdio(args.config));
     }
-    let listen: SocketAddr = format!("{}:{}", args.host, args.port)
+    // Legacy in-process app-server HTTP transport (`/healthz`, `/thread`, `/app`,
+    // `/prompt`, `/tool`, `/jobs`). Kept for backward compatibility; defaults to
+    // 127.0.0.1:8787 to avoid colliding with the runtime API default of :7878.
+    let host = args.host.as_deref().unwrap_or("127.0.0.1");
+    let port = args.port.unwrap_or(8787);
+    let listen: SocketAddr = format!("{host}:{port}")
         .parse()
-        .with_context(|| {
-            format!(
-                "invalid app-server listen address {}:{}",
-                args.host, args.port
-            )
-        })?;
+        .with_context(|| format!("invalid app-server listen address {host}:{port}"))?;
     runtime.block_on(run_app_server(AppServerOptions {
         listen,
         config_path: args.config,
@@ -1692,6 +1771,45 @@ fn run_app_server_command(args: AppServerArgs) -> Result<()> {
         insecure_no_auth: args.insecure_no_auth,
         cors_origins: args.cors_origin,
     }))
+}
+
+/// Build the `serve` argv forwarded to the TUI binary for
+/// `codewhale app-server --http`/`--mobile`. Maps app-server flags onto the
+/// matching `serve` flags (note `--insecure-no-auth` → `--insecure`). The
+/// subcommand-level `--config` is bridged through the global `--config` in the
+/// dispatcher, so it is intentionally not part of this passthrough. An auth
+/// token from the environment is deliberately *not* forwarded into child argv;
+/// the runtime API reads CODEWHALE_RUNTIME_TOKEN/DEEPSEEK_RUNTIME_TOKEN itself.
+fn app_server_serve_passthrough(args: &AppServerArgs) -> Vec<String> {
+    let mut forwarded = vec!["serve".to_string()];
+    forwarded.push(if args.mobile { "--mobile" } else { "--http" }.to_string());
+    if let Some(host) = args.host.as_ref() {
+        forwarded.push("--host".to_string());
+        forwarded.push(host.clone());
+    }
+    if let Some(port) = args.port {
+        forwarded.push("--port".to_string());
+        forwarded.push(port.to_string());
+    }
+    if let Some(workers) = args.workers {
+        forwarded.push("--workers".to_string());
+        forwarded.push(workers.to_string());
+    }
+    for origin in &args.cors_origin {
+        forwarded.push("--cors-origin".to_string());
+        forwarded.push(origin.clone());
+    }
+    if let Some(token) = args.auth_token.as_ref() {
+        forwarded.push("--auth-token".to_string());
+        forwarded.push(token.clone());
+    }
+    if args.insecure_no_auth {
+        forwarded.push("--insecure".to_string());
+    }
+    if args.qr {
+        forwarded.push("--qr".to_string());
+    }
+    forwarded
 }
 
 fn app_server_token_from_env() -> Option<String> {
@@ -2487,9 +2605,11 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::AppServer(AppServerArgs {
-                ref host,
-                port: 9999,
+                host: Some(ref host),
+                port: Some(9999),
                 stdio: false,
+                http: false,
+                mobile: false,
                 ..
             })) if host == "0.0.0.0"
         ));
@@ -2505,6 +2625,124 @@ mod tests {
             cli.command,
             Some(Commands::Completion { shell: Shell::Bash })
         ));
+    }
+
+    #[test]
+    fn app_server_transports_are_mutually_exclusive() {
+        assert!(matches!(
+            parse_ok(&["deepseek", "app-server", "--http"]).command,
+            Some(Commands::AppServer(AppServerArgs {
+                http: true,
+                mobile: false,
+                stdio: false,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            parse_ok(&["deepseek", "app-server", "--mobile"]).command,
+            Some(Commands::AppServer(AppServerArgs {
+                mobile: true,
+                http: false,
+                stdio: false,
+                ..
+            }))
+        ));
+
+        for argv in [
+            ["deepseek", "app-server", "--http", "--mobile"].as_slice(),
+            ["deepseek", "app-server", "--http", "--stdio"].as_slice(),
+            ["deepseek", "app-server", "--mobile", "--stdio"].as_slice(),
+        ] {
+            let err = Cli::try_parse_from(argv).expect_err("conflicting transports must fail");
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "argv={argv:?}");
+        }
+    }
+
+    #[test]
+    fn app_server_qr_requires_mobile() {
+        let err = Cli::try_parse_from(["deepseek", "app-server", "--qr"])
+            .expect_err("--qr without --mobile must fail");
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(matches!(
+            parse_ok(&["deepseek", "app-server", "--mobile", "--qr"]).command,
+            Some(Commands::AppServer(AppServerArgs {
+                mobile: true,
+                qr: true,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn app_server_serve_passthrough_maps_flags_to_serve() {
+        let args = AppServerArgs {
+            http: true,
+            mobile: false,
+            stdio: false,
+            qr: false,
+            host: Some("127.0.0.1".to_string()),
+            port: Some(9000),
+            workers: Some(4),
+            config: None,
+            auth_token: Some("tok".to_string()),
+            insecure_no_auth: true,
+            cors_origin: vec!["http://localhost:5173".to_string()],
+        };
+        let argv = app_server_serve_passthrough(&args);
+        let as_str: Vec<&str> = argv.iter().map(String::as_str).collect();
+        // app-server's --insecure-no-auth maps onto serve's --insecure.
+        assert_eq!(
+            as_str,
+            vec![
+                "serve",
+                "--http",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "9000",
+                "--workers",
+                "4",
+                "--cors-origin",
+                "http://localhost:5173",
+                "--auth-token",
+                "tok",
+                "--insecure",
+            ]
+        );
+    }
+
+    #[test]
+    fn app_server_serve_passthrough_mobile_defaults_are_minimal() {
+        let args = AppServerArgs {
+            http: false,
+            mobile: true,
+            stdio: false,
+            qr: true,
+            host: None,
+            port: None,
+            workers: None,
+            config: None,
+            auth_token: None,
+            insecure_no_auth: false,
+            cors_origin: vec![],
+        };
+        let argv = app_server_serve_passthrough(&args);
+        let as_str: Vec<&str> = argv.iter().map(String::as_str).collect();
+        // No host/port forwarded → serve applies its own --mobile 0.0.0.0 default.
+        // No auth token is injected from the environment into child argv.
+        assert_eq!(as_str, vec!["serve", "--mobile", "--qr"]);
+    }
+
+    #[test]
+    fn serve_help_documents_forwarded_runtime_modes() {
+        let help = help_for(&["codewhale", "serve", "--help"]);
+        for flag in ["--http", "--mobile", "--mcp", "--acp"] {
+            assert!(
+                help.contains(flag),
+                "serve help should document forwarded flag {flag}; help was:\n{help}"
+            );
+        }
+        assert!(help.contains("compatibility"));
     }
 
     #[test]
@@ -2773,6 +3011,8 @@ mod tests {
             ("zai", ProviderArg::Zai),
             ("stepfun", ProviderArg::Stepfun),
             ("minimax", ProviderArg::Minimax),
+            ("deepinfra", ProviderArg::Deepinfra),
+            ("deep-infra", ProviderArg::Deepinfra),
         ] {
             let cli = parse_ok(&[
                 "deepseek",

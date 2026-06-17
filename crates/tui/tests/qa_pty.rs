@@ -121,6 +121,61 @@ fn smoke_boot_paints_composer() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Regression for v0.8.61 startup: the dispatcher-side config writer produced
+/// camelCase keys plus `[features.enabled]`, while the TUI config reader only
+/// accepted snake_case and flat `[features]` booleans. That failed before the
+/// TUI log initialized and looked like an interactive launch crash from the
+/// facade. Boot through a real PTY and prove early init reaches the trust
+/// prompt and accepts input.
+#[test]
+fn interactive_init_accepts_input_with_dispatcher_written_config() -> anyhow::Result<()> {
+    let _guard = qa_pty_test_lock();
+    let ws = make_sealed_workspace()?;
+    std::fs::write(
+        ws.home().join(".codewhale").join("config.toml"),
+        r#"
+provider = "zai"
+fallbackProviders = []
+apiKey = "deepseek-test-key"
+defaultTextModel = "deepseek-v4-pro"
+authMode = "api_key"
+
+[providers.zai]
+apiKey = "zai-test-key"
+authMode = "api_key"
+
+[providers.zai.httpHeaders]
+
+[features.enabled]
+shell_tool = true
+subagents = true
+web_search = true
+"#,
+    )?;
+
+    let mut h = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+        .cwd(ws.workspace())
+        .clear_env()
+        .seal_home(ws.home())
+        .env("RUST_LOG", "warn")
+        .args([
+            "--workspace",
+            ws.workspace().to_str().expect("utf-8 workspace path"),
+            "--no-project-config",
+        ])
+        .size(40, 140)
+        .spawn()?;
+
+    h.wait_for_text("Press Enter to continue", BOOT_TIMEOUT)?;
+    h.send(keys::key::enter())?;
+    h.wait_for_text("Choose your language", BOOT_TIMEOUT)?;
+    h.send(keys::key::enter())?;
+    h.wait_for_text("Trust Workspace", BOOT_TIMEOUT)?;
+    h.send(keys::key::ch('2'))?;
+    assert_eq!(h.wait_for_exit(KEY_TIMEOUT), Some(0));
+    Ok(())
+}
+
 /// Regression for #1085: after a turn exits through the error path, terminal
 /// origin/scroll-region state must not leave blank rows above the TUI.
 #[test]

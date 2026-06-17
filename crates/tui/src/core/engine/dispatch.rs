@@ -356,6 +356,9 @@ pub(super) fn should_force_update_plan_first(mode: AppMode, content: &str) -> bo
     }
 
     let lower = content.to_ascii_lowercase();
+    // Only shortcut genuinely lightweight plan asks. Bare "make a plan" wording
+    // is often used for repo/version/build work where Plan mode still needs to
+    // inspect available context before publishing the handoff artifact.
     let asks_for_direct_plan = [
         "quick plan",
         "short plan",
@@ -366,10 +369,6 @@ pub(super) fn should_force_update_plan_first(mode: AppMode, content: &str) -> bo
         "three step plan",
         "high-level plan",
         "high level plan",
-        "give me a plan",
-        "make a plan",
-        "outline a plan",
-        "draft a plan",
     ]
     .iter()
     .any(|needle| lower.contains(needle));
@@ -387,10 +386,24 @@ pub(super) fn should_force_update_plan_first(mode: AppMode, content: &str) -> bo
         "review the code",
         "analyze the code",
         "investigate",
+        "figure out",
+        "figuring out",
         "look through",
         "understand the current",
+        "current state",
         "ground it in the codebase",
         "based on the codebase",
+        "repo",
+        "codebase",
+        "version",
+        "ver ",
+        "release",
+        "build",
+        "benchmark",
+        "api server",
+        "github.com",
+        "http://",
+        "https://",
     ]
     .iter()
     .any(|needle| lower.contains(needle));

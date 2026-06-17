@@ -2,9 +2,9 @@
 
 > 面向任意模型的终端编程智能体——开放模型优先。
 
-一套 Rust TUI 与 CLI，支持 24 个 provider。DeepSeek、OpenRouter、Hugging Face
-以及本地 vLLM/SGLang/Ollama 都是一等路由；当你手里是 Anthropic Claude 或
-OpenAI 的 key 时，CodeWhale 也以原生协议直连。工具经审批放行、操作系统级沙箱，
+一套 Rust TUI 与 CLI，支持 25 个 provider。DeepSeek、OpenRouter、Hugging Face、
+DeepInfra 以及本地 vLLM/SGLang/Ollama 都是一等路由；当你手里是 Anthropic Claude
+或 OpenAI 的 key 时，CodeWhale 也以原生协议直连。工具经审批放行、操作系统级沙箱，
 每一轮都可用 `/restore` 回滚。
 
 [English README](README.md) · [日本語 README](README.ja-JP.md) · [Tiếng Việt README](README.vi.md) · [codewhale.net](https://codewhale.net/) · [安装指南](docs/INSTALL.md) · [Provider 注册表](docs/PROVIDERS.md) · [更新日志](CHANGELOG.md)
@@ -31,6 +31,10 @@ npm wrapper（Node 18+）会从 GitHub Releases 下载经 SHA-256 校验的二�
 cargo install codewhale-cli --locked
 cargo install codewhale-tui --locked
 ```
+
+> **Linux 用户注意：** 请先安装系统构建依赖：
+> `sudo apt-get install -y build-essential pkg-config libdbus-1-dev`。
+> 详见 [INSTALL.md](docs/INSTALL.md#4-install-via-cargo-any-tier-1-rust-target)。
 
 如果访问 GitHub 不稳定，推荐直接走下面的 CNB 镜像。其他安装路径：
 
@@ -110,19 +114,19 @@ codewhale exec --allowed-tools read_file,exec_shell --max-turns 10 "fix the fail
   `--disallowed-tools`（deny 优先）、`--max-turns` 和
   `--append-system-prompt` *(0.8.58)*，面向脚本和 CI。
 - **随处可嵌入。** HTTP/SSE 与 ACP 运行时 API、VS Code 扩展（Phase 0），
-  以及 Telegram/飞书桥接。
+  以及 Telegram/飞书桥接（微信桥接实验性）。
 - **日常主力的打磨。** MCP 客户端*和*服务器、可复用 skills、7 种语言本地化
   （0.8.56 起覆盖审批对话框），以及基于小米 MiMo 的语音/TTS。
 
 ### 任意模型，开放模型优先
 
-24 个 provider 共用同一套运行框架、同一部宪法、同一组工具：
+25 个 provider 共用同一套运行框架、同一部宪法、同一组工具：
 
 - **开放模型，托管服务：** `deepseek`（同侪之首）、`openrouter`、
   `huggingface`（Inference Providers）、`moonshot`（Kimi）、`volcengine`
   （火山方舟）、`nvidia-nim`、`together`、`fireworks`、`novita`、
   `siliconflow` / `siliconflow-CN`、`arcee`、`xiaomi-mimo`、`atlascloud`、
-  `wanjie-ark`，外加一条通用的 `openai` 兼容路由，可接任意网关。
+  `deepinfra`、`wanjie-ark`，外加一条通用的 `openai` 兼容路由，可接任意网关。
 - **开放模型，自托管：** `vllm`、`sglang`、`ollama` 直连你自己的 localhost
   端点——无需任何 key。
 - **闭源 provider，原生直连：** `anthropic` 走专用的 `/v1/messages` 适配器
@@ -138,10 +142,12 @@ base URL、能力边界——见 [docs/PROVIDERS.md](docs/PROVIDERS.md)。
 上面的版本标注对应最近三个版本（0.8.56 → 0.8.58）落地的内容。完整细节见
 [CHANGELOG.md](CHANGELOG.md)。
 
-## 核心想法
+## 核心想法 —— 这个版本放进来的 mission idea
 
 多数编程 Agent 从加码开始：更多工具、更长上下文、更多自主性。CodeWhale
 从落实责任开始。
+
+（这是本版本正在落地的设计使命；memory、cost、remote orchestration 等具体形态仍在迭代，详见下方的 v0.9.0 轨道。）
 
 一个会改你仓库的 Agent 应该有一个地址——这个终端、这个用户、这个分支、
 这个会话。不是人格面具，而是一个回信地址。出了问题，“是模型干的”不是答案；

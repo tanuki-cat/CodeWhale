@@ -2,10 +2,10 @@
 
 > The terminal coding agent for any model — open models first.
 
-A Rust TUI and CLI, 24 providers. DeepSeek, OpenRouter, Hugging Face, and local
-vLLM/SGLang/Ollama are first-class routes, and CodeWhale speaks natively to
-Anthropic Claude and OpenAI when that's what you have. Approval-gated tools, OS
-sandboxing, and `/restore` rollback for every turn.
+A Rust TUI and CLI, 25 providers. DeepSeek, OpenRouter, Hugging Face,
+DeepInfra, and local vLLM/SGLang/Ollama are first-class routes, and CodeWhale
+speaks natively to Anthropic Claude and OpenAI when that's what you have.
+Approval-gated tools, OS sandboxing, and `/restore` rollback for every turn.
 
 [简体中文 README](README.zh-CN.md) · [日本語 README](README.ja-JP.md) · [Tiếng Việt README](README.vi.md) · [codewhale.net](https://codewhale.net/) · [Install guide](docs/INSTALL.md) · [Provider registry](docs/PROVIDERS.md) · [Changelog](CHANGELOG.md)
 
@@ -31,6 +31,10 @@ building from source? Use cargo (Rust 1.88+):
 cargo install codewhale-cli --locked
 cargo install codewhale-tui --locked
 ```
+
+> **Linux users:** install system build dependencies first:
+> `sudo apt-get install -y build-essential pkg-config libdbus-1-dev`.
+> See [INSTALL.md](docs/INSTALL.md#4-install-via-cargo-any-tier-1-rust-target).
 
 Every other path:
 
@@ -123,7 +127,7 @@ rails are runtime mechanisms, not advice the model has to remember:
 - **Remote setup** *(0.8.61)*. `codewhale remote-setup` — guided cloud
   deployment and chat-bridge (Telegram/Feishu) provisioning in one command.
 - **Embedded everywhere.** HTTP/SSE and ACP runtime APIs, a VS Code extension
-  (Phase 0), and Telegram/Feishu bridges.
+  (Phase 0), and Telegram/Feishu bridges (Weixin bridge experimental).
 - **Provider balance query** *(0.8.61)*. `/balance` and `codewhale balance` query
   the active provider's account credits over the network — DeepSeek surfaces
   granted promotional credit, OpenRouter reports total credits. The footer chip
@@ -134,14 +138,14 @@ rails are runtime mechanisms, not advice the model has to remember:
 
 ### Any model, open models first
 
-Twenty-four providers route through the same harness, same constitution, same
+Twenty-five providers route through the same harness, same constitution, same
 tools:
 
 - **Open models, hosted:** `deepseek` (first among equals), `openrouter`,
   `huggingface` (Inference Providers), `moonshot` (Kimi), `zai` (GLM),
   `minimax`, `volcengine` (Ark), `nvidia-nim`, `together`, `fireworks`,
   `novita`, `siliconflow` / `siliconflow-CN`, `arcee`, `xiaomi-mimo`,
-  `stepfun`, `atlascloud`, `wanjie-ark`, plus a generic `openai`-compatible
+  `deepinfra`, `stepfun`, `atlascloud`, `wanjie-ark`, plus a generic `openai`-compatible
   route for any gateway.
 - **Open models, self-hosted:** `vllm`, `sglang`, and `ollama` against your
   own localhost endpoints — no key required.
@@ -160,7 +164,7 @@ registry — credentials, base URLs, capability boundaries — lives in
 The version tags above mark what landed in the last several releases
 (0.8.56 → 0.8.61). Full details in [CHANGELOG.md](CHANGELOG.md).
 
-## The Idea
+## The Idea — mission idea put in this version
 
 Most coding agents start by adding power: more tools, more context, more
 autonomy. CodeWhale starts by assigning responsibility.
@@ -169,6 +173,10 @@ An agent that edits your repo should have an address — this terminal, this
 user, this branch, this session. Not a persona; a return address. When
 something breaks, "the model did it" is not an answer. "This instance, in this
 session, after this approval" is.
+
+*(This is the design mission being put in place in this version. The exact
+shape — especially memory, cost accounting, and remote orchestration — is
+still iterating; see the v0.9.0 track below.)*
 
 Then it needs law. A real working session is a conflict stack: your current
 request, the repo's instructions, fresh shell output, stale memory, and a

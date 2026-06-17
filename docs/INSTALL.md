@@ -158,6 +158,24 @@ cargo install codewhale-tui     --locked   # provides `codewhale-tui`
 codewhale --version
 ```
 
+> **Linux: install build-time dependencies first.** `cargo install` compiles
+> from source, and on Linux the `codewhale-tui` crate links against
+> `libdbus-1` (used by the D-Bus secret-service backend for credential
+> storage). Install the required system packages before running `cargo install`:
+>
+> ```bash
+> # Debian / Ubuntu
+> sudo apt-get install -y build-essential pkg-config libdbus-1-dev
+>
+> # Fedora / RHEL
+> sudo dnf install -y gcc make pkgconf-pkg-config dbus-devel
+> ```
+>
+> If you use the npm wrapper or download GitHub Release binaries, these
+> build-time packages are **not** required — the prebuilt binary only
+> needs the runtime library (`libdbus-1`), which is already present on
+> most desktop Linux installs.
+
 ### China / mirror-friendly install
 
 When installing from mainland China, configure mirrors for both **rustup**
@@ -603,9 +621,10 @@ cargo install codewhale-cli --locked
 
 ### npm download is slow or times out from mainland China
 
-Set `DEEPSEEK_TUI_RELEASE_BASE_URL` to a mirrored release-asset directory
+Set `CODEWHALE_RELEASE_BASE_URL` to a mirrored release-asset directory
 (rsproxy, TUNA, Tencent COS, Aliyun OSS), or skip npm entirely and use the
 Cargo mirror setup in [Section 4](#4-install-via-cargo-any-tier-1-rust-target).
+The legacy `DEEPSEEK_TUI_RELEASE_BASE_URL` name is still accepted.
 
 ### `codewhale update` is blocked by GitHub from mainland China
 
@@ -624,13 +643,14 @@ cargo install --git https://cnb.cool/codewhale.net/codewhale --tag vX.Y.Z codewh
 If you operate a binary asset mirror, `codewhale update` can use it directly:
 
 ```bash
+CODEWHALE_RELEASE_BASE_URL=https://your-mirror.example.com/CodeWhale/vX.Y.Z/ \
 DEEPSEEK_TUI_VERSION=X.Y.Z \
-DEEPSEEK_TUI_RELEASE_BASE_URL=https://your-mirror.example.com/CodeWhale/vX.Y.Z/ \
 codewhale update
 ```
 
 The mirror directory must contain `codewhale-artifacts-sha256.txt` and the
-platform binaries from the GitHub release.
+platform binaries from the GitHub release. The legacy
+`DEEPSEEK_TUI_RELEASE_BASE_URL` mirror variable remains supported as an alias.
 
 ### Debian/Ubuntu: `feature edition2024 is required` from `cargo install`
 

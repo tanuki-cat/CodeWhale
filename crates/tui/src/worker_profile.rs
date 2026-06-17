@@ -3,13 +3,13 @@
 //! #414 / #426 / #1186).
 //!
 //! This is the **WhaleFlow substrate**: every detached worker — whether launched
-//! as a `agent_open` sub-agent or a Fleet worker — should run under a profile
+//! as an `agent` sub-agent or a Fleet worker — should run under a profile
 //! that bounds what it may do (permissions, shell access, tool scope, model
 //! route, recursion budget, foreground/background). A child profile is always
 //! **derived** from its parent and can never escalate beyond it.
 //!
 //! Scope: this module defines the contract and the parent→child derivation with
-//! tests. `agent_open` and Fleet worker records now build and persist these
+//! tests. `agent` and Fleet worker records now build and persist these
 //! profiles so parent-visible worker projections have a single capability
 //! contract. Runtime enforcement of every declared field remains incremental
 //! follow-up work (#3217).
@@ -106,16 +106,18 @@ pub enum ToolScope {
     Explicit(Vec<String>),
 }
 
-/// How a worker's model is selected — the heterogeneous-model piece that makes
-/// WhaleFlow distinct from a single-model sub-agent fan-out (#3217, #2027,
-/// #1768). A scout/tool role can ride a cheap flash route while a synthesis role
-/// inherits the (typically larger) session model.
+/// How a worker's model is selected. New model-facing spawns default to the
+/// parent/session model; a child only takes a smaller/faster family sibling when
+/// the parent explicitly asks for that route.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelRoute {
     /// Same model as the parent / session.
     Inherit,
-    /// Provider-aware automatic routing (e.g. flash for scouts, pro for synthesis).
+    /// Explicitly request a smaller/faster same-family sibling when known.
+    Faster,
+    /// Legacy persisted route from the old hidden auto-router. New spawns do
+    /// not emit this; runtime treats it like `Faster` for compatibility.
     Auto,
     /// An explicit model id, validated against the active provider at spawn time.
     Fixed(String),
@@ -142,7 +144,7 @@ pub struct WorkerRuntimeProfile {
 impl WorkerRuntimeProfile {
     /// The default profile for a role — the per-role posture. Mirrors the role
     /// stances documented in `docs/SUBAGENTS.md` (explore/plan/review are
-    /// read-only; verifier runs tests; implementer/general/tool write).
+    /// read-only; verifier runs tests; implementer/general write).
     #[must_use]
     pub fn for_role(role: SubAgentType) -> Self {
         let (permissions, shell) = match role {
@@ -155,24 +157,18 @@ impl WorkerRuntimeProfile {
             // Verifier: doesn't modify code, but runs the test suite.
             SubAgentType::Verifier => (PermissionSet::read_only(), ShellPolicy::Full),
             // Doers.
-            SubAgentType::Implementer | SubAgentType::General | SubAgentType::ToolAgent => {
+            SubAgentType::Implementer | SubAgentType::General => {
                 (PermissionSet::full(), ShellPolicy::Full)
             }
             // Custom starts locked down; the caller opens specific tools explicitly.
             SubAgentType::Custom => (PermissionSet::read_only(), ShellPolicy::None),
-        };
-        // Cheap, machine-bound roles default to auto-routing (flash lane); the
-        // rest inherit the session model.
-        let model = match role {
-            SubAgentType::Explore | SubAgentType::ToolAgent => ModelRoute::Auto,
-            _ => ModelRoute::Inherit,
         };
         Self {
             role,
             permissions,
             shell,
             tools: ToolScope::Inherit,
-            model,
+            model: ModelRoute::Inherit,
             provider: None,
             max_spawn_depth: codewhale_config::DEFAULT_SPAWN_DEPTH,
             background: true,
@@ -277,8 +273,8 @@ mod tests {
         assert_eq!(explore.shell, ShellPolicy::ReadOnly);
         assert_eq!(
             explore.model,
-            ModelRoute::Auto,
-            "explore rides the cheap auto lane"
+            ModelRoute::Inherit,
+            "explore should not silently downgrade the child model"
         );
 
         let implementer = WorkerRuntimeProfile::for_role(SubAgentType::Implementer);

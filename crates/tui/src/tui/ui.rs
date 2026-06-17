@@ -989,10 +989,9 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         // human-noticeable; we trust the operator over a hard step cap.
         max_steps: u32::MAX,
         max_subagents: app.max_subagents,
-        interactive_launch_limit: config.interactive_launch_limit(),
+        launch_concurrency: config.launch_concurrency(),
         features: config.features(),
         compaction: app.compaction_config(),
-        capacity: crate::core::capacity::CapacityControllerConfig::from_app_config(config),
         todos: app.todos.clone(),
         plan_state: app.plan_state.clone(),
         goal_state: crate::tools::goal::new_shared_goal_state_from_host_status(
@@ -1511,6 +1510,11 @@ async fn run_event_loop(
         // First, poll for engine events (non-blocking)
         let mut received_engine_event = false;
         let mut transcript_batch_updated = false;
+        // #freeze: coalesce per-event `Op::ListSubAgents` sends into a single
+        // trailing-edge refresh per drain. At high fanout, many spawn/complete/
+        // mailbox events in one drain otherwise each take the manager write
+        // lock and trigger a full O(N) list reconcile.
+        let mut subagent_list_refresh_requested = false;
         let mut queued_to_send: Option<QueuedMessage> = None;
         let mut respawn_after_provider_rollback: Option<String> = None;
         let mut fallback_after_engine_error: Option<ApiProvider> = None;
@@ -1789,12 +1793,7 @@ async fn run_event_loop(
                         // (delegate vs fanout).
                         if matches!(
                             name.as_str(),
-                            "agent_open"
-                                | "agent_spawn"
-                                | "rlm_open"
-                                | "rlm_eval"
-                                | "rlm"
-                                | "delegate"
+                            "agent" | "rlm_open" | "rlm_eval" | "rlm" | "delegate"
                         ) {
                             app.pending_subagent_dispatch = Some(name.clone());
                             if matches!(name.as_str(), "rlm_open" | "rlm_eval" | "rlm") {
@@ -1838,16 +1837,15 @@ async fn run_event_loop(
                         // Tasks panel stays in sync with tool execution
                         // rather than waiting up to 2.5 s for the periodic
                         // poll. Also merge shell jobs (#373).
+                        // Only tools that actually change durable tasks or
+                        // background shell jobs force a jobs-panel refresh.
+                        // Checklist/todo/plan tools drive the To-do panel,
+                        // which reads `app.todos` directly and repaints on the
+                        // normal redraw — no forced refresh needed (avoids the
+                        // old per-checklist Tasks-panel churn).
                         if matches!(
                             name.as_str(),
-                            "agent_open"
-                                | "agent_spawn"
-                                | "agent_close"
-                                | "agent_cancel"
-                                | "todo_write"
-                                | "checklist_write"
-                                | "checklist_update"
-                                | "update_plan"
+                            "agent"
                                 | "task_shell_start"
                                 | "exec_shell"
                                 | "exec_shell_cancel"
@@ -1857,17 +1855,8 @@ async fn run_event_loop(
                             refresh_active_task_panel(app, &task_manager).await;
                             last_task_refresh = Instant::now();
                         }
-                        if matches!(
-                            name.as_str(),
-                            "agent_open"
-                                | "agent_eval"
-                                | "agent_close"
-                                | "agent_cancel"
-                                | "agent_wait"
-                                | "agent_result"
-                                | "agent_status"
-                        ) {
-                            let _ = engine_handle.send(Op::ListSubAgents).await;
+                        if matches!(name.as_str(), "agent") {
+                            subagent_list_refresh_requested = true;
                         }
                     }
                     EngineEvent::TurnStarted { turn_id } => {
@@ -1989,7 +1978,7 @@ async fn run_event_loop(
                             crate::core::events::TurnOutcomeStatus::Interrupted
                                 | crate::core::events::TurnOutcomeStatus::Failed
                         ) {
-                            let _ = engine_handle.send(Op::ListSubAgents).await;
+                            subagent_list_refresh_requested = true;
                         }
                         crate::tui::notifications::clear_taskbar_progress();
                         if status != crate::core::events::TurnOutcomeStatus::Completed {
@@ -2339,9 +2328,6 @@ async fn run_event_loop(
                         app.is_purging = false;
                         app.status_message = Some(message);
                     }
-                    EngineEvent::CoherenceState { state, .. } => {
-                        app.coherence_state = state;
-                    }
                     EngineEvent::PrefixCacheChange {
                         description,
                         stability_pct,
@@ -2359,25 +2345,6 @@ async fn run_event_loop(
                                 app.last_prefix_change_desc = Some(description);
                             }
                         }
-                    }
-                    EngineEvent::CapacityDecision { .. } => {
-                        // Telemetry-only event. Surface actual interventions and failures
-                        // instead of replacing the footer with no-op guardrail chatter.
-                    }
-                    EngineEvent::CapacityIntervention {
-                        action,
-                        before_prompt_tokens,
-                        after_prompt_tokens,
-                        ..
-                    } => {
-                        app.status_message = Some(format!(
-                            "Capacity intervention: {action} (~{before_prompt_tokens} -> ~{after_prompt_tokens} tokens)"
-                        ));
-                    }
-                    EngineEvent::CapacityMemoryPersistFailed { action, error, .. } => {
-                        app.status_message = Some(format!(
-                            "Capacity memory persist failed ({action}): {error}"
-                        ));
                     }
                     EngineEvent::PauseEvents { ack } => {
                         if !event_broker.is_paused() {
@@ -2425,7 +2392,7 @@ async fn run_event_loop(
                         // agent and keep the raw id out of the status bar.
                         let label = app.ensure_agent_label(&id);
                         app.status_message = Some(format!("{label} starting: {prompt_summary}"));
-                        let _ = engine_handle.send(Op::ListSubAgents).await;
+                        subagent_list_refresh_requested = true;
                     }
                     EngineEvent::AgentProgress { id, status } => {
                         let display = friendly_subagent_progress(app, &id, &status);
@@ -2523,7 +2490,7 @@ async fn run_event_loop(
                             terminal_paused_at = None;
                             app.needs_redraw = true;
                         }
-                        let _ = engine_handle.send(Op::ListSubAgents).await;
+                        subagent_list_refresh_requested = true;
                     }
                     EngineEvent::AgentList { agents } => {
                         let mut sorted = agents.clone();
@@ -2542,11 +2509,24 @@ async fn run_event_loop(
                     EngineEvent::SubAgentMailbox { seq, message } => {
                         let should_refresh_subagents =
                             subagent_message_refreshes_workspace_context(&message);
-                        handle_subagent_mailbox(app, seq, &message);
+                        let updated_transcript = handle_subagent_mailbox(app, seq, &message);
                         if should_refresh_subagents {
-                            let _ = engine_handle.send(Op::ListSubAgents).await;
+                            subagent_list_refresh_requested = true;
                         }
-                        transcript_batch_updated = true;
+                        if updated_transcript {
+                            transcript_batch_updated = true;
+                        } else if !should_refresh_subagents
+                            && matches!(
+                                message,
+                                crate::tools::subagent::MailboxMessage::Progress { .. }
+                            )
+                        {
+                            // Progress mailbox envelopes mirror AgentProgress.
+                            // When the card state did not visibly change, do
+                            // not let the duplicate envelope bypass the
+                            // AgentProgress redraw throttle.
+                            received_engine_event = redraw_requested_before_event;
+                        }
                     }
                     EngineEvent::ApprovalRequired {
                         id,
@@ -2651,10 +2631,6 @@ async fn run_event_loop(
                             "Action required: answer the popup with 1-4, arrows, or Enter"
                                 .to_string(),
                         );
-                    }
-                    EngineEvent::ToolCallProgress { id, output } => {
-                        app.status_message =
-                            Some(format!("Tool {id}: {}", summarize_tool_output(&output)));
                     }
                     EngineEvent::ElevationRequired {
                         tool_id,
@@ -2771,6 +2747,11 @@ async fn run_event_loop(
         }
         if received_engine_event {
             app.needs_redraw = true;
+        }
+        // #freeze: one trailing-edge sub-agent list refresh per drain, no
+        // matter how many spawn/complete/mailbox events arrived this batch.
+        if subagent_list_refresh_requested {
+            let _ = engine_handle.send(Op::ListSubAgents).await;
         }
 
         if let Some(next) = queued_to_send {
@@ -3011,7 +2992,6 @@ async fn run_event_loop(
                 tracing::debug!(
                     width,
                     height,
-                    coherence = ?app.coherence_state,
                     use_alt_screen = app.use_alt_screen,
                     "Event::Resize received; clearing terminal"
                 );
@@ -4667,10 +4647,6 @@ fn hotbar_slot_from_key(app: &App, key: &event::KeyEvent) -> Option<u8> {
     }
     let slot = c.to_digit(10).and_then(|digit| u8::try_from(digit).ok())?;
 
-    if key.modifiers == KeyModifiers::NONE {
-        return app.input.is_empty().then_some(slot);
-    }
-
     if key.modifiers.contains(KeyModifiers::ALT)
         && !key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::SUPER)
@@ -5694,10 +5670,10 @@ fn paused_command_note(title: &str, resume: bool) -> String {
         "The user is not resuming that paused command. Answer only the new message and do not continue the paused command."
     };
     format!(
-        "\n\n<runtime_prompt visibility=\"internal\">\n\
+        "\n\nCodeWhale paused custom slash command context:\n\
 Paused custom slash command: {title}\n\
-{instruction}\n\
-</runtime_prompt>"
+Paused command: {title}\n\
+{instruction}"
     )
 }
 
@@ -7995,6 +7971,7 @@ fn render(f: &mut Frame, app: &mut App) {
             crate::config::ApiProvider::Vllm => Some("vLLM"),
             crate::config::ApiProvider::Ollama => Some("Ollama"),
             crate::config::ApiProvider::Huggingface => Some("HF"),
+            crate::config::ApiProvider::Deepinfra => Some("DeepInfra"),
             crate::config::ApiProvider::Together => Some("Together"),
             crate::config::ApiProvider::OpenaiCodex => Some("Codex"),
             crate::config::ApiProvider::Zai => Some("Z.ai"),
@@ -8065,7 +8042,13 @@ fn render(f: &mut Frame, app: &mut App) {
                 body_chunks[0]
             };
 
-        if let Some(sidebar_width) = sidebar_width_for_chat_area(app, chat_area.width) {
+        // Auto-reveal: in Auto focus mode, collapse the sidebar to a
+        // full-width transcript when nothing is active; bring it back the
+        // moment there is a To-do, a live fleet, or background jobs.
+        let sidebar_auto_collapsed = crate::tui::sidebar::sidebar_auto_idle(app);
+        if !sidebar_auto_collapsed
+            && let Some(sidebar_width) = sidebar_width_for_chat_area(app, chat_area.width)
+        {
             // Record total width for drag-to-resize percentage calculation.
             app.sidebar_resize_total_width = chat_area.width;
             let split = Layout::default()
@@ -8865,7 +8848,6 @@ fn suppress_engine_event_after_local_cancel(event: &EngineEvent) -> bool {
             | EngineEvent::ThinkingDelta { .. }
             | EngineEvent::ThinkingComplete { .. }
             | EngineEvent::ToolCallStarted { .. }
-            | EngineEvent::ToolCallProgress { .. }
             | EngineEvent::ToolCallComplete { .. }
             | EngineEvent::ApprovalRequired { .. }
             | EngineEvent::UserInputRequired { .. }
@@ -8884,7 +8866,6 @@ fn ignore_stale_stream_event_while_idle(event: &EngineEvent) -> bool {
             | EngineEvent::ThinkingDelta { .. }
             | EngineEvent::ThinkingComplete { .. }
             | EngineEvent::ToolCallStarted { .. }
-            | EngineEvent::ToolCallProgress { .. }
             | EngineEvent::ToolCallComplete { .. }
             | EngineEvent::ApprovalRequired { .. }
             | EngineEvent::UserInputRequired { .. }
@@ -9055,6 +9036,7 @@ async fn apply_provider_picker_api_key(
             ApiProvider::Vllm => &mut providers.vllm,
             ApiProvider::Ollama => &mut providers.ollama,
             ApiProvider::Huggingface => &mut providers.huggingface,
+            ApiProvider::Deepinfra => &mut providers.deepinfra,
             ApiProvider::Together => &mut providers.together,
             ApiProvider::OpenaiCodex => &mut providers.openai_codex,
             ApiProvider::Anthropic => &mut providers.anthropic,
@@ -9118,6 +9100,7 @@ fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, 
         ApiProvider::Vllm => &mut providers.vllm,
         ApiProvider::Ollama => &mut providers.ollama,
         ApiProvider::Huggingface => &mut providers.huggingface,
+        ApiProvider::Deepinfra => &mut providers.deepinfra,
         ApiProvider::Together => &mut providers.together,
         ApiProvider::OpenaiCodex => &mut providers.openai_codex,
         ApiProvider::Anthropic => &mut providers.anthropic,
@@ -10089,6 +10072,9 @@ fn activity_detail_text(app: &App, cell_index: usize, width: u16) -> Option<Stri
     if let Some(handle) = activity_detail_handle_line(app, cell_index, cell) {
         sections.push(handle);
     }
+    if let Some(summary) = activity_input_summary_line(cell) {
+        sections.push(summary);
+    }
 
     sections.push(String::new());
     sections.push(activity_cell_to_text(cell, width));
@@ -10392,6 +10378,18 @@ fn activity_detail_handle_line(app: &App, cell_index: usize, cell: &HistoryCell)
         HistoryCell::Tool(_) => Some("Detail handle: Alt+V details".to_string()),
         HistoryCell::SubAgent(_) => Some("Detail handle: Alt+V details".to_string()),
         _ => None,
+    }
+}
+
+fn activity_input_summary_line(cell: &HistoryCell) -> Option<String> {
+    let HistoryCell::Tool(ToolCell::Generic(generic)) = cell else {
+        return None;
+    };
+    let summary = generic.input_summary.as_deref()?.trim();
+    if summary.is_empty() {
+        None
+    } else {
+        Some(format!("Input: {summary}"))
     }
 }
 

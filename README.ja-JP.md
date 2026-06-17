@@ -2,7 +2,7 @@
 
 > あらゆるモデルのためのターミナルコーディングエージェント — オープンモデルを最優先に。
 
-Rust 製の TUI と CLI、24 のプロバイダ。DeepSeek、OpenRouter、Hugging Face、ローカルの vLLM/SGLang/Ollama を第一級のルートとして扱い、手元にあるのが Anthropic Claude や OpenAI のキーなら、それらの API もネイティブに扱えます。承認ゲート付きツール、OS サンドボックス、そして全ターンを巻き戻せる `/restore`。
+Rust 製の TUI と CLI、25 のプロバイダ。DeepSeek、OpenRouter、Hugging Face、DeepInfra、ローカルの vLLM/SGLang/Ollama を第一級のルートとして扱い、手元にあるのが Anthropic Claude や OpenAI のキーなら、それらの API もネイティブに扱えます。承認ゲート付きツール、OS サンドボックス、そして全ターンを巻き戻せる `/restore`。
 
 [English README](README.md) · [简体中文 README](README.zh-CN.md) · [Tiếng Việt README](README.vi.md) · [codewhale.net](https://codewhale.net/) · [Install guide](docs/INSTALL.md) · [Provider registry](docs/PROVIDERS.md) · [Changelog](CHANGELOG.md)
 
@@ -26,6 +26,10 @@ npm wrapper（Node 18+）は GitHub Releases から SHA-256 検証済みのバ�
 cargo install codewhale-cli --locked
 cargo install codewhale-tui --locked
 ```
+
+> **Linux ユーザーへ:** ビルド依存パッケージを先にインストールしてください:
+> `sudo apt-get install -y build-essential pkg-config libdbus-1-dev`。
+> 詳細は [INSTALL.md](docs/INSTALL.md#4-install-via-cargo-any-tier-1-rust-target) を参照。
 
 その他の経路:
 
@@ -87,14 +91,14 @@ codewhale exec --allowed-tools read_file,exec_shell --max-turns 10 "fix the fail
 - **プロバイダを認識する並行サブエージェント** *(0.8.58)*。調査と実装を並列に進め、big/cheap のモデル階層はプロバイダごとに解決されます — モデル ID のハードコードはありません。
 - **耐久性のあるセッション。** fork、relay 引き継ぎ、そして Plan/Agent/YOLO のモード切り替えをまたいでもバイト単位で安定する、セッション横断のディスク永続プロンプトキャッシュ *(0.8.56)*。ターンはシステムのスリープも生き延びます *(0.8.57)*: ストリーミング中にサスペンドしても、復帰後にリクエストが静かに再発行され、ターンは失敗しません。
 - **ヘッドレスモード。** スクリプトや CI 向けに、`codewhale exec` が `--allowed-tools`、`--disallowed-tools`（deny 優先）、`--max-turns`、`--append-system-prompt` *(0.8.58)* に対応。
-- **どこにでも組み込める。** HTTP/SSE と ACP の Runtime API、VS Code 拡張（Phase 0）、Telegram/Feishu ブリッジ。
+- **どこにでも組み込める。** HTTP/SSE と ACP の Runtime API、VS Code 拡張（Phase 0）、Telegram/Feishu ブリッジ（Weixin ブリッジは実験的）。
 - **日常使いの磨き込み。** MCP のクライアント*かつ*サーバー、再利用可能なスキル、7 ロケールのローカライズ（0.8.56 から承認ダイアログも対象）、Xiaomi MiMo による音声合成（TTS）。
 
 ### あらゆるモデル、まずはオープンモデル
 
-24 のプロバイダが、同じハーネス、同じ Constitution、同じツール群を通ります:
+25 のプロバイダが、同じハーネス、同じ Constitution、同じツール群を通ります:
 
-- **オープンモデル（ホスト型）:** `deepseek`（同格の中の筆頭）、`openrouter`、`huggingface`（Inference Providers）、`moonshot`（Kimi）、`volcengine`（Ark）、`nvidia-nim`、`together`、`fireworks`、`novita`、`siliconflow` / `siliconflow-CN`、`arcee`、`xiaomi-mimo`、`atlascloud`、`wanjie-ark`、さらに任意のゲートウェイに使える汎用の `openai` 互換ルート。
+- **オープンモデル（ホスト型）:** `deepseek`（同格の中の筆頭）、`openrouter`、`huggingface`（Inference Providers）、`moonshot`（Kimi）、`volcengine`（Ark）、`nvidia-nim`、`together`、`fireworks`、`novita`、`siliconflow` / `siliconflow-CN`、`arcee`、`xiaomi-mimo`、`deepinfra`、`atlascloud`、`wanjie-ark`、さらに任意のゲートウェイに使える汎用の `openai` 互換ルート。
 - **オープンモデル（セルフホスト型）:** `vllm`、`sglang`、`ollama` を自分の localhost エンドポイントに向けて使えます — キーは不要です。
 - **クローズドプロバイダ（ネイティブ対応）:** `anthropic` は専用の `/v1/messages` アダプタ *(0.8.58)* 経由で、適応的 thinking、プロンプトキャッシュのブレークポイント、署名付き thinking のリプレイに対応します — OpenAI 方言のシムではありません。`openai-codex` は既存の ChatGPT/Codex CLI ログインを再利用します。
 
@@ -102,9 +106,11 @@ codewhale exec --allowed-tools read_file,exec_shell --max-turns 10 "fix the fail
 
 上のバージョンタグは、直近 3 リリース（0.8.56 → 0.8.58）で入ったものを示しています。詳細は [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
-## 考え方
+## 考え方 — このバージョンに入れている mission idea
 
 多くのコーディングエージェントは、力を足すところから始めます。もっと多くのツール、もっと長いコンテキスト、もっと強い自律性。CodeWhale は責任を割り当てるところから始めます。
+
+（これはこのバージョンで形にしているデザインミッションです。memory や cost、remote orchestration の具体的な形はまだイテレーション中です — 下の v0.9.0 Track を参照。）
 
 リポジトリを編集するエージェントには住所があるべきです — このターミナル、このユーザー、このブランチ、このセッション。人格ではなく、返送先の住所です。何かが壊れたとき、「モデルがやった」は答えになりません。「このインスタンスが、このセッションで、この承認のあとに」なら答えになります。
 

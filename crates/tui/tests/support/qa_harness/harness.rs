@@ -238,6 +238,11 @@ impl Harness {
         self.pty.shutdown(Duration::from_secs(2))
     }
 
+    /// Wait for the child process to exit without sending it a signal.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<i32> {
+        self.pty.wait_until(Instant::now() + timeout)
+    }
+
     pub fn debug_dump(&mut self) -> String {
         self.pump();
         self.frame.debug_dump()

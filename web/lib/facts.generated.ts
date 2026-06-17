@@ -18,7 +18,7 @@ export interface RepoFacts {
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-06-14T08:12:37.396Z",
+  "generatedAt": "2026-06-16T08:03:17.993Z",
   "version": "0.8.61",
   "crates": [
     "agent",
@@ -135,6 +135,41 @@ export const FACTS: RepoFacts = {
       "id": "huggingface",
       "label": "Hugging Face",
       "env": "HUGGINGFACE_API_KEY / HF_TOKEN"
+    },
+    {
+      "id": "together",
+      "label": "Together AI",
+      "env": "TOGETHER_API_KEY"
+    },
+    {
+      "id": "openai-codex",
+      "label": "OpenAI Codex",
+      "env": "ChatGPT/Codex OAuth via `codex login` (OPENAI_CODEX_ACCESS_TOKEN / CODEX_ACCESS_TOKEN override)"
+    },
+    {
+      "id": "anthropic",
+      "label": "Anthropic",
+      "env": "ANTHROPIC_API_KEY"
+    },
+    {
+      "id": "zai",
+      "label": "Z.ai",
+      "env": "ZAI_API_KEY / Z_AI_API_KEY"
+    },
+    {
+      "id": "stepfun",
+      "label": "StepFun",
+      "env": "STEPFUN_API_KEY / STEP_API_KEY"
+    },
+    {
+      "id": "minimax",
+      "label": "MiniMax",
+      "env": "MINIMAX_API_KEY"
+    },
+    {
+      "id": "deepinfra",
+      "label": "DeepInfra",
+      "env": "DEEPINFRA_API_KEY / DEEPINFRA_TOKEN"
     }
   ],
   "defaultModel": "deepseek-v4-pro",

@@ -14,7 +14,9 @@
 #   5. The current release has a dated Keep a Changelog entry and compare link.
 #   6. README contributor additions are mentioned in the current release entry.
 #   7. `SECURITY.md` keeps the dedicated security contact.
-#   8. `Cargo.lock` is in sync with the manifests (`cargo metadata --locked`
+#   8. `codewhale-app-server` stays library-only; the shipped app-server
+#      entrypoint belongs to `codewhale-cli`.
+#   9. `Cargo.lock` is in sync with the manifests (`cargo metadata --locked`
 #      fails if not).
 set -euo pipefail
 
@@ -166,7 +168,29 @@ for readme in README.md README.zh-CN.md README.ja-JP.md README.vi.md; do
   fi
 done
 
-# 10) Cargo.lock in sync.
+# 10) App-server is not a standalone binary.
+app_server_bins="$(
+  cargo metadata --locked --format-version 1 --no-deps \
+    | node -e '
+const fs = require("fs");
+const metadata = JSON.parse(fs.readFileSync(0, "utf8"));
+const pkg = metadata.packages.find((p) => p.name === "codewhale-app-server");
+if (!pkg) {
+  process.exit(2);
+}
+const bins = pkg.targets
+  .filter((target) => target.kind.includes("bin"))
+  .map((target) => target.name);
+process.stdout.write(bins.join("\n"));
+'
+)"
+if [[ -n "${app_server_bins}" ]]; then
+  echo "::error::codewhale-app-server must stay library-only; use the codewhale-cli-owned 'codewhale app-server' entrypoint instead. Unexpected binary target(s):" >&2
+  echo "${app_server_bins}" >&2
+  fail=1
+fi
+
+# 11) Cargo.lock in sync.
 if ! cargo metadata --locked --format-version 1 --no-deps >/dev/null 2>&1; then
   echo "::error::Cargo.lock is out of sync with the manifests. Run 'cargo update -p codewhale-tui' or 'cargo build' and commit the result." >&2
   fail=1

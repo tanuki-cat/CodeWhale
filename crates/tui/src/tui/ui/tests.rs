@@ -13,9 +13,9 @@ use crate::tui::file_mention::{
 };
 use crate::tui::footer_ui::{
     active_tool_status_label, footer_auxiliary_spans, footer_balance_spans, footer_cache_spans,
-    footer_coherence_spans, footer_session_tokens_spans, footer_state_label,
-    footer_status_line_spans, format_context_budget, format_token_count_compact,
-    friendly_subagent_progress, render_footer_from,
+    footer_session_tokens_spans, footer_state_label, footer_status_line_spans,
+    format_context_budget, format_token_count_compact, friendly_subagent_progress,
+    render_footer_from,
 };
 use crate::tui::history::{
     ExecCell, ExecSource, GenericToolCell, HistoryCell, SubAgentCell, ToolCell, ToolStatus,
@@ -3305,10 +3305,11 @@ fn turn_liveness_does_not_abort_running_tool() {
 #[test]
 fn turn_liveness_does_not_abort_running_tool_with_recent_heartbeat() {
     let mut app = create_test_app();
-    let now = Instant::now();
+    let started_at = Instant::now();
+    let now = started_at + TOOL_HANG_WATCHDOG_TIMEOUT + Duration::from_secs(30);
     app.is_loading = true;
     app.runtime_turn_status = Some("in_progress".to_string());
-    app.turn_started_at = Some(now - TOOL_HANG_WATCHDOG_TIMEOUT - Duration::from_secs(30));
+    app.turn_started_at = Some(started_at);
     app.turn_last_activity_at = Some(now - Duration::from_secs(10));
     let mut active = ActiveCell::new();
     active.push_tool(
@@ -3337,11 +3338,12 @@ fn turn_liveness_does_not_abort_running_tool_with_recent_heartbeat() {
 #[test]
 fn turn_liveness_recovers_running_tool_without_heartbeat() {
     let mut app = create_test_app();
-    let now = Instant::now();
+    let started_at = Instant::now();
+    let now = started_at + TOOL_HANG_WATCHDOG_TIMEOUT + Duration::from_secs(1);
     app.is_loading = true;
     app.runtime_turn_status = Some("in_progress".to_string());
     app.runtime_turn_id = Some("stale-tool-turn".to_string());
-    app.turn_started_at = Some(now - TOOL_HANG_WATCHDOG_TIMEOUT - Duration::from_secs(1));
+    app.turn_started_at = Some(started_at);
     app.turn_last_activity_at = app.turn_started_at;
     app.user_scrolled_during_stream = true;
     let mut active = ActiveCell::new();
@@ -3552,12 +3554,12 @@ fn ctrl_alt_4_focuses_agents_sidebar_without_switching_modes() {
 }
 
 #[test]
-fn hotbar_bare_digit_fires_only_when_composer_empty() {
+fn hotbar_bare_digit_inserts_text_even_when_composer_empty() {
     let mut app = create_test_app();
     app.onboarding = OnboardingState::None;
 
     let bare_four = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE);
-    assert_eq!(hotbar_slot_from_key(&app, &bare_four), Some(4));
+    assert_eq!(hotbar_slot_from_key(&app, &bare_four), None);
 
     app.input = "draft".to_string();
     assert_eq!(hotbar_slot_from_key(&app, &bare_four), None);
@@ -3621,6 +3623,26 @@ fn hotbar_dispatches_bound_slot_and_ignores_empty_slot() {
 }
 
 #[test]
+fn hotbar_dispatches_slash_command_slot() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+    let config = Config {
+        hotbar: Some(vec![codewhale_config::HotbarBindingToml {
+            slot: 1,
+            label: Some("mode".to_string()),
+            action: "slash.mode".to_string(),
+        }]),
+        ..Config::default()
+    };
+
+    assert_eq!(
+        dispatch_hotbar_slot(&mut app, &config, 1).expect("slash slot dispatch"),
+        Some(HotbarDispatch::AppAction(AppAction::OpenModePicker))
+    );
+    assert!(app.input.is_empty());
+}
+
+#[test]
 fn alt_0_restores_auto_sidebar_focus() {
     let mut app = create_test_app();
     app.sidebar_focus = SidebarFocus::Hidden;
@@ -3678,6 +3700,68 @@ fn hidden_sidebar_focus_suppresses_sidebar_split_even_when_wide() {
 
     app.sidebar_focus = SidebarFocus::Hidden;
     assert_eq!(sidebar_width_for_chat_area(&app, 120), None);
+}
+
+#[test]
+fn sidebar_auto_idle_collapses_when_nothing_active() {
+    let mut app = create_test_app();
+    app.sidebar_focus = SidebarFocus::Auto;
+    // A fresh session has no To-do, no fleet, no background jobs, no context.
+    assert!(crate::tui::sidebar::sidebar_auto_idle(&mut app));
+}
+
+#[test]
+fn sidebar_auto_idle_false_when_fleet_active() {
+    let mut app = create_test_app();
+    app.sidebar_focus = SidebarFocus::Auto;
+    app.agent_progress
+        .insert("agent_1".to_string(), "running".to_string());
+    assert!(!crate::tui::sidebar::sidebar_auto_idle(&mut app));
+}
+
+#[test]
+fn sidebar_auto_idle_false_for_explicit_focus() {
+    let mut app = create_test_app();
+    // An explicit panel pin is never auto-collapsed.
+    app.sidebar_focus = SidebarFocus::Agents;
+    assert!(!crate::tui::sidebar::sidebar_auto_idle(&mut app));
+}
+
+#[test]
+fn jobs_panel_ignores_model_reasoning_but_shows_for_real_jobs() {
+    let mut app = create_test_app();
+    app.sidebar_focus = SidebarFocus::Auto;
+
+    // Per-turn model reasoning must NOT bring the jobs/tasks panel up — an
+    // ordinary reasoning turn stays idle (full-width transcript).
+    app.task_panel = vec![crate::tui::app::TaskPanelEntry {
+        id: "reasoning".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "thinking".to_string(),
+        duration_ms: None,
+        kind: crate::tui::app::TaskPanelEntryKind::ModelReasoning,
+        stale: false,
+        elapsed_since_output_ms: None,
+    }];
+    assert!(
+        crate::tui::sidebar::sidebar_auto_idle(&mut app),
+        "model reasoning alone must not surface the jobs panel"
+    );
+
+    // A real background job (Background) does surface it.
+    app.task_panel.push(crate::tui::app::TaskPanelEntry {
+        id: "shell_1".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "shell: cargo test".to_string(),
+        duration_ms: Some(10),
+        kind: crate::tui::app::TaskPanelEntryKind::Background,
+        stale: false,
+        elapsed_since_output_ms: None,
+    });
+    assert!(
+        !crate::tui::sidebar::sidebar_auto_idle(&mut app),
+        "a real background job must surface the jobs panel"
+    );
 }
 
 // ── Sidebar resize-handle mouse tests ──────────────────────────────
@@ -3978,7 +4062,9 @@ fn reconcile_subagent_activity_state_trims_stale_progress_and_sets_anchor() {
 #[test]
 fn reconcile_subagent_activity_state_expires_terminal_cards_but_keeps_running() {
     let mut app = create_test_app();
-    let now = Instant::now();
+    let old_seen_at = Instant::now();
+    let now = old_seen_at + Duration::from_secs(10 * 60);
+    let recent_seen_at = now - Duration::from_secs(30);
     app.subagent_cache = vec![
         make_subagent(
             "agent_running",
@@ -3993,14 +4079,10 @@ fn reconcile_subagent_activity_state_expires_terminal_cards_but_keeps_running() 
             crate::tools::subagent::SubAgentStatus::Failed("boom".to_string()),
         ),
     ];
-    app.subagent_terminal_seen_at.insert(
-        "agent_old".to_string(),
-        now.checked_sub(Duration::from_secs(10 * 60)).unwrap(),
-    );
-    app.subagent_terminal_seen_at.insert(
-        "agent_recent".to_string(),
-        now.checked_sub(Duration::from_secs(30)).unwrap(),
-    );
+    app.subagent_terminal_seen_at
+        .insert("agent_old".to_string(), old_seen_at);
+    app.subagent_terminal_seen_at
+        .insert("agent_recent".to_string(), recent_seen_at);
 
     reconcile_subagent_activity_state_at(&mut app, now);
 
@@ -4019,7 +4101,8 @@ fn reconcile_subagent_activity_state_expires_terminal_cards_but_keeps_running() 
 #[test]
 fn reconcile_subagent_activity_state_caps_terminal_card_bursts() {
     let mut app = create_test_app();
-    let now = Instant::now();
+    let oldest_seen_at = Instant::now();
+    let now = oldest_seen_at + Duration::from_secs(30);
     for idx in 0..30 {
         let id = format!("agent_{idx:02}");
         app.subagent_cache.push(make_subagent(
@@ -4027,7 +4110,7 @@ fn reconcile_subagent_activity_state_caps_terminal_card_bursts() {
             crate::tools::subagent::SubAgentStatus::Completed,
         ));
         app.subagent_terminal_seen_at
-            .insert(id, now.checked_sub(Duration::from_secs(idx)).unwrap());
+            .insert(id, now - Duration::from_secs(idx));
     }
 
     reconcile_subagent_activity_state_at(&mut app, now);
@@ -4275,7 +4358,7 @@ fn stall_reason_provider_wait_flags_pending_dispatch() {
     let mut app = create_test_app();
     app.is_loading = true;
     app.turn_started_at = Some(Instant::now() - Duration::from_secs(31));
-    app.pending_subagent_dispatch = Some("agent_spawn".to_string());
+    app.pending_subagent_dispatch = Some("agent".to_string());
 
     let reason = crate::tui::footer_ui::stall_reason(&app).expect("stalled turn has a reason");
     assert!(
@@ -4648,46 +4731,6 @@ fn footer_status_line_spans_truncate_long_model_names() {
     let line = spans_text(&footer_status_line_spans(&app, 40));
     assert!(line.contains("..."));
     assert!(UnicodeWidthStr::width(line.as_str()) <= 40);
-}
-
-#[test]
-fn footer_coherence_chip_hides_healthy_and_uses_clear_labels() {
-    let mut app = create_test_app();
-
-    app.coherence_state = crate::core::coherence::CoherenceState::Healthy;
-    assert!(
-        footer_coherence_spans(&app).is_empty(),
-        "healthy state should produce no footer chip"
-    );
-
-    // GettingCrowded is intentionally suppressed — see the rationale in
-    // `footer_coherence_spans`. The footer only surfaces active engine
-    // interventions; soft pressure hints stay quiet.
-    app.coherence_state = crate::core::coherence::CoherenceState::GettingCrowded;
-    assert!(
-        footer_coherence_spans(&app).is_empty(),
-        "GettingCrowded should not surface a footer chip; only active interventions do"
-    );
-
-    let cases = [
-        (
-            crate::core::coherence::CoherenceState::RefreshingContext,
-            "refreshing context",
-        ),
-        (
-            crate::core::coherence::CoherenceState::VerifyingRecentWork,
-            "verifying",
-        ),
-        (
-            crate::core::coherence::CoherenceState::ResettingPlan,
-            "resetting plan",
-        ),
-    ];
-
-    for (state, expected) in cases {
-        app.coherence_state = state;
-        assert_eq!(spans_text(&footer_coherence_spans(&app)), expected);
-    }
 }
 
 #[test]
@@ -8172,7 +8215,7 @@ fn activity_detail_fallback_prefers_live_activity_context() {
     active.push_tool(
         "active-1",
         HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
-            name: "agent_eval".to_string(),
+            name: "agent".to_string(),
             status: ToolStatus::Running,
             input_summary: Some("agent_id: agent_af58ba3a".to_string()),
             output: None,
@@ -9072,7 +9115,6 @@ fn render_footer_from_with_empty_items_blanks_every_segment() {
     assert_eq!(props.mode_label, "");
     assert!(props.model.is_empty());
     assert!(props.cost.is_empty());
-    assert!(props.coherence.is_empty());
     assert!(props.agents.is_empty());
     assert!(props.cache.is_empty());
 }

@@ -3,31 +3,35 @@ import { Seal } from "@/components/seal";
 import { InstallCodeBlock } from "@/components/install-code-block";
 import { InstallBinary } from "@/components/install-binary";
 import { getFacts } from "@/lib/facts";
+import { buildPageMetadata } from "@/lib/page-meta";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
   const isZh = locale === "zh";
-  const facts = await getFacts();
-  const version = facts.version ?? "0.8.60";
-  return {
+  return buildPageMetadata({
+    path: "/install",
+    locale,
     title: isZh ? "安装 · CodeWhale" : "Install · CodeWhale",
     description: isZh
-      ? `安装 CodeWhale 的 codewhale / codewhale-tui 二进制对。v${version} 支持 npm、Cargo、GitHub Releases、CNB、Homebrew、预编译二进制、Docker、国内镜像。`
-      : `Install the matched codewhale / codewhale-tui binary pair. For v${version} use npm, Cargo, GitHub Releases, CNB, Homebrew, prebuilt binary, Docker, or source.`,
-  };
+      ? "一行 npm install -g codewhale 安装 CodeWhale，也支持 Cargo、GitHub Releases、CNB 镜像、Homebrew、预编译二进制、Docker 和源码编译。"
+      : "Install CodeWhale with npm install -g codewhale — or via cargo, GitHub Releases, the CNB mirror, Homebrew, prebuilt binaries, Docker, or from source.",
+  });
 }
 
+const NPM_INSTALL = `npm install -g codewhale`;
 const CARGO_INSTALL = `cargo install codewhale-cli --locked
 cargo install codewhale-tui --locked`;
 const FIRST_RUN = `codewhale`;
-const VERIFY = `codewhale --version
-codewhale doctor`;
 
 const UPDATE = `codewhale update`;
 
 const SET_KEY_BASH = `export DEEPSEEK_API_KEY=sk-...`;
 const SET_KEY_AUTH = `codewhale auth set --provider deepseek --api-key sk-...`;
 
+const RELEASE_DOWNLOAD = `# Download your platform archive (incl. Linux riscv64):
+https://github.com/Hmbown/CodeWhale/releases/latest`;
+const cnbInstall = (tag: string) => `cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${tag} codewhale-cli --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${tag} codewhale-tui --locked --force`;
 const TUNA_CONFIG = `# ~/.cargo/config.toml
 [source.crates-io]
 replace-with = "tuna"
@@ -79,15 +83,12 @@ export default async function InstallPage({ params }: { params: Promise<{ locale
   const { locale } = await params;
   const isZh = locale === "zh";
   const facts = await getFacts();
-  const version = facts.version ?? "0.8.60";
-  const releaseTag = `v${version}`;
+  const tag = facts.version ? `v${facts.version}` : "v0.8.x";
+  const verify = `codewhale --version   # ${facts.version ?? "prints the installed version"}
+codewhale doctor`;
 
   const copyLabel = isZh ? "复制" : "Copy";
   const copiedLabel = isZh ? "已复制 ✓" : "Copied ✓";
-  const releaseDownload = `# Download your platform archive:
-https://github.com/Hmbown/CodeWhale/releases/tag/${releaseTag}`;
-  const cnbInstall = `cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${releaseTag} codewhale-cli --locked --force
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${releaseTag} codewhale-tui --locked --force`;
 
   return (
     <>
@@ -106,22 +107,27 @@ cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${releaseTag}
         </h1>
 
         <div className="space-y-3">
-          <InstallCodeBlock cmd={CARGO_INSTALL} copyLabel={copyLabel} copiedLabel={copiedLabel} />
+          <InstallCodeBlock cmd={NPM_INSTALL} copyLabel={copyLabel} copiedLabel={copiedLabel} />
           <InstallCodeBlock cmd={FIRST_RUN} copyLabel={copyLabel} copiedLabel={copiedLabel} />
         </div>
 
         <p className="mt-4 text-sm text-ink-soft leading-relaxed max-w-2xl">
           {isZh ? (
             <>
-              v{version} 支持 Cargo、npm、GitHub Releases、CNB、国内镜像、Homebrew、预编译二进制等安装路径。
-              如果某个包管理器落后于 release assets，请临时使用 GitHub Releases 或 Cargo。
+              npm wrapper（Node 18+）会从 GitHub Releases 下载经 SHA-256 校验的二进制，并安装{" "}
+              <code className="inline">codewhale</code>、<code className="inline">codew</code> 和{" "}
+              <code className="inline">codewhale-tui</code> 三个命令。
+              下方「其他安装方式」列出 Cargo、GitHub Releases、CNB、国内镜像、Homebrew、预编译二进制和 Docker。
             </>
           ) : (
             <>
-              For v{version}, use Cargo, npm, GitHub Releases, CNB, Homebrew, prebuilt binaries,
-              or mainland China mirrors. If one package manager lags the release assets, use{" "}
-              <a href="#other-ways" className="body-link">Other ways to install</a> below while
-              the mirror catches up.
+              The npm wrapper (Node 18+) downloads SHA-256-verified binaries from GitHub Releases
+              and installs <code className="inline">codewhale</code>,{" "}
+              <code className="inline">codew</code>, and{" "}
+              <code className="inline">codewhale-tui</code>. See{" "}
+              <a href="#other-ways" className="body-link">Other ways to install</a> below for
+              cargo, GitHub Releases, CNB, Homebrew, prebuilt binaries, Docker, or mainland China
+              mirrors.
             </>
           )}
         </p>
@@ -134,7 +140,7 @@ cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${releaseTag}
           <div className="eyebrow">{isZh ? "02 · 验证" : "02 · Verify"}</div>
         </div>
 
-        <InstallCodeBlock cmd={VERIFY} copyLabel={copyLabel} copiedLabel={copiedLabel} />
+        <InstallCodeBlock cmd={verify} copyLabel={copyLabel} copiedLabel={copiedLabel} />
 
         <p className="mt-4 text-sm text-ink-soft leading-relaxed max-w-2xl">
           {isZh ? (
@@ -166,17 +172,20 @@ cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${releaseTag}
           {isZh ? (
             <>
               检查 GitHub Releases 是否有新版本并就地替换二进制。
-              通过 Homebrew 或 npm 安装的话，使用包管理器升级更稳：
-              <code className="inline">brew upgrade deepseek-tui</code> 或{" "}
-              <code className="inline">npm update -g codewhale</code>。
-              Cargo 安装的可以重跑两个 <code className="inline">cargo install</code> 命令并加 <code className="inline">--force</code>。
+              通过包管理器安装的话，用包管理器升级更稳：npm 安装的运行{" "}
+              <code className="inline">npm update -g codewhale</code>；
+              Cargo 安装的重跑两个 <code className="inline">cargo install</code> 命令并加{" "}
+              <code className="inline">--force</code>；
+              旧版 Homebrew tap 用 <code className="inline">brew upgrade deepseek-tui</code>。
             </>
           ) : (
             <>
               Checks GitHub Releases for a newer version and replaces the binary in place. If you
-              installed via Homebrew, prefer the package manager instead:{" "}
-              <code className="inline">brew upgrade deepseek-tui</code>. Cargo users can re-run both{" "}
-              <code className="inline">cargo install</code> commands with <code className="inline">--force</code>.
+              installed via a package manager, prefer it instead: npm users run{" "}
+              <code className="inline">npm update -g codewhale</code>; cargo users re-run both{" "}
+              <code className="inline">cargo install</code> commands with{" "}
+              <code className="inline">--force</code>; the legacy Homebrew tap updates with{" "}
+              <code className="inline">brew upgrade deepseek-tui</code>.
             </>
           )}
         </p>
@@ -265,8 +274,8 @@ cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${releaseTag}
           </h2>
           <p className="text-sm text-ink-soft max-w-2xl mb-10">
             {isZh
-              ? "如果上面的 Cargo 路径不适合你，从下面找到匹配你情况的一条。每条都安装同一组 codewhale / codewhale-tui 二进制。"
-              : "If the Cargo path above doesn't fit your setup, pick the row that matches your situation. Every path installs the same codewhale / codewhale-tui binary pair."}
+              ? "如果上面的 npm 路径不适合你，从下面找到匹配你情况的一条。每条都安装同一组 codewhale / codewhale-tui 二进制。"
+              : "If the npm path above doesn't fit your setup, pick the row that matches your situation. Every path installs the same codewhale / codewhale-tui binary pair."}
           </p>
 
           <div className="space-y-10">
@@ -296,13 +305,13 @@ cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${releaseTag}
             {/* GitHub Release */}
             <div className="rounded-lg border border-ink/12 bg-white/70 p-5">
               <div className="font-display text-lg mb-3">{isZh ? "GitHub Releases" : "GitHub Releases"}</div>
-              <InstallCodeBlock cmd={releaseDownload} copyLabel={copyLabel} copiedLabel={copiedLabel} />
+              <InstallCodeBlock cmd={RELEASE_DOWNLOAD} copyLabel={copyLabel} copiedLabel={copiedLabel} />
             </div>
 
             {/* CNB */}
             <div className="rounded-lg border border-ink/12 bg-white/70 p-5">
               <div className="font-display text-lg mb-3">{isZh ? "CNB 镜像" : "CNB mirror"}</div>
-              <InstallCodeBlock cmd={cnbInstall} copyLabel={copyLabel} copiedLabel={copiedLabel} />
+              <InstallCodeBlock cmd={cnbInstall(tag)} copyLabel={copyLabel} copiedLabel={copiedLabel} />
             </div>
 
             {/* Mainland China network */}
@@ -330,13 +339,17 @@ cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${releaseTag}
               <p className="mt-4 text-sm text-ink-soft leading-relaxed max-w-2xl">
                 {isZh ? (
                   <>
-                    v{version} 也可以通过 Cargo + Tuna 或 CNB 路径绕开 GitHub 下载瓶颈。
+                    npm 安装时设置 <code className="inline">CODEWHALE_USE_CNB_MIRROR=1</code>，
+                    wrapper 会改从 CNB 镜像下载二进制而不是 GitHub。Cargo + Tuna 或 CNB
+                    路径同样可以绕开 GitHub 下载瓶颈。
                     DeepSeek API（<code className="inline">api.deepseek.com</code>）在国内直连，无需代理。
                   </>
                 ) : (
                   <>
-                    For v{version}, Cargo + Tuna or the CNB path routes around GitHub download
-                    bottlenecks. The DeepSeek API at{" "}
+                    For the npm path, set{" "}
+                    <code className="inline">CODEWHALE_USE_CNB_MIRROR=1</code> and the wrapper
+                    downloads binaries from the CNB mirror instead of GitHub. Cargo + Tuna or the
+                    CNB path also routes around GitHub download bottlenecks. The DeepSeek API at{" "}
                     <code className="inline">api.deepseek.com</code> is reachable from mainland China
                     without a proxy.
                   </>
@@ -349,10 +362,15 @@ cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${releaseTag}
               <div className="eyebrow mb-2 text-indigo">
                 Homebrew{" "}
                 <span className="text-ink-mute font-mono normal-case tracking-normal">
-                  · macOS / Linux
+                  {isZh ? "· macOS / Linux · 旧版 tap" : "· macOS / Linux · legacy tap"}
                 </span>
               </div>
               <InstallCodeBlock cmd={BREW} copyLabel={copyLabel} copiedLabel={copiedLabel} />
+              <p className="mt-3 text-sm text-ink-soft leading-relaxed max-w-2xl">
+                {isZh
+                  ? "这是旧版 deepseek-tui tap，在 formula 重命名为 codewhale 期间保留以保证兼容，安装的同样是当前版本的二进制。"
+                  : "This is the legacy deepseek-tui tap, kept for compatibility while the formula is renamed to codewhale. It installs the same current-release binaries."}
+              </p>
             </div>
 
             {/* Prebuilt binary */}

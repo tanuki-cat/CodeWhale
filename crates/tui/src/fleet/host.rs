@@ -816,12 +816,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut adapter = LocalProcessFleetHostAdapter::new(tmp.path());
         let script = if cfg!(windows) {
-            "echo 0123456789abcdef & ping -n 30 127.0.0.1 >NUL"
+            "echo 0123456789abcdef& ping -n 30 127.0.0.1 >NUL"
         } else {
             "printf 0123456789abcdef; sleep 30"
         };
         let mut request = FleetWorkerStartRequest::new("local-1", shell_command(script));
-        request.log_limit_bytes = 16;
+        let line_ending_bytes = if cfg!(windows) { 2 } else { 0 };
+        request.log_limit_bytes = 16 + line_ending_bytes;
 
         let handle = adapter.start_worker(request).unwrap();
         assert_eq!(handle.host_kind, FleetHostKind::LocalProcess);
@@ -830,8 +831,10 @@ mod tests {
         assert_eq!(status.state, FleetHostWorkerState::Running);
 
         let logs = wait_for_log(&adapter, "local-1", "abcdef");
-        assert!(logs.ends_with("0123456789abcdef") || logs.contains("0123456789abcdef"));
-        let bounded = adapter.read_logs("local-1", 6).unwrap();
+        let logs = logs.trim_end_matches(&['\r', '\n'][..]);
+        assert!(logs.ends_with("0123456789abcdef"), "{logs:?}");
+        let bounded = adapter.read_logs("local-1", 6 + line_ending_bytes).unwrap();
+        let bounded = bounded.trim_end_matches(&['\r', '\n'][..]);
         assert!(bounded.ends_with("abcdef"), "{bounded:?}");
 
         let status = adapter.stop_worker("local-1").unwrap();

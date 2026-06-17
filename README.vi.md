@@ -2,11 +2,11 @@
 
 > Coding agent trong terminal cho mọi model — ưu tiên model mở.
 
-Một TUI và CLI viết bằng Rust, 24 provider. DeepSeek, OpenRouter, Hugging Face
-và vLLM/SGLang/Ollama chạy cục bộ là các đường first-class, và CodeWhale nói
-chuyện native với Anthropic Claude và OpenAI khi đó là thứ bạn đang có. Công cụ
-qua cổng phê duyệt, sandbox cấp hệ điều hành, và rollback bằng `/restore` cho
-mọi lượt.
+Một TUI và CLI viết bằng Rust, 25 provider. DeepSeek, OpenRouter, Hugging Face,
+DeepInfra và vLLM/SGLang/Ollama chạy cục bộ là các đường first-class, và
+CodeWhale nói chuyện native với Anthropic Claude và OpenAI khi đó là thứ bạn
+đang có. Công cụ qua cổng phê duyệt, sandbox cấp hệ điều hành, và rollback
+bằng `/restore` cho mọi lượt.
 
 [English README](README.md) · [简体中文 README](README.zh-CN.md) · [日本語 README](README.ja-JP.md) · [codewhale.net](https://codewhale.net/) · [Hướng dẫn cài đặt](docs/INSTALL.md) · [Danh mục provider](docs/PROVIDERS.md) · [Changelog](CHANGELOG.md)
 
@@ -32,6 +32,10 @@ Dùng cargo (Rust 1.88+):
 cargo install codewhale-cli --locked
 cargo install codewhale-tui --locked
 ```
+
+> **Người dùng Linux:** cài đặt các gói build trước:
+> `sudo apt-get install -y build-essential pkg-config libdbus-1-dev`.
+> Xem [INSTALL.md](docs/INSTALL.md#4-install-via-cargo-any-tier-1-rust-target).
 
 Mọi đường cài đặt khác:
 
@@ -118,21 +122,21 @@ toàn là cơ chế runtime, không phải lời dặn mà model phải tự nh�
   `--disallowed-tools` (deny thắng), `--max-turns` và
   `--append-system-prompt` *(0.8.58)* cho script và CI.
 - **Nhúng được ở mọi nơi.** Runtime API HTTP/SSE và ACP, extension VS Code
-  (Phase 0), và cầu nối Telegram/Feishu.
+  (Phase 0), và cầu nối Telegram/Feishu (cầu nối Weixin đang thử nghiệm).
 - **Độ hoàn thiện để dùng hằng ngày.** Vừa là MCP client *vừa* là MCP server,
   skill tái sử dụng, bản địa hóa 7 ngôn ngữ (gồm cả hộp thoại phê duyệt từ
   0.8.56), và speech/TTS qua Xiaomi MiMo.
 
 ### Mọi model, ưu tiên model mở
 
-Hai mươi bốn provider đi qua cùng một harness, cùng một constitution, cùng
+Hai mươi lăm provider đi qua cùng một harness, cùng một constitution, cùng
 một bộ công cụ:
 
 - **Model mở, dạng hosted:** `deepseek` (đứng đầu trong nhóm ngang hàng),
   `openrouter`, `huggingface` (Inference Providers), `moonshot` (Kimi),
   `volcengine` (Ark), `nvidia-nim`, `together`, `fireworks`, `novita`,
   `siliconflow` / `siliconflow-CN`, `arcee`, `xiaomi-mimo`, `atlascloud`,
-  `wanjie-ark`, cộng thêm một đường `openai`-compatible tổng quát cho bất kỳ
+  `deepinfra`, `wanjie-ark`, cộng thêm một đường `openai`-compatible tổng quát cho bất kỳ
   gateway nào.
 - **Model mở, tự host:** `vllm`, `sglang` và `ollama` trỏ vào endpoint
   localhost của riêng bạn — không cần key.
@@ -151,11 +155,14 @@ trong [docs/PROVIDERS.md](docs/PROVIDERS.md).
 Các nhãn phiên bản ở trên đánh dấu những gì đã hạ cánh trong ba bản phát hành
 gần nhất (0.8.56 → 0.8.58). Chi tiết đầy đủ trong [CHANGELOG.md](CHANGELOG.md).
 
-## Ý tưởng chính
+## Ý tưởng chính — mission idea được đưa vào phiên bản này
 
 Phần lớn coding agent bắt đầu bằng việc thêm sức mạnh: nhiều công cụ hơn,
 context dài hơn, tự chủ nhiều hơn. CodeWhale bắt đầu bằng việc gán trách
 nhiệm.
+
+(Đây là mission thiết kế đang được đưa vào phiên bản này; memory, cost,
+và remote orchestration vẫn đang lặp lại — xem v0.9.0 Track bên dưới.)
 
 Một agent sửa repo của bạn cần có một địa chỉ — terminal này, người dùng này,
 branch này, session này. Không phải một persona; một địa chỉ để truy hồi. Khi

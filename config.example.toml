@@ -16,11 +16,11 @@
 # `--provider volcengine`, `--provider openrouter`, `--provider xiaomi-mimo`,
 # `--provider fireworks`, `--provider siliconflow`, `--provider siliconflow-CN`,
 # `/provider arcee`, `/provider moonshot`, `/provider sglang`, `/provider vllm`,
-# `/provider ollama`, `/provider huggingface`) toggle without having to re-enter keys. Top-level
+# `/provider ollama`, `/provider huggingface`, `/provider stepfun`) toggle without having to re-enter keys. Top-level
 # `api_key` / `base_url` are
 # still read as DeepSeek defaults when `[providers.deepseek]` is absent
 # (backward compatibility).
-provider = "deepseek" # deepseek | deepseek-cn | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | sglang | vllm | ollama | huggingface | together | openai-codex | anthropic
+provider = "deepseek" # deepseek | deepseek-cn | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | openai-codex | anthropic | deepinfra
 api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty
 base_url = "https://api.deepseek.com/beta"
 # provider = "deepseek-cn"                       # legacy alias (official host is still https://api.deepseek.com)
@@ -45,6 +45,7 @@ base_url = "https://api.deepseek.com/beta"
 #   z-ai/glm-5.2                  — OpenRouter Z.AI GLM 5.2 (opt-in preview)
 #   GLM-5.1                       — default direct Z.AI Coding Plan model
 #   GLM-5.2                       — direct Z.AI opt-in preview model
+#   step-3.7-flash                — default direct StepFun / StepFlash model ID
 #   kimi-k2.6                       — default Moonshot/Kimi model ID
 #   gpt-4.1                         — default generic OpenAI-compatible model ID
 #   deepseek-ai/deepseek-v4-flash   — default AtlasCloud model ID
@@ -102,6 +103,8 @@ check_for_updates = true
 #
 # Invalid slots are skipped with a warning, duplicate slots use the last entry,
 # and unknown actions are preserved so the UI can show a disabled placeholder.
+# Slash commands can be bound as slash.<name>, for example slash.mode. Commands
+# that require arguments pre-fill the composer instead of running incomplete.
 #
 # [[hotbar]]
 # slot = 1
@@ -111,6 +114,11 @@ check_for_updates = true
 # [[hotbar]]
 # slot = 2
 # action = "session.compact"
+#
+# [[hotbar]]
+# slot = 3
+# label = "mode"
+# action = "slash.mode"
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Paths
@@ -369,7 +377,7 @@ max_subagents = 10 # optional (1-20)
 # Novita AI-hosted inference (https://novita.ai)
 [providers.novita]
 # api_key = "YOUR_NOVITA_API_KEY"
-# base_url = "https://api.novita.ai/v1"
+# base_url = "https://api.novita.ai/openai/v1"
 # model = "deepseek/deepseek-v4-pro"         # or deepseek/deepseek-v4-flash
 
 # Fireworks AI-hosted DeepSeek V4 (https://fireworks.ai)
@@ -415,6 +423,12 @@ max_subagents = 10 # optional (1-20)
 # # base_url = "https://api.z.ai/api/paas/v4"
 # model = "GLM-5.1"                             # default; GLM-5.2 is opt-in preview
 
+# StepFun / StepFlash direct OpenAI-compatible endpoint (https://platform.stepfun.com)
+[providers.stepfun]
+# api_key = "YOUR_STEPFUN_API_KEY"               # or STEP_API_KEY
+# base_url = "https://api.stepfun.ai/v1"          # or STEP_BASE_URL
+# model = "step-3.7-flash"                       # or STEPFUN_MODEL / STEP_MODEL
+
 # MiniMax direct OpenAI-compatible endpoint (https://platform.minimax.io)
 [providers.minimax]
 # api_key = "YOUR_MINIMAX_API_KEY"
@@ -448,6 +462,12 @@ max_subagents = 10 # optional (1-20)
 [providers.huggingface]
 # api_key = "YOUR_HF_TOKEN"
 # base_url = "https://router.huggingface.co/v1"
+# model = "deepseek-ai/DeepSeek-V4-Pro"     # or deepseek-ai/DeepSeek-V4-Flash
+
+# DeepInfra — AI inference cloud (https://deepinfra.com)
+[providers.deepinfra]
+# api_key = "YOUR_DEEPINFRA_TOKEN"
+# base_url = "https://api.deepinfra.com/v1/openai"
 # model = "deepseek-ai/DeepSeek-V4-Pro"     # or deepseek-ai/DeepSeek-V4-Flash
 
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -573,7 +593,7 @@ osc8_links = true            # emit OSC 8 escapes around URLs (Cmd+click in iTer
 # built-in default; set [] to hide all configurable chips. You can also edit
 # this interactively with `/statusline`.
 # Supported keys: mode, model, cost, balance (DeepSeek / DeepSeekCN only),
-# status, coherence, agents,
+# status, agents,
 # reasoning_replay, prefix_stability, cache, context_percent, git_branch,
 # last_tool_elapsed (placeholder), rate_limit (placeholder), tokens.
 # status_items = ["mode", "model", "status", "git_branch", "tokens", "cache"]

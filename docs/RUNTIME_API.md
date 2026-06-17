@@ -1,22 +1,38 @@
 # Runtime API & Integration Contract
 
-codewhale exposes a local runtime API through `codewhale serve --http` and
-machine-readable health via `codewhale doctor --json`. It also exposes
-`codewhale serve --acp` for editor clients that speak the Agent Client Protocol
-over stdio. This document is the stable integration contract for native macOS
-workbench applications (and other local supervisors) that embed the DeepSeek
-engine without screen-scraping terminal output.
+`codewhale app-server` is the canonical local runtime API and control plane.
+Local SDKs, benchmark supervisors, mobile/remote-control clients, and editor
+integrations talk to it instead of screen-scraping terminal output. It serves
+the full HTTP/SSE runtime API (`/v1/*`), a JSON-RPC control transport over
+stdio, and the phone-friendly mobile page. `codewhale doctor --json` provides
+machine-readable health, and `codewhale serve --acp` speaks the Agent Client
+Protocol over stdio for editors such as Zed.
+
+`codewhale serve --http` / `serve --mobile` remain as **compatibility aliases**
+for `codewhale app-server --http` / `--mobile`; both launch the identical
+server. New integrations should target `app-server`.
+
+`codewhale exec` is the separate one-shot headless worker path (stream-json,
+fleet worker subprocess, CI/benchmark primitive). It is not part of this API,
+but it shares the same runtime, provider/model resolution, permission profiles,
+and event vocabulary.
+
+This document is the stable integration contract for native workbench
+applications (and other local supervisors) that embed the DeepSeek engine.
 
 ## Architecture
 
 ```
-macOS workbench (or any local supervisor)
+local supervisor / SDK / benchmark harness
         │
-        ├─ codewhale doctor --json   → machine-readable health & capability
-        ├─ codewhale serve --http    → HTTP/SSE runtime API
-        ├─ codewhale serve --acp     → ACP stdio agent for editors such as Zed
-        ├─ codewhale serve --mcp     → MCP stdio server
-        └─ codewhale [args]          → interactive TUI session
+        ├─ codewhale app-server --http     → HTTP/SSE runtime API (/v1/*)        [canonical]
+        ├─ codewhale app-server --mobile   → runtime API + mobile control page
+        ├─ codewhale app-server --stdio    → JSON-RPC control transport over stdio
+        ├─ codewhale doctor --json         → machine-readable health & capability
+        ├─ codewhale serve --acp           → ACP stdio agent for editors such as Zed
+        ├─ codewhale serve --mcp           → MCP stdio server
+        ├─ codewhale serve --http/--mobile → legacy aliases for `app-server --http/--mobile`
+        └─ codewhale exec [args]           → one-shot headless worker (stream-json)
 ```
 
 The engine runs as a local-only process. All APIs bind to `localhost` by
@@ -25,6 +41,82 @@ default. No hosted relay, no provider-token custody, no secret leakage.
 For a proposed read-only audit export over completed turns, see
 [`docs/RECEIPTS.md`](RECEIPTS.md). That document is a protocol note; the receipt
 CLI/API surfaces are not implemented yet.
+
+## Runtime API entrypoints
+
+| Entry | Transport | Use |
+|---|---|---|
+| `codewhale app-server --http` | HTTP/SSE on `127.0.0.1:7878` | Full `/v1/*` runtime API (canonical) |
+| `codewhale app-server --mobile` | HTTP/SSE on `0.0.0.0:7878` + `/mobile` | Runtime API + phone control page |
+| `codewhale app-server --stdio` | JSON-RPC 2.0 over stdio | Local SDK / benchmark control probe (no listener) |
+| `codewhale app-server` | HTTP on `127.0.0.1:8787` | Legacy in-process app-server (`/healthz`, `/thread`, `/app`, `/prompt`, `/tool`, `/jobs`) |
+| `codewhale serve --http` / `--mobile` | same server as `app-server --http`/`--mobile` | Compatibility aliases |
+
+`app-server --http` and `--mobile` launch the same mature runtime API server
+historically reached through `serve --http` — no routes or behavior changed, so
+every endpoint documented below is identical across both entrypoints. The
+runtime API token is read from `--auth-token`, then `CODEWHALE_RUNTIME_TOKEN`,
+then `DEEPSEEK_RUNTIME_TOKEN`; pass `--insecure` only on a trusted loopback.
+
+The `--stdio` control transport is newline-delimited JSON-RPC 2.0. Probe it
+without spending model tokens:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"healthz"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"capabilities"}' \
+  '{"jsonrpc":"2.0","id":3,"method":"shutdown"}' \
+  | codewhale app-server --stdio
+```
+
+`capabilities` returns the advertised method families (`thread/*`, `app/*`,
+`prompt/*`) and the full method list; `thread/capabilities`,
+`app/capabilities`, and `prompt/capabilities` scope it per family. The method
+set is pinned by a drift test in `crates/app-server/src/lib.rs`, so SDK and
+benchmark clients can rely on it not changing silently.
+
+## Benchmarking & SDK contract
+
+The app-server exists so an external benchmark or SDK can answer — without
+scraping TUI output — *what route ran, which provider/model/reasoning/permission
+profile was effective, what events happened, how many tokens were used, and how
+the run finished.* The durable Thread/Turn/Item data model already carries most
+of this; the table maps each benchmark need to where a harness reads it.
+
+| Benchmark need | Where it comes from | Status |
+|---|---|---|
+| Route / effective model | `TurnRecord` + thread `model`; per-run `--provider`/`--model` overrides | available |
+| Permission / sandbox / approval profile | thread `auto_approve`, sandbox + approval policy | available |
+| Run / thread / turn IDs | `thread_id`, `turn_id`, SSE event envelope | available |
+| Event stream | `GET /v1/threads/{id}/events` (replay + live SSE) | available |
+| Turn status / terminal classification | `TurnRecord.status` + error summary | available |
+| Token usage | `TurnRecord.usage`; aggregate via `GET /v1/usage` | available |
+| Single-read run receipt (route + usage + cost) | `GET /v1/threads/{id}/turns/{turn_id}/receipt` | proposed ([RECEIPTS.md](RECEIPTS.md)) |
+
+For one-shot/headless benchmark runs, prefer `codewhale exec` with explicit
+`--provider <id> --model <id>` so a failure identifies the exact provider/model
+pair. Use `app-server` when the harness needs to start/resume/steer/interrupt
+turns, list models/capabilities, follow the event stream, or read usage. Both
+paths share the same runtime, so route-effective model resolution and the event
+vocabulary match.
+
+### Release smoke
+
+`scripts/release/app-server-smoke.sh` is the committed pre-release check:
+
+```bash
+scripts/release/app-server-smoke.sh                 # stdio health/capabilities probe (no tokens)
+scripts/release/app-server-smoke.sh --matrix        # + print the configured provider/model matrix
+scripts/release/app-server-smoke.sh --matrix --real # + exec a cheap sentinel per provider
+```
+
+The stdio probe runs against a throwaway config, so it never reads real keys.
+The matrix discovers configured providers from `codewhale auth list`, maps each
+to a cheap model (override per provider with `SMOKE_MODEL_<SLUG>`), skips
+unconfigured providers, and fails loudly on unmapped ones. `auth list` reports
+presence flags only and exec output is passed through a redactor, so secrets are
+never printed. The parser is covered by
+`scripts/release/app-server-smoke.test.sh` against a fake `codewhale` binary.
 
 ## ACP stdio adapter: `codewhale serve --acp`
 
@@ -117,11 +209,15 @@ codewhale doctor --json
 }
 ```
 
-## HTTP/SSE runtime API: `codewhale serve --http`
+## HTTP/SSE runtime API: `codewhale app-server --http`
 
 ```bash
-codewhale serve --http [--host 127.0.0.1] [--port 7878] [--workers 2] [--auth-token TOKEN]
-codewhale serve --mobile [--host 0.0.0.0] [--port 7878] [--auth-token TOKEN]
+codewhale app-server --http [--host 127.0.0.1] [--port 7878] [--workers 2] [--auth-token TOKEN]
+codewhale app-server --mobile [--host 0.0.0.0] [--port 7878] [--auth-token TOKEN]
+
+# Compatibility aliases — identical server, same flags:
+codewhale serve --http   [...]
+codewhale serve --mobile [...]
 ```
 
 Defaults: host `127.0.0.1`, port `7878`, 2 workers (clamped 1–8).
@@ -341,7 +437,7 @@ tokens but `0.0` cost. Added in v0.8.10 (#564).
 The runtime uses a durable Thread/Turn/Item lifecycle.
 
 - **ThreadRecord** — `id`, `created_at`, `updated_at`, `model`, `workspace`,
-  `mode`, `task_id`, `coherence_state`, `system_prompt`, `latest_turn_id`,
+  `mode`, `task_id`, `system_prompt`, `latest_turn_id`,
   `latest_response_bookmark`, `archived`
 - **TurnRecord** — `id`, `thread_id`, `status` (`queued|in_progress|completed|
   failed|interrupted|canceled`), timestamps, duration, usage, error summary
@@ -405,7 +501,7 @@ Common event names: `thread.started`, `thread.forked`, `turn.started`,
 `turn.lifecycle`, `turn.steered`, `turn.interrupt_requested`,
 `turn.completed`, `item.started`, `item.delta`, `item.completed`,
 `item.failed`, `item.interrupted`, `approval.required`, `approval.decided`,
-`approval.timeout`, `sandbox.denied`, `coherence.state`.
+`approval.timeout`, `sandbox.denied`.
 
 `approval.required` events may include a `matched_rule` string when an
 execution-policy rule caused the prompt. This field is explanatory metadata for
@@ -506,16 +602,15 @@ a read-only inspection surface:
 | List persisted agent runs | `GET /v1/agent-runs` |
 | Inspect one run | `GET /v1/agent-runs/{run_id}` |
 
-The response is the same worker-record shape returned by `agent_eval`:
+The response is the same worker-record shape surfaced by `agent` receipts:
 `spec.run_id`, `actor_kind`, lifecycle `status`, bounded `events`,
 `follow_up`, `takeover`, `artifacts`, `usage`, and `verification`. `run_id`
 falls back to the worker id for older records, and `{run_id}` may be either the
 run id or the worker id.
 
-These endpoints do not start, cancel, or steer sub-agents. Live follow-up still
-goes through `agent_eval`; live cancellation still goes through `agent_close`.
-The API surface exists so app/editor/headless clients can inspect the same
-handoff receipts that the TUI and parent model see.
+These endpoints do not start, cancel, or steer sub-agents. The API surface
+exists so app/editor/headless clients can inspect the same handoff receipts that
+the TUI and parent model see.
 
 ## Session lifecycle (native UI supervision)
 
@@ -543,3 +638,18 @@ cargo test -p codewhale-protocol --test parity_protocol --locked
 
 This validates that the app-server's event schema hasn't drifted from the
 documented contract. CI runs this on every push to `main` and on release tags.
+
+The app-server stdio control surface has its own drift guard — the advertised
+`capabilities` method set is pinned in `crates/app-server/src/lib.rs`:
+
+```bash
+cargo test -p codewhale-app-server capabilities
+```
+
+Before a release, run the headless smoke (stdio probe + optional provider
+matrix, no secrets leaked):
+
+```bash
+scripts/release/app-server-smoke.sh --matrix        # dry-run plan
+bash scripts/release/app-server-smoke.test.sh       # parser self-test (fake binary)
+```

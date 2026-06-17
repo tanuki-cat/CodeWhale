@@ -83,9 +83,13 @@ function deriveProviders() {
     Vllm: { id: "vllm", label: "vLLM", env: "VLLM_API_KEY" },
     Ollama: { id: "ollama", label: "Ollama", env: "OLLAMA_API_KEY" },
     Huggingface: { id: "huggingface", label: "Hugging Face", env: "HUGGINGFACE_API_KEY / HF_TOKEN" },
+    Deepinfra: { id: "deepinfra", label: "DeepInfra", env: "DEEPINFRA_API_KEY / DEEPINFRA_TOKEN" },
     Together: { id: "together", label: "Together AI", env: "TOGETHER_API_KEY" },
     OpenaiCodex: { id: "openai-codex", label: "OpenAI Codex", env: "ChatGPT/Codex OAuth via `codex login` (OPENAI_CODEX_ACCESS_TOKEN / CODEX_ACCESS_TOKEN override)" },
     Anthropic: { id: "anthropic", label: "Anthropic", env: "ANTHROPIC_API_KEY" },
+    Zai: { id: "zai", label: "Z.ai", env: "ZAI_API_KEY / Z_AI_API_KEY" },
+    Stepfun: { id: "stepfun", label: "StepFun", env: "STEPFUN_API_KEY / STEP_API_KEY" },
+    Minimax: { id: "minimax", label: "MiniMax", env: "MINIMAX_API_KEY" },
   };
   // Fail loudly on unmapped variants so a new provider can never be silently
   // dropped from the generated facts again. DeepseekCN is the one deliberate

@@ -33,8 +33,8 @@ use crate::mcp::McpPool;
 #[cfg(test)]
 use crate::models::ToolCaller;
 use crate::models::{
-    ContentBlock, ContentBlockStart, Delta, LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS, Message,
-    MessageRequest, StreamEvent, SystemPrompt, Tool, Usage,
+    ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent, SystemPrompt,
+    Tool, Usage,
 };
 use crate::prompts;
 use crate::purge::{emit_purge_completed, emit_purge_failed, emit_purge_started, run_purge};
@@ -46,30 +46,22 @@ use crate::tools::spec::RuntimeToolServices;
 use crate::tools::spec::{ApprovalRequirement, ToolError, ToolResult};
 use crate::tools::subagent::{
     Mailbox, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext, SubAgentResult,
-    SubAgentRuntime, SubAgentStatus, SubAgentType, new_shared_subagent_manager_with_timeout,
-    resolve_subagent_assignment_route,
+    SubAgentRuntime, SubAgentStatus, SubAgentThinking, SubAgentType,
+    new_shared_subagent_manager_with_timeout, resolve_subagent_assignment_route,
 };
 use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
 use crate::tools::{ToolContext, ToolRegistryBuilder};
 use crate::tui::app::AppMode;
 use crate::utils::spawn_supervised;
+use crate::worker_profile::ModelRoute;
 use crate::working_set::WorkingSet;
 
-use super::capacity::{
-    CapacityController, CapacityControllerConfig, CapacityDecision, CapacityObservationInput,
-    CapacitySnapshot, GuardrailAction, RiskBand,
-};
-use super::capacity_memory::{
-    CanonicalState, CapacityMemoryRecord, ReplayInfo, append_capacity_record,
-    load_last_k_capacity_records, new_record_id, now_rfc3339,
-};
-use super::coherence::{CoherenceSignal, CoherenceState, next_coherence_state};
 use super::events::{Event, TurnOutcomeStatus};
 use super::ops::{Op, SessionSnapshot, USER_SHELL_TOOL_ID_PREFIX};
 use super::session::Session;
 use super::tool_parser;
-use super::turn::{TurnContext, TurnToolCall, post_turn_snapshot, pre_turn_snapshot};
+use super::turn::{TurnContext, post_turn_snapshot, pre_turn_snapshot};
 
 /// Snapshot of parent state that can be passed to forked sub-agents without
 /// rewriting the parent transcript.
@@ -280,15 +272,13 @@ pub struct EngineConfig {
     /// Maximum number of concurrently active subagents.
     pub max_subagents: usize,
     /// Number of direct (depth-1) sub-agents that may execute concurrently
-    /// before further interactive fanout launches queue for a slot (#3095).
-    /// Resolved from `[subagents] interactive_max_launch`.
-    pub interactive_launch_limit: usize,
+    /// before further launches queue for a launch slot (#3095).
+    /// Resolved from `[subagents] launch_concurrency`.
+    pub launch_concurrency: usize,
     /// Feature flags controlling tool availability.
     pub features: Features,
     /// Auto-compaction settings for long conversations.
     pub compaction: CompactionConfig,
-    /// Capacity-controller settings.
-    pub capacity: CapacityControllerConfig,
     /// Shared Todo list state.
     pub todos: SharedTodoList,
     /// Shared Plan state.
@@ -398,10 +388,9 @@ impl Default for EngineConfig {
             show_thinking: true,
             max_steps: 100,
             max_subagents: DEFAULT_MAX_SUBAGENTS,
-            interactive_launch_limit: crate::config::DEFAULT_INTERACTIVE_LAUNCH_LIMIT,
+            launch_concurrency: DEFAULT_MAX_SUBAGENTS,
             features: Features::with_defaults(),
             compaction: CompactionConfig::default(),
-            capacity: CapacityControllerConfig::default(),
             todos: new_shared_todo_list(),
             plan_state: new_shared_plan_state(),
             goal_state: new_shared_goal_state(),
@@ -541,11 +530,9 @@ pub struct Engine {
     /// user-facing message names a cause.
     pub(super) cancel_reason: Arc<StdMutex<Option<CancelReason>>>,
     tool_exec_lock: Arc<RwLock<()>>,
-    capacity_controller: CapacityController,
     /// Append-only layered context manager (#159). Opt-in for v0.7.5 while
     /// cache-hit behavior is audited.
     seam_manager: Option<SeamManager>,
-    coherence_state: CoherenceState,
     turn_counter: u64,
     /// Post-edit LSP diagnostics injection (#136). Populated unconditionally
     /// — when LSP is disabled in config, this is an inert manager that
@@ -583,6 +570,45 @@ pub struct Engine {
 // === Internal tool helpers ===
 
 impl Engine {
+    pub(super) async fn emit_compaction_started(
+        &mut self,
+        id: String,
+        auto: bool,
+        message: String,
+    ) {
+        let _ = self
+            .tx_event
+            .send(Event::CompactionStarted { id, auto, message })
+            .await;
+    }
+
+    pub(super) async fn emit_compaction_completed(
+        &mut self,
+        id: String,
+        auto: bool,
+        message: String,
+        messages_before: Option<usize>,
+        messages_after: Option<usize>,
+    ) {
+        let _ = self
+            .tx_event
+            .send(Event::CompactionCompleted {
+                id,
+                auto,
+                message,
+                messages_before,
+                messages_after,
+            })
+            .await;
+    }
+
+    pub(super) async fn emit_compaction_failed(&mut self, id: String, auto: bool, message: String) {
+        let _ = self
+            .tx_event
+            .send(Event::CompactionFailed { id, auto, message })
+            .await;
+    }
+
     fn reset_cancel_token(&mut self) {
         let token = CancellationToken::new();
         self.cancel_token = token.clone();
@@ -634,6 +660,7 @@ impl Engine {
             ApiProvider::Vllm => "VLLM_API_KEY",
             ApiProvider::Ollama => "OLLAMA_API_KEY",
             ApiProvider::Huggingface => "HUGGINGFACE_API_KEY/HF_TOKEN",
+            ApiProvider::Deepinfra => "DEEPINFRA_API_KEY/DEEPINFRA_TOKEN",
             ApiProvider::Together => "TOGETHER_API_KEY",
             ApiProvider::OpenaiCodex => "OPENAI_CODEX_ACCESS_TOKEN/CODEX_ACCESS_TOKEN",
             ApiProvider::Minimax => "MINIMAX_API_KEY",
@@ -793,15 +820,13 @@ impl Engine {
             config.workspace.clone(),
             config.max_subagents,
             config.subagent_heartbeat_timeout,
-            config.interactive_launch_limit,
+            config.launch_concurrency,
         );
         let shell_manager = config
             .runtime_services
             .shell_manager
             .clone()
             .unwrap_or_else(|| new_shared_shell_manager(config.workspace.clone()));
-        let capacity_controller = CapacityController::new(config.capacity.clone());
-
         // Create Flash seam manager for layered context (#159). v0.7.5 keeps
         // this opt-in until the prefix-cache audit proves when seam production
         // is worth the extra request and transcript mutation.
@@ -863,7 +888,7 @@ impl Engine {
             })
             .map(std::sync::Arc::from);
 
-        let mut engine = Engine {
+        let engine = Engine {
             config,
             api_config: api_config.clone(),
             deepseek_client,
@@ -885,9 +910,7 @@ impl Engine {
             shared_cancel_token: shared_cancel_token.clone(),
             cancel_reason: cancel_reason.clone(),
             tool_exec_lock,
-            capacity_controller,
             seam_manager,
-            coherence_state: CoherenceState::default(),
             turn_counter: 0,
             lsp_manager,
             pending_lsp_blocks: Vec::new(),
@@ -898,8 +921,6 @@ impl Engine {
             token_estimate_cache: TokenEstimateCache::new(),
             shared_paused: shared_paused.clone(),
         };
-        engine.rehydrate_latest_canonical_state();
-
         let handle = EngineHandle {
             tx_op,
             rx_event: Arc::new(RwLock::new(rx_event)),
@@ -924,7 +945,6 @@ impl Engine {
     ) {
         self.reset_cancel_token();
         self.turn_counter = self.turn_counter.saturating_add(1);
-        self.capacity_controller.mark_turn_start(self.turn_counter);
 
         let turn_id = format!(
             "{}{seq}",
@@ -1160,30 +1180,28 @@ impl Engine {
     /// Run the engine event loop
     #[allow(clippy::too_many_lines)]
     pub async fn run(mut self) {
-        while let Some(op) = self.rx_op.recv().await {
-            match op {
-                Op::SendMessage {
-                    content,
-                    mode,
-                    provider,
-                    model,
-                    goal_objective,
-                    goal_token_budget,
-                    goal_status,
-                    reasoning_effort,
-                    reasoning_effort_auto,
-                    auto_model,
-                    allow_shell,
-                    trust_mode,
-                    auto_approve,
-                    approval_mode,
-                    translation_enabled,
-                    show_thinking,
-                    allowed_tools,
-                    hook_executor,
-                    verbosity,
-                } => {
-                    self.handle_send_message(
+        enum EngineRunInput {
+            Operation(Op),
+            SubAgentCompletion(SubAgentCompletion),
+        }
+
+        loop {
+            let input = tokio::select! {
+                op = self.rx_op.recv() => op.map(EngineRunInput::Operation),
+                completion = self.rx_subagent_completion.recv() => {
+                    completion.map(EngineRunInput::SubAgentCompletion)
+                }
+            };
+            let Some(input) = input else {
+                break;
+            };
+
+            match input {
+                EngineRunInput::SubAgentCompletion(completion) => {
+                    self.handle_idle_subagent_completion(completion).await;
+                }
+                EngineRunInput::Operation(op) => match op {
+                    Op::SendMessage {
                         content,
                         mode,
                         provider,
@@ -1203,289 +1221,321 @@ impl Engine {
                         allowed_tools,
                         hook_executor,
                         verbosity,
-                    )
-                    .await;
-                }
-                Op::RunShellCommand {
-                    command,
-                    mode,
-                    trust_mode,
-                    auto_approve,
-                    approval_mode,
-                } => {
-                    self.handle_run_shell_command(
+                    } => {
+                        self.handle_send_message(
+                            content,
+                            mode,
+                            provider,
+                            model,
+                            goal_objective,
+                            goal_token_budget,
+                            goal_status,
+                            reasoning_effort,
+                            reasoning_effort_auto,
+                            auto_model,
+                            allow_shell,
+                            trust_mode,
+                            auto_approve,
+                            approval_mode,
+                            translation_enabled,
+                            show_thinking,
+                            allowed_tools,
+                            hook_executor,
+                            verbosity,
+                        )
+                        .await;
+                    }
+                    Op::RunShellCommand {
                         command,
                         mode,
                         trust_mode,
                         auto_approve,
                         approval_mode,
-                    )
-                    .await;
-                }
-                Op::CancelRequest => {
-                    self.cancel_token.cancel();
-                    self.reset_cancel_token();
-                }
-                Op::ApproveToolCall { id } => {
-                    // Tool approval handling will be implemented in tools module
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!("Approved tool call: {id}")))
+                    } => {
+                        self.handle_run_shell_command(
+                            command,
+                            mode,
+                            trust_mode,
+                            auto_approve,
+                            approval_mode,
+                        )
                         .await;
-                }
-                Op::DenyToolCall { id } => {
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!("Denied tool call: {id}")))
-                        .await;
-                }
-                Op::SpawnSubAgent { prompt } => {
-                    let Some(client) = self.deepseek_client.clone() else {
-                        let message = self
-                            .deepseek_client_error
-                            .as_deref()
-                            .map(|err| format!("Failed to spawn sub-agent: {err}"))
-                            .unwrap_or_else(|| {
-                                "Failed to spawn sub-agent: API client not configured".to_string()
-                            });
+                    }
+                    Op::CancelRequest => {
+                        self.cancel_token.cancel();
+                        self.reset_cancel_token();
+                    }
+                    Op::ApproveToolCall { id } => {
+                        // Tool approval handling will be implemented in tools module
                         let _ = self
                             .tx_event
-                            .send(Event::error(ErrorEnvelope::fatal(message)))
+                            .send(Event::status(format!("Approved tool call: {id}")))
                             .await;
-                        continue;
-                    };
+                    }
+                    Op::DenyToolCall { id } => {
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!("Denied tool call: {id}")))
+                            .await;
+                    }
+                    Op::SpawnSubAgent { prompt } => {
+                        let Some(client) = self.deepseek_client.clone() else {
+                            let message = self
+                                .deepseek_client_error
+                                .as_deref()
+                                .map(|err| format!("Failed to spawn sub-agent: {err}"))
+                                .unwrap_or_else(|| {
+                                    "Failed to spawn sub-agent: API client not configured"
+                                        .to_string()
+                                });
+                            let _ = self
+                                .tx_event
+                                .send(Event::error(ErrorEnvelope::fatal(message)))
+                                .await;
+                            continue;
+                        };
 
-                    let mcp_pool = if self.config.features.enabled(Feature::Mcp) {
-                        self.ensure_mcp_pool().await.ok()
-                    } else {
-                        None
-                    };
+                        let mcp_pool = if self.config.features.enabled(Feature::Mcp) {
+                            self.ensure_mcp_pool().await.ok()
+                        } else {
+                            None
+                        };
 
-                    let mut runtime = SubAgentRuntime::new(
-                        client,
-                        self.session.model.clone(),
-                        // Sub-agents don't inherit YOLO mode - use Agent mode defaults
-                        self.build_tool_context(AppMode::Agent, self.session.auto_approve),
-                        self.session.allow_shell,
-                        Some(self.tx_event.clone()),
-                        Arc::clone(&self.subagent_manager),
-                    )
-                    .with_role_models(self.config.subagent_model_overrides.clone())
-                    .with_auto_model(self.session.auto_model)
-                    .with_reasoning_effort(
-                        self.session.reasoning_effort.clone(),
-                        self.session.reasoning_effort_auto,
-                    )
-                    .with_max_spawn_depth(self.config.max_spawn_depth)
-                    .with_step_api_timeout(self.config.subagent_api_timeout)
-                    .with_speech_output_dir(self.config.speech_output_dir.clone())
-                    .with_mcp_pool(mcp_pool)
-                    .background_runtime();
-                    let route = resolve_subagent_assignment_route(
-                        &runtime,
-                        None,
-                        &prompt,
-                        &SubAgentType::General,
-                    )
-                    .await;
-                    runtime.model = route.model;
-                    runtime.reasoning_effort = route.reasoning_effort;
-                    runtime.reasoning_effort_auto = false;
-
-                    let result = {
-                        let mut manager = self.subagent_manager.write().await;
-                        manager.spawn_background(
+                        let mut runtime = SubAgentRuntime::new(
+                            client,
+                            self.session.model.clone(),
+                            // Sub-agents don't inherit YOLO mode - use Agent mode defaults
+                            self.build_tool_context(AppMode::Agent, self.session.auto_approve),
+                            self.session.allow_shell,
+                            Some(self.tx_event.clone()),
                             Arc::clone(&self.subagent_manager),
-                            runtime,
-                            SubAgentType::General,
-                            prompt.clone(),
-                            None,
                         )
-                    };
+                        .with_role_models(self.config.subagent_model_overrides.clone())
+                        .with_auto_model(self.session.auto_model)
+                        .with_reasoning_effort(
+                            self.session.reasoning_effort.clone(),
+                            self.session.reasoning_effort_auto,
+                        )
+                        .with_max_spawn_depth(self.config.max_spawn_depth)
+                        .with_step_api_timeout(self.config.subagent_api_timeout)
+                        .with_speech_output_dir(self.config.speech_output_dir.clone())
+                        .with_mcp_pool(mcp_pool)
+                        .background_runtime();
+                        let route = resolve_subagent_assignment_route(
+                            &runtime,
+                            None,
+                            &prompt,
+                            &SubAgentType::General,
+                            ModelRoute::Inherit,
+                            SubAgentThinking::Inherit,
+                        )
+                        .await;
+                        runtime.model = route.model;
+                        runtime.reasoning_effort = route.reasoning_effort;
+                        runtime.reasoning_effort_auto = false;
 
-                    match result {
-                        Ok(snapshot) => {
-                            let _ = self
-                                .tx_event
-                                .send(Event::status(format!(
-                                    "Spawned sub-agent {}",
-                                    snapshot.agent_id
-                                )))
-                                .await;
-                        }
-                        Err(err) => {
-                            let _ = self
-                                .tx_event
-                                .send(Event::error(ErrorEnvelope::fatal(format!(
-                                    "Failed to spawn sub-agent: {err}"
-                                ))))
-                                .await;
-                        }
-                    }
-                }
-                Op::ListSubAgents => {
-                    let agents = {
-                        let mut manager = self.subagent_manager.write().await;
-                        manager.cleanup(Duration::from_secs(60 * 60));
-                        manager.list()
-                    };
-                    let _ = self.tx_event.send(Event::AgentList { agents }).await;
-                }
-                Op::ChangeMode { mode } => {
-                    self.current_mode = mode;
-                    self.emit_session_updated().await;
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Mode changed to: {}",
-                            mode.description()
-                        )))
-                        .await;
-                }
-                Op::SetModel { model, mode: _ } => {
-                    self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
-                    self.session.model = model;
-                    self.config.model.clone_from(&self.session.model);
-                    self.refresh_system_prompt();
-                    self.emit_session_updated().await;
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Model set to: {}",
-                            self.session.model
-                        )))
-                        .await;
-                }
-                Op::SetCompaction { config } => {
-                    let enabled = config.enabled;
-                    self.config.compaction = config;
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Auto-compaction {}",
-                            if enabled { "enabled" } else { "disabled" }
-                        )))
-                        .await;
-                }
-                Op::SetStreamChunkTimeout { timeout_secs } => {
-                    self.config.stream_chunk_timeout = Duration::from_secs(timeout_secs);
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Stream chunk timeout set to {timeout_secs}s"
-                        )))
-                        .await;
-                }
-                Op::SyncSession {
-                    session_id,
-                    messages,
-                    system_prompt,
-                    system_prompt_override,
-                    model,
-                    workspace,
-                } => {
-                    if let Some(session_id) = session_id {
-                        self.session.id = session_id;
-                    } else if messages.is_empty() && system_prompt.is_none() {
-                        self.session.id = uuid::Uuid::new_v4().to_string();
-                    }
-                    self.session.messages = messages.into();
-                    self.session.compaction_summary_prompt =
-                        extract_compaction_summary_prompt(system_prompt.clone());
-                    self.session.system_prompt = system_prompt;
-                    self.session.last_system_prompt_hash =
-                        Some(system_prompt_hash(self.session.system_prompt.as_ref()));
-                    // Host-supplied prompts are persisted prefixes. Keep them
-                    // byte-stable; mode/runtime state is projected per request.
-                    self.session.system_prompt_override =
-                        system_prompt_override && self.session.system_prompt.is_some();
-                    self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
-                    self.session.model = model;
-                    self.session.workspace = workspace.clone();
-                    self.config.model.clone_from(&self.session.model);
-                    self.config.workspace = workspace.clone();
-                    let ctx = crate::project_context::load_project_context_with_parents(&workspace);
-                    self.session.project_context = if ctx.has_instructions() {
-                        Some(ctx)
-                    } else {
-                        None
-                    };
-                    self.session.rebuild_working_set();
-                    self.rehydrate_latest_canonical_state();
-                    self.emit_session_updated().await;
-                    let _ = self
-                        .tx_event
-                        .send(Event::status("Session context synced".to_string()))
-                        .await;
-                }
-                Op::CompactContext => {
-                    self.handle_manual_compaction().await;
-                }
-                Op::GetSessionSnapshot { tx } => {
-                    let total_tokens = self.session.total_usage.input_tokens
-                        + self.session.total_usage.output_tokens;
-                    let snapshot = SessionSnapshot {
-                        messages: self.session.messages.to_vec(),
-                        total_tokens,
-                        model: self.session.model.clone(),
-                        workspace: self.session.workspace.clone(),
-                        system_prompt: self.session.system_prompt.clone(),
-                        mode: self.current_mode.as_setting().to_string(),
-                    };
-                    if let Some(tx) = tx.lock().ok().and_then(|mut g| g.take()) {
-                        let _ = tx.send(snapshot);
-                    }
-                }
-                Op::PurgeContext => {
-                    self.handle_purge().await;
-                }
-                Op::EditLastTurn { new_message } => {
-                    // #383: /edit — remove the last user+assistant exchange
-                    // from the session, then re-send with the new content.
-                    // Pop messages from the tail until we've removed the
-                    // most recent user message and everything after it.
-                    // First, find the last user message index.
-                    let mut cut = None;
-                    for (idx, msg) in self.session.messages.iter().enumerate().rev() {
-                        if msg.role == "user" {
-                            cut = Some(idx);
-                            break;
+                        let result = {
+                            let mut manager = self.subagent_manager.write().await;
+                            manager.spawn_background(
+                                Arc::clone(&self.subagent_manager),
+                                runtime,
+                                SubAgentType::General,
+                                prompt.clone(),
+                                None,
+                            )
+                        };
+
+                        match result {
+                            Ok(snapshot) => {
+                                let _ = self
+                                    .tx_event
+                                    .send(Event::status(format!(
+                                        "Spawned sub-agent {}",
+                                        snapshot.agent_id
+                                    )))
+                                    .await;
+                            }
+                            Err(err) => {
+                                let _ = self
+                                    .tx_event
+                                    .send(Event::error(ErrorEnvelope::fatal(format!(
+                                        "Failed to spawn sub-agent: {err}"
+                                    ))))
+                                    .await;
+                            }
                         }
                     }
-                    if let Some(idx) = cut {
-                        self.session.messages.truncate_to(idx);
-                        self.session.bump_messages_revision();
+                    Op::ListSubAgents => {
+                        let agents = {
+                            let mut manager = self.subagent_manager.write().await;
+                            manager.cleanup(Duration::from_secs(60 * 60));
+                            manager.list()
+                        };
+                        let _ = self.tx_event.send(Event::AgentList { agents }).await;
                     }
-                    // Now dispatch the new message as a normal send,
-                    // reusing the engine's stored mode/model config.
-                    let mode = AppMode::Agent; // default fallback
-                    self.handle_send_message(
-                        new_message,
-                        mode,
-                        Some(self.api_provider),
-                        self.session.model.clone(),
-                        self.config.goal_objective.clone(),
-                        self.config.goal_token_budget,
-                        self.config.goal_status,
-                        self.session.reasoning_effort.clone(),
-                        self.session.reasoning_effort_auto,
-                        self.session.auto_model,
-                        self.session.allow_shell,
-                        self.session.trust_mode,
-                        self.session.auto_approve,
-                        self.session.approval_mode,
-                        self.config.translation_enabled,
-                        self.config.show_thinking,
-                        self.config.allowed_tools.clone(),
-                        self.config.hook_executor.clone(),
-                        self.config.verbosity.clone(),
-                    )
-                    .await;
-                }
-                Op::Shutdown => {
-                    break;
-                }
+                    Op::ChangeMode { mode } => {
+                        self.current_mode = mode;
+                        self.emit_session_updated().await;
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "Mode changed to: {}",
+                                mode.description()
+                            )))
+                            .await;
+                    }
+                    Op::SetModel { model, mode: _ } => {
+                        self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
+                        self.session.model = model;
+                        self.config.model.clone_from(&self.session.model);
+                        self.refresh_system_prompt();
+                        self.emit_session_updated().await;
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "Model set to: {}",
+                                self.session.model
+                            )))
+                            .await;
+                    }
+                    Op::SetCompaction { config } => {
+                        let enabled = config.enabled;
+                        self.config.compaction = config;
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "Auto-compaction {}",
+                                if enabled { "enabled" } else { "disabled" }
+                            )))
+                            .await;
+                    }
+                    Op::SetStreamChunkTimeout { timeout_secs } => {
+                        self.config.stream_chunk_timeout = Duration::from_secs(timeout_secs);
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "Stream chunk timeout set to {timeout_secs}s"
+                            )))
+                            .await;
+                    }
+                    Op::SyncSession {
+                        session_id,
+                        messages,
+                        system_prompt,
+                        system_prompt_override,
+                        model,
+                        workspace,
+                    } => {
+                        if let Some(session_id) = session_id {
+                            self.session.id = session_id;
+                        } else if messages.is_empty() && system_prompt.is_none() {
+                            self.session.id = uuid::Uuid::new_v4().to_string();
+                        }
+                        self.session.messages = messages.into();
+                        self.session.compaction_summary_prompt =
+                            extract_compaction_summary_prompt(system_prompt.clone());
+                        self.session.system_prompt = system_prompt;
+                        self.session.last_system_prompt_hash =
+                            Some(system_prompt_hash(self.session.system_prompt.as_ref()));
+                        // Host-supplied prompts are persisted prefixes. Keep them
+                        // byte-stable; mode/runtime state is projected per request.
+                        self.session.system_prompt_override =
+                            system_prompt_override && self.session.system_prompt.is_some();
+                        self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
+                        self.session.model = model;
+                        self.session.workspace = workspace.clone();
+                        self.config.model.clone_from(&self.session.model);
+                        self.config.workspace = workspace.clone();
+                        let ctx =
+                            crate::project_context::load_project_context_with_parents(&workspace);
+                        self.session.project_context = if ctx.has_instructions() {
+                            Some(ctx)
+                        } else {
+                            None
+                        };
+                        self.session.rebuild_working_set();
+                        self.emit_session_updated().await;
+                        let _ = self
+                            .tx_event
+                            .send(Event::status("Session context synced".to_string()))
+                            .await;
+                    }
+                    Op::CompactContext => {
+                        self.handle_manual_compaction().await;
+                    }
+                    Op::GetSessionSnapshot { tx } => {
+                        let total_tokens = self.session.total_usage.input_tokens
+                            + self.session.total_usage.output_tokens;
+                        let snapshot = SessionSnapshot {
+                            messages: self.session.messages.to_vec(),
+                            total_tokens,
+                            model: self.session.model.clone(),
+                            workspace: self.session.workspace.clone(),
+                            system_prompt: self.session.system_prompt.clone(),
+                            mode: self.current_mode.as_setting().to_string(),
+                        };
+                        if let Some(tx) = tx.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = tx.send(snapshot);
+                        }
+                    }
+                    Op::PurgeContext => {
+                        self.handle_purge().await;
+                    }
+                    Op::EditLastTurn { new_message } => {
+                        // #383: /edit — remove the last user+assistant exchange
+                        // from the session, then re-send with the new content.
+                        // Pop messages from the tail until we've removed the
+                        // most recent user message and everything after it.
+                        // First, find the last user message index.
+                        let mut cut = None;
+                        for (idx, msg) in self.session.messages.iter().enumerate().rev() {
+                            if msg.role == "user" {
+                                cut = Some(idx);
+                                break;
+                            }
+                        }
+                        if let Some(idx) = cut {
+                            self.session.messages.truncate_to(idx);
+                            self.session.bump_messages_revision();
+                        }
+                        // Now dispatch the new message as a normal send,
+                        // reusing the engine's stored mode/model config.
+                        let mode = AppMode::Agent; // default fallback
+                        self.handle_send_message(
+                            new_message,
+                            mode,
+                            Some(self.api_provider),
+                            self.session.model.clone(),
+                            self.config.goal_objective.clone(),
+                            self.config.goal_token_budget,
+                            self.config.goal_status,
+                            self.session.reasoning_effort.clone(),
+                            self.session.reasoning_effort_auto,
+                            self.session.auto_model,
+                            self.session.allow_shell,
+                            self.session.trust_mode,
+                            self.session.auto_approve,
+                            self.session.approval_mode,
+                            self.config.translation_enabled,
+                            self.config.show_thinking,
+                            self.config.allowed_tools.clone(),
+                            self.config.hook_executor.clone(),
+                            self.config.verbosity.clone(),
+                        )
+                        .await;
+                    }
+                    Op::Shutdown => {
+                        break;
+                    }
+                },
             }
+        }
+
+        // #freeze: flush any sub-agent checkpoint that the hot-path debounce
+        // coalesced away, so a graceful shutdown keeps the latest progress.
+        {
+            let mut manager = self.subagent_manager.write().await;
+            manager.flush_pending_persist();
         }
 
         // #420: graceful MCP shutdown — send SIGTERM and give stdio servers
@@ -1585,20 +1635,6 @@ impl Engine {
         }
     }
 
-    fn runtime_prompt_message(&self) -> Message {
-        let mode = self.current_mode;
-        let agent_approval_mode =
-            agent_approval_mode_for_turn(self.session.auto_approve, self.session.approval_mode);
-        let approval_mode = approval_mode_for(mode, agent_approval_mode);
-        Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: runtime_prompt_text(mode, approval_mode, self.session.allow_shell),
-                cache_control: None,
-            }],
-        }
-    }
-
     fn user_text_message_with_turn_metadata(&self, text: String) -> Message {
         self.user_text_message_with_turn_metadata_for_route(
             text,
@@ -1642,6 +1678,50 @@ impl Engine {
         }
     }
 
+    async fn handle_idle_subagent_completion(&mut self, first: SubAgentCompletion) {
+        let mut completions = vec![first];
+        while let Ok(completion) = self.rx_subagent_completion.try_recv() {
+            completions.push(completion);
+        }
+
+        let count = completions.len();
+        let content = completions
+            .iter()
+            .map(|completion| turn_loop::subagent_completion_runtime_text(&completion.payload))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let _ = self
+            .tx_event
+            .send(Event::status(format!(
+                "Resuming turn with {count} idle sub-agent completion(s)"
+            )))
+            .await;
+
+        self.handle_send_message(
+            content,
+            self.current_mode,
+            Some(self.api_provider),
+            self.session.model.clone(),
+            self.config.goal_objective.clone(),
+            self.config.goal_token_budget,
+            self.config.goal_status,
+            self.session.reasoning_effort.clone(),
+            self.session.reasoning_effort_auto,
+            self.session.auto_model,
+            self.session.allow_shell,
+            self.session.trust_mode,
+            self.session.auto_approve,
+            self.session.approval_mode,
+            self.config.translation_enabled,
+            self.config.show_thinking,
+            self.config.allowed_tools.clone(),
+            self.config.hook_executor.clone(),
+            self.config.verbosity.clone(),
+        )
+        .await;
+    }
+
     /// Handle a send message operation
     #[allow(clippy::too_many_arguments)]
     async fn handle_send_message(
@@ -1678,7 +1758,6 @@ impl Engine {
         // Create turn context first so start event includes a stable turn id.
         let mut turn = TurnContext::new(self.config.max_steps);
         self.turn_counter = self.turn_counter.saturating_add(1);
-        self.capacity_controller.mark_turn_start(self.turn_counter);
 
         // Emit turn started event IMMEDIATELY so the UI knows the turn is
         // active. The snapshot below can take 30+ seconds on slow filesystems
@@ -1821,8 +1900,7 @@ impl Engine {
         self.config.show_thinking = show_thinking;
         self.config.verbosity = verbosity;
 
-        // Refresh stable prompt context. Current mode is carried by the
-        // request-time runtime prompt projection.
+        // Refresh stable prompt context.
         self.refresh_system_prompt();
         self.emit_session_updated().await;
 
@@ -2803,17 +2881,6 @@ fn goal_objective_for_prompt(
 // byte-stable, and strict chat-template providers never see a system message
 // outside messages[0].
 
-fn approval_mode_for(
-    mode: AppMode,
-    session_approval: crate::tui::approval::ApprovalMode,
-) -> crate::tui::approval::ApprovalMode {
-    match mode {
-        AppMode::Yolo => crate::tui::approval::ApprovalMode::Auto,
-        AppMode::Plan => crate::tui::approval::ApprovalMode::Never,
-        AppMode::Agent => session_approval,
-    }
-}
-
 fn agent_approval_mode_for_turn(
     auto_approve: bool,
     approval_mode: crate::tui::approval::ApprovalMode,
@@ -2823,50 +2890,6 @@ fn agent_approval_mode_for_turn(
     } else {
         approval_mode
     }
-}
-
-/// Produce a minimal runtime-capabilities tag for the per-turn transient user message.
-///
-/// Human UI labels such as Plan / Agent / YOLO and approval-mode names stay in
-/// the app shell. The model receives route-effective capabilities instead, so
-/// prompt behavior follows the current runtime posture without training the
-/// model on presentation labels or branding.
-fn runtime_prompt_text(
-    mode: AppMode,
-    approval_mode: crate::tui::approval::ApprovalMode,
-    allow_shell: bool,
-) -> String {
-    let tool_profile = match mode {
-        AppMode::Agent => "workspace_write",
-        AppMode::Plan => "read_only",
-        AppMode::Yolo => "full_access",
-    };
-    let write_access = match mode {
-        AppMode::Agent => "workspace",
-        AppMode::Plan => "none",
-        AppMode::Yolo => "full_disk",
-    };
-    let shell_access = if matches!(mode, AppMode::Plan) || !allow_shell {
-        "none"
-    } else {
-        "enabled"
-    };
-    let network_access = match mode {
-        AppMode::Plan => "none",
-        AppMode::Agent | AppMode::Yolo => "enabled",
-    };
-    let approval_gate = match approval_mode {
-        crate::tui::approval::ApprovalMode::Auto => "preapproved",
-        crate::tui::approval::ApprovalMode::Suggest => "user_confirm",
-        crate::tui::approval::ApprovalMode::Never => "blocked",
-    };
-    let planning = match mode {
-        AppMode::Plan => "required",
-        AppMode::Agent | AppMode::Yolo => "optional",
-    };
-    format!(
-        "<cw_runtime_capabilities visibility=\"internal\" tool_profile=\"{tool_profile}\" write_access=\"{write_access}\" shell_access=\"{shell_access}\" network_access=\"{network_access}\" approval_gate=\"{approval_gate}\" planning=\"{planning}\"/>"
-    )
 }
 
 /// Spawn the engine in a background task
@@ -2955,16 +2978,15 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
 }
 
 mod approval;
-mod capacity_flow;
 mod context;
 mod handle;
 pub(crate) use context::compact_tool_result_for_context;
 #[cfg(test)]
 use context::route_context_budget_for_provider;
 use context::{
-    COMPACTION_SUMMARY_MARKER, MAX_CONTEXT_RECOVERY_ATTEMPTS, MIN_RECENT_MESSAGES_TO_KEEP,
-    context_input_budget_for_provider, effective_max_output_tokens,
-    extract_compaction_summary_prompt, is_context_length_error_message, summarize_text,
+    MAX_CONTEXT_RECOVERY_ATTEMPTS, MIN_RECENT_MESSAGES_TO_KEEP, context_input_budget_for_provider,
+    effective_max_output_tokens, extract_compaction_summary_prompt,
+    is_context_length_error_message, summarize_text,
 };
 mod dispatch;
 mod loop_guard;

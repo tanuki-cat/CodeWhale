@@ -68,22 +68,10 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 /// Build the Auto-mode panel stack. Empty panels collapse to zero height so
-/// non-empty ones get the full sidebar real estate. Work appears when it has
+/// non-empty ones get the full sidebar real estate. To-do appears when it has
 /// useful content, or as the one quiet empty state when nothing else is active.
 fn render_sidebar_auto(f: &mut Frame, area: Rect, app: &mut App) {
-    let work_has_content = sidebar_work_summary(app).has_useful_content();
-    let tasks_empty = app.runtime_turn_id.is_none() && app.task_panel.is_empty();
-    let agents_empty = app.subagent_cache.is_empty()
-        && app.agent_progress.is_empty()
-        && active_fanout_counts(app).is_none()
-        && !foreground_rlm_running(app);
-
-    let visible = auto_sidebar_panels(AutoSidebarState {
-        work_has_content,
-        tasks_empty,
-        agents_empty,
-        context_enabled: app.context_panel,
-    });
+    let visible = auto_sidebar_panels(auto_sidebar_state(app));
 
     let constraints: Vec<Constraint> = match visible.len() {
         1 => vec![Constraint::Min(0)],
@@ -121,6 +109,44 @@ fn render_sidebar_auto(f: &mut Frame, area: Rect, app: &mut App) {
             AutoSidebarPanel::Context => render_context_panel(f, *rect, app),
         }
     }
+}
+
+/// Compute the Auto-mode panel signals. Shared by `render_sidebar_auto` (which
+/// panel boxes to show) and `sidebar_auto_idle` (whether to collapse the whole
+/// sidebar to a full-width transcript). Content-gated: the jobs/tasks panel
+/// appears only when there are real durable tasks or background shell jobs,
+/// never merely because a turn is in flight.
+fn auto_sidebar_state(app: &mut App) -> AutoSidebarState {
+    AutoSidebarState {
+        work_has_content: sidebar_work_summary(app).has_useful_content(),
+        // The jobs/tasks panel appears only for real background work — running
+        // shell jobs, RLM, or durable Fleet tasks (`Background` entries).
+        // Per-turn model reasoning (`ModelReasoning`) never counts, so an
+        // ordinary reasoning turn shows no panel at all.
+        tasks_empty: !app
+            .task_panel
+            .iter()
+            .any(|entry| entry.kind == TaskPanelEntryKind::Background),
+        agents_empty: app.subagent_cache.is_empty()
+            && app.agent_progress.is_empty()
+            && active_fanout_counts(app).is_none()
+            && !foreground_rlm_running(app),
+        context_enabled: app.context_panel,
+    }
+}
+
+/// Auto-reveal: in Auto focus mode the sidebar collapses to nothing when there
+/// is no active content (no To-do, no live/queued fleet, no background jobs, no
+/// pinned context), so an idle session gets a full-width transcript. Any active
+/// content brings it back; completed agents linger in the cache as a natural
+/// grace before it retracts. Explicit panel focus and Hidden bypass this (the
+/// former should always show, the latter is handled by the width helper).
+pub(crate) fn sidebar_auto_idle(app: &mut App) -> bool {
+    if app.sidebar_focus != SidebarFocus::Auto {
+        return false;
+    }
+    let state = auto_sidebar_state(app);
+    !state.work_has_content && state.tasks_empty && state.agents_empty && !state.context_enabled
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +218,14 @@ impl SidebarWorkSummary {
         !self.checklist_items.is_empty()
     }
 
+    fn checklist_is_complete(&self) -> bool {
+        self.checklist_is_primary()
+            && self
+                .checklist_items
+                .iter()
+                .all(|item| item.status == TodoStatus::Completed)
+    }
+
     fn has_strategy(&self) -> bool {
         self.strategy_explanation
             .as_deref()
@@ -234,6 +268,32 @@ impl SidebarWorkSummary {
         let percent = completed.saturating_mul(100) / self.strategy_steps.len();
         u8::try_from(percent).unwrap_or(u8::MAX)
     }
+}
+
+fn should_render_strategy_step(
+    summary: &SidebarWorkSummary,
+    step: &SidebarWorkStrategyStep,
+) -> bool {
+    !summary.checklist_is_complete() || step.status == StepStatus::Completed
+}
+
+fn renderable_strategy_steps(summary: &SidebarWorkSummary) -> Vec<&SidebarWorkStrategyStep> {
+    summary
+        .strategy_steps
+        .iter()
+        .filter(|step| should_render_strategy_step(summary, step))
+        .collect()
+}
+
+fn has_renderable_strategy(summary: &SidebarWorkSummary) -> bool {
+    summary
+        .strategy_explanation
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        || summary
+            .strategy_steps
+            .iter()
+            .any(|step| should_render_strategy_step(summary, step))
 }
 
 fn sidebar_work_summary(app: &mut App) -> SidebarWorkSummary {
@@ -406,7 +466,11 @@ fn work_panel_hover_texts(
             summary.checklist_completion_pct
         ));
 
-        let reserve_for_strategy = if summary.has_strategy() { 2 } else { 0 };
+        let reserve_for_strategy = if has_renderable_strategy(summary) {
+            2
+        } else {
+            0
+        };
         let available_item_rows = max_rows
             .saturating_sub(texts.len())
             .saturating_sub(reserve_for_strategy)
@@ -456,7 +520,9 @@ fn work_panel_hover_texts(
         }
     }
 
-    if summary.has_strategy() && texts.len() < max_rows {
+    if has_renderable_strategy(summary) && texts.len() < max_rows {
+        let strategy_steps = renderable_strategy_steps(summary);
+
         if !summary.checklist_is_primary() && !summary.strategy_steps.is_empty() {
             let (pending, in_progress, completed) = summary.strategy_counts();
             let total = pending + in_progress + completed;
@@ -476,8 +542,9 @@ fn work_panel_hover_texts(
 
         let max_steps = max_rows
             .saturating_sub(texts.len())
-            .min(summary.strategy_steps.len());
-        for step in summary.strategy_steps.iter().take(max_steps) {
+            .min(strategy_steps.len());
+        let remaining = strategy_steps.len().saturating_sub(max_steps);
+        for step in strategy_steps.into_iter().take(max_steps) {
             let prefix = match step.status {
                 StepStatus::Pending => "[ ]",
                 StepStatus::InProgress => "[~]",
@@ -498,7 +565,6 @@ fn work_panel_hover_texts(
             texts.push(text);
         }
 
-        let remaining = summary.strategy_steps.len().saturating_sub(max_steps);
         if remaining > 0 && texts.len() < max_rows {
             texts.push(format!("+{remaining} more strategy steps"));
         }
@@ -615,7 +681,11 @@ fn push_work_checklist_lines(
         ),
     ]));
 
-    let reserve_for_strategy = if summary.has_strategy() { 2 } else { 0 };
+    let reserve_for_strategy = if has_renderable_strategy(summary) {
+        2
+    } else {
+        0
+    };
     let available_item_rows = max_rows
         .saturating_sub(lines.len())
         .saturating_sub(reserve_for_strategy)
@@ -681,11 +751,12 @@ fn push_work_strategy_lines(
     lines: &mut Vec<Line<'static>>,
     theme: &Theme,
 ) {
-    if !summary.has_strategy() || lines.len() >= max_rows {
+    if !has_renderable_strategy(summary) || lines.len() >= max_rows {
         return;
     }
 
     let checklist_is_primary = summary.checklist_is_primary();
+    let strategy_steps = renderable_strategy_steps(summary);
     if !checklist_is_primary && !summary.strategy_steps.is_empty() {
         let (pending, in_progress, completed) = summary.strategy_counts();
         let total = pending + in_progress + completed;
@@ -721,8 +792,9 @@ fn push_work_strategy_lines(
 
     let max_steps = max_rows
         .saturating_sub(lines.len())
-        .min(summary.strategy_steps.len());
-    for step in summary.strategy_steps.iter().take(max_steps) {
+        .min(strategy_steps.len());
+    let remaining = strategy_steps.len().saturating_sub(max_steps);
+    for step in strategy_steps.into_iter().take(max_steps) {
         let (prefix, color) = match step.status {
             StepStatus::Pending => ("[ ]", theme.plan_pending_color),
             StepStatus::InProgress => ("[~]", theme.plan_in_progress_color),
@@ -746,7 +818,6 @@ fn push_work_strategy_lines(
         )));
     }
 
-    let remaining = summary.strategy_steps.len().saturating_sub(max_steps);
     if remaining > 0 && lines.len() < max_rows {
         lines.push(Line::from(Span::styled(
             format!("+{remaining} more strategy steps"),
@@ -801,7 +872,7 @@ fn render_sidebar_work(f: &mut Frame, area: Rect, app: &mut App) {
     );
 
     let full_texts = work_panel_hover_texts(&summary, content_width.max(1), usable_rows);
-    render_sidebar_section(f, area, "Work", lines, full_texts, Vec::new(), app);
+    render_sidebar_section(f, area, "To-do", lines, full_texts, Vec::new(), app);
 }
 
 /// Click actions for one background job row pair (#3028).
@@ -2967,7 +3038,7 @@ mod tests {
     }
 
     #[test]
-    fn work_panel_renders_checklist_as_primary_progress_surface() {
+    fn work_panel_renders_checklist_as_primary_progress_surface_while_incomplete() {
         let summary = SidebarWorkSummary {
             checklist_completion_pct: 33,
             checklist_items: vec![
@@ -3047,7 +3118,7 @@ mod tests {
     }
 
     #[test]
-    fn work_panel_hover_renders_strategy_as_context_when_checklist_exists() {
+    fn work_panel_hover_renders_strategy_as_context_while_checklist_incomplete() {
         let summary = SidebarWorkSummary {
             checklist_completion_pct: 0,
             checklist_items: vec![SidebarWorkChecklistItem {
@@ -3095,6 +3166,70 @@ mod tests {
                 .any(|line| line.contains("[✓] Map phase boundaries")),
             "hover strategy rows must not look like a second checklist: {hover:?}"
         );
+    }
+
+    #[test]
+    fn work_panel_suppresses_stale_active_strategy_when_checklist_complete() {
+        let summary = SidebarWorkSummary {
+            checklist_completion_pct: 100,
+            checklist_items: vec![
+                SidebarWorkChecklistItem {
+                    id: 1,
+                    content: "Ship the fix".to_string(),
+                    status: TodoStatus::Completed,
+                },
+                SidebarWorkChecklistItem {
+                    id: 2,
+                    content: "Run focused tests".to_string(),
+                    status: TodoStatus::Completed,
+                },
+            ],
+            strategy_explanation: Some("Old plan metadata".to_string()),
+            strategy_steps: vec![
+                SidebarWorkStrategyStep {
+                    text: "Completed context".to_string(),
+                    status: StepStatus::Completed,
+                    elapsed: String::new(),
+                },
+                SidebarWorkStrategyStep {
+                    text: "Stale active phase".to_string(),
+                    status: StepStatus::InProgress,
+                    elapsed: String::new(),
+                },
+                SidebarWorkStrategyStep {
+                    text: "Stale next phase".to_string(),
+                    status: StepStatus::Pending,
+                    elapsed: String::new(),
+                },
+            ],
+            ..SidebarWorkSummary::default()
+        };
+
+        let display = lines_to_text(&work_panel_lines(
+            &summary,
+            80,
+            16,
+            PaletteMode::Dark,
+            &palette::UI_THEME,
+        ));
+        let hover = work_panel_hover_texts(&summary, 80, 16);
+
+        for rendered in [&display, &hover] {
+            assert!(
+                rendered
+                    .iter()
+                    .any(|line| line.contains("phase done: Completed context")),
+                "completed strategy context may still render: {rendered:?}"
+            );
+            assert!(
+                !rendered.iter().any(|line| line.contains("phase now:")),
+                "stale in-progress strategy must not render as active work: {rendered:?}"
+            );
+            assert!(
+                !rendered.iter().any(|line| line.contains("phase next:")),
+                "stale pending strategy must not render as upcoming work: {rendered:?}"
+            );
+        }
     }
 
     #[test]
@@ -3297,7 +3432,7 @@ mod tests {
         active.push_tool(
             "tool-1",
             HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
-                name: "agent_eval".to_string(),
+                name: "agent".to_string(),
                 status: ToolStatus::Running,
                 input_summary: Some("agent_id: agent_af58ba3a".to_string()),
                 output: None,
@@ -3320,8 +3455,8 @@ mod tests {
             "live section missing: {text:?}"
         );
         assert!(
-            text.iter().any(|line| line.contains("[~] agent_eval")),
-            "active agent_eval row missing: {text:?}"
+            text.iter().any(|line| line.contains("[~] agent")),
+            "active agent row missing: {text:?}"
         );
         assert!(
             !text.iter().any(|line| line.contains("No active tasks")),

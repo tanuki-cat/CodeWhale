@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Codex-style app-server transport for DeepSeek workspace architecture"
+# `codewhale app-server` is owned by codewhale-cli; this crate is library-only.
+autobins = false
 
 [dependencies]
 anyhow.workspace = true
@@ -25,6 +27,7 @@ rustls.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
+reqwest = { workspace = true, features = ["json"] }
 uuid.workspace = true
 
 [dev-dependencies]

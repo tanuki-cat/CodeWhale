@@ -2647,6 +2647,10 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                     "HUGGINGFACE_API_KEY/HF_TOKEN",
                     "codewhale auth set --provider huggingface",
                 ),
+                crate::config::ApiProvider::Deepinfra => (
+                    "DEEPINFRA_API_KEY/DEEPINFRA_TOKEN",
+                    "codewhale auth set --provider deepinfra --api-key \"...\"",
+                ),
                 crate::config::ApiProvider::Together => (
                     "TOGETHER_API_KEY",
                     "codewhale auth set --provider together --api-key \"...\"",
@@ -2693,6 +2697,7 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                     crate::config::ApiProvider::Vllm => "vllm",
                     crate::config::ApiProvider::Ollama => "ollama",
                     crate::config::ApiProvider::Huggingface => "huggingface",
+                    crate::config::ApiProvider::Deepinfra => "deepinfra",
                     crate::config::ApiProvider::Together => "together",
                     crate::config::ApiProvider::OpenaiCodex => "openai_codex",
                     crate::config::ApiProvider::Deepseek
@@ -6558,12 +6563,9 @@ async fn run_exec_agent(
         show_thinking: settings.show_thinking,
         max_steps: max_turns,
         max_subagents,
-        interactive_launch_limit: execution_config.interactive_launch_limit(),
+        launch_concurrency: execution_config.launch_concurrency(),
         features: execution_config.features(),
         compaction,
-        capacity: crate::core::capacity::CapacityControllerConfig::from_app_config(
-            &execution_config,
-        ),
         todos: new_shared_todo_list(),
         plan_state: new_shared_plan_state(),
         goal_state: crate::tools::goal::new_shared_goal_state(),
@@ -6763,11 +6765,6 @@ async fn run_exec_agent(
                         eprintln!("tool: {name}");
                     }
                 }
-            }
-            Event::ToolCallProgress { id, output }
-                if output_format == ExecOutputFormat::Text && !json_output =>
-            {
-                eprintln!("tool {id}: {}", summarize_tool_output(&output));
             }
             Event::ToolCallComplete {
                 id, name, result, ..
