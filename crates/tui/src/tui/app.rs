@@ -69,6 +69,17 @@ pub(crate) fn resolve_skills_dir(
     global_skills_dir: &Path,
     config: &Config,
 ) -> PathBuf {
+    if config.skills_config().scan_codewhale_only() {
+        if config.skills_dir.is_some() {
+            return global_skills_dir.to_path_buf();
+        }
+        if let Some(codewhale_skills_dir) = crate::skills::codewhale_workspace_skills_dir(workspace)
+        {
+            return codewhale_skills_dir;
+        }
+        return global_skills_dir.to_path_buf();
+    }
+
     let agents_skills_dir = workspace.join(".agents").join("skills");
     if agents_skills_dir.exists() {
         return agents_skills_dir;
@@ -332,11 +343,17 @@ impl ReasoningEffort {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarFocus {
     Auto,
-    Work,
+    Pinned,
     Tasks,
     Agents,
     Context,
     Hidden,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentProgressMeta {
+    pub parent_run_id: Option<String>,
+    pub spawn_depth: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,7 +396,7 @@ impl SidebarFocus {
     #[must_use]
     pub fn from_setting(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
-            "work" | "plan" | "todos" => Self::Work,
+            "pinned" | "visible" | "show" | "on" | "work" | "plan" | "todos" => Self::Pinned,
             "tasks" => Self::Tasks,
             "agents" | "subagents" | "sub-agents" => Self::Agents,
             "context" | "session" => Self::Context,
@@ -393,7 +410,7 @@ impl SidebarFocus {
     pub fn as_setting(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Work => "work",
+            Self::Pinned => "pinned",
             Self::Tasks => "tasks",
             Self::Agents => "agents",
             Self::Context => "context",
@@ -985,6 +1002,12 @@ struct YoloRestoreState {
     approval_mode: ApprovalMode,
 }
 
+/// Saved approval mode to restore when leaving Plan mode (#3279).
+#[derive(Debug, Clone, Copy)]
+struct PlanRestoreState {
+    approval_mode: ApprovalMode,
+}
+
 // === Sub-state structs for App field organization (#377) ===
 
 /// Vim modal editing mode for the composer input area.
@@ -1036,6 +1059,9 @@ pub struct MentionCompletionCache {
     /// Completion behavior used for this walk. Included so live config changes
     /// invalidate cached popup results.
     pub behavior: String,
+    /// Whether symlink following was enabled for this completion walk.
+    /// Included so live config changes invalidate cached popup results.
+    pub follow_links: bool,
     /// Cached completion entries.
     pub entries: Vec<String>,
 }
@@ -1445,6 +1471,7 @@ pub struct App {
     pub config_profile: Option<String>,
     pub mcp_config_path: PathBuf,
     pub skills_dir: PathBuf,
+    pub skills_scan_codewhale_only: bool,
     /// Path to the user-memory file (#489). Always populated; only
     /// consulted when `use_memory` is `true`.
     pub memory_path: PathBuf,
@@ -1470,6 +1497,10 @@ pub struct App {
     /// `@`-mention completion behavior: fuzzy workspace search or deterministic
     /// directory browser.
     pub mention_menu_behavior: String,
+    /// Follow symbolic links during workspace file discovery walks.
+    /// When `true`, symlinked directories are traversed, enabling
+    /// multi-project workspaces.
+    pub workspace_follow_symlinks: bool,
     pub use_bracketed_paste: bool,
     pub use_paste_burst_detection: bool,
     /// Set to `true` the first time a real `Event::Paste` arrives during a
@@ -1539,6 +1570,8 @@ pub struct App {
     pub sidebar_resize_anchor_width: u16,
     /// Last sidebar area rendered (for mouse hit-testing the resize handle).
     pub last_sidebar_area: Option<Rect>,
+    /// Last total chat/sidebar width considered for sidebar rendering.
+    pub last_sidebar_host_width: Option<u16>,
     /// Handle rect painted on the left edge of the sidebar (1 col).
     pub last_sidebar_handle_area: Option<Rect>,
     /// Total horizontal space (chat + sidebar) used to compute the percentage
@@ -1575,6 +1608,8 @@ pub struct App {
     pub subagent_terminal_seen_at: HashMap<String, Instant>,
     /// Last known per-agent progress text for running sub-agents.
     pub agent_progress: HashMap<String, String>,
+    /// Parent/depth metadata for live progress-only sub-agent rows.
+    pub agent_progress_meta: HashMap<String, AgentProgressMeta>,
     /// In-transcript sub-agent card index by `agent_id` (issue #128).
     /// Maps each live sub-agent to the `HistoryCell::SubAgent` it renders
     /// into, so successive mailbox envelopes mutate the same cell rather
@@ -1618,6 +1653,7 @@ pub struct App {
     #[allow(dead_code)]
     pub yolo: bool,
     yolo_restore: Option<YoloRestoreState>,
+    plan_restore: Option<PlanRestoreState>,
     // Clipboard handler
     pub clipboard: ClipboardHandler,
     // Tool approval session allowlist
@@ -1659,8 +1695,8 @@ pub struct App {
     pub plan_prompt_pending: bool,
     /// Whether update_plan was called during the current turn
     pub plan_tool_used_in_turn: bool,
-    /// Todo list for `TodoWriteTool`
-    #[allow(dead_code)] // For future engine integration
+    /// Todo list for `TodoWriteTool`. Read by the plan confirmation modal to
+    /// show the active checklist alongside the plan.
     pub todos: SharedTodoList,
     /// Durable runtime services exposed to model-visible task/automation tools.
     pub runtime_services: RuntimeToolServices,
@@ -1731,6 +1767,14 @@ pub struct App {
     /// thinking into the active cell so it groups visually with tool calls
     /// until the next assistant prose chunk flushes the group into history.
     pub streaming_thinking_active_entry: Option<usize>,
+    /// Instant of the last throttled active-cell revision bump for the
+    /// in-flight thinking stream (#1620). Reasoning chunks arrive faster than
+    /// the eye can read, and each bump invalidates the active cell's wrap
+    /// cache, forcing a full re-wrap. We debounce intermediate bumps to a
+    /// time window so high-frequency thinking deltas no longer trigger a
+    /// re-render per character. `None` means "no bump since the last
+    /// finalize" so the first chunk of a block always renders immediately.
+    pub thinking_revision_last_bump_at: Option<Instant>,
     /// Newline-gated streaming collector state.
     pub streaming_state: StreamingState,
     /// Live approximate output tokens for the current assistant stream.
@@ -1930,6 +1974,8 @@ pub struct TaskPanelEntry {
     pub kind: TaskPanelEntryKind,
     pub stale: bool,
     pub elapsed_since_output_ms: Option<u64>,
+    pub owner_agent_id: Option<String>,
+    pub owner_agent_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2051,6 +2097,33 @@ impl App {
         } = options;
 
         let settings = Settings::load().unwrap_or_else(|_| Settings::default());
+
+        // If settings.toml exists on disk but couldn't be parsed (we fell back
+        // to defaults), surface a warning in the TUI so the user knows their
+        // file is broken instead of silently losing all settings.
+        let settings_parse_warning = crate::settings::Settings::path().ok().and_then(|p| {
+            if p.exists() {
+                std::fs::read_to_string(&p).ok().and_then(|raw| {
+                    ::toml::from_str::<::toml::Value>(&raw)
+                        .err()
+                        .map(|e| format!("⚠ settings.toml is malformed — using defaults ({e})"))
+                })
+            } else {
+                None
+            }
+        });
+        let tui_prefs_warning = crate::settings::TuiPrefs::path().ok().and_then(|p| {
+            if p.exists() {
+                std::fs::read_to_string(&p).ok().and_then(|raw| {
+                    ::toml::from_str::<::toml::Value>(&raw)
+                        .err()
+                        .map(|e| format!("⚠ tui.toml is malformed — using defaults ({e})"))
+                })
+            } else {
+                None
+            }
+        });
+
         let mut provider = config.api_provider();
 
         // Let settings preserve runtime switches only when config/CLI did not
@@ -2210,8 +2283,10 @@ impl App {
         // Initialize plan state
         let plan_state = new_shared_plan_state();
 
+        let skills_scan_codewhale_only = config.skills_config().scan_codewhale_only();
         let skills_dir = resolve_skills_dir(&workspace, &global_skills_dir, config);
-        let cached_skills = Self::discover_cached_skills(&workspace, &skills_dir);
+        let cached_skills =
+            Self::discover_cached_skills(&workspace, &skills_dir, skills_scan_codewhale_only);
 
         let input_history = crate::composer_history::load_history();
         let (initial_input_text, initial_input_cursor, auto_submit_initial_input) =
@@ -2279,7 +2354,9 @@ impl App {
             prompt_suggestion_gen: std::sync::atomic::AtomicU64::new(0),
             offline_mode: false,
             turn_error_posted: false,
-            status_message: None,
+            // Surface parse warnings so the user knows their config file is
+            // broken instead of silently losing all settings.
+            status_message: settings_parse_warning.or(tui_prefs_warning),
             status_toasts: VecDeque::new(),
             sticky_status: None,
             last_status_message_seen: None,
@@ -2299,6 +2376,7 @@ impl App {
             config_profile,
             mcp_config_path: mcp_config_path.clone(),
             skills_dir,
+            skills_scan_codewhale_only,
             memory_path,
             use_memory,
             use_alt_screen,
@@ -2336,6 +2414,7 @@ impl App {
             sidebar_resize_anchor_x: 0,
             sidebar_resize_anchor_width: 0,
             last_sidebar_area: None,
+            last_sidebar_host_width: None,
             last_sidebar_handle_area: None,
             sidebar_resize_total_width: 0,
             sidebar_width_dirty: false,
@@ -2355,6 +2434,7 @@ impl App {
             subagent_cache: Vec::new(),
             subagent_terminal_seen_at: HashMap::new(),
             agent_progress: HashMap::new(),
+            agent_progress_meta: HashMap::new(),
             subagent_card_index: HashMap::new(),
             last_fanout_card_index: None,
             pending_subagent_dispatch: None,
@@ -2373,6 +2453,7 @@ impl App {
             hooks,
             yolo: initial_mode == AppMode::Yolo,
             yolo_restore,
+            plan_restore: None,
             clipboard: ClipboardHandler::new(),
             approval_session_approved: HashSet::new(),
             approval_session_denied: HashSet::new(),
@@ -2431,6 +2512,7 @@ impl App {
             streaming_message_index: None,
             suppress_stream_events_until_turn_complete: false,
             streaming_thinking_active_entry: None,
+            thinking_revision_last_bump_at: None,
             streaming_state: StreamingState::new(),
             streaming_output_token_estimate: 0,
             reasoning_buffer: String::new(),
@@ -2487,6 +2569,7 @@ impl App {
             mention_menu_limit: settings.mention_menu_limit,
             mention_walk_depth: settings.mention_walk_depth,
             mention_menu_behavior: settings.mention_menu_behavior.clone(),
+            workspace_follow_symlinks: settings.workspace_follow_symlinks,
             session_title: None,
             receipt_text: None,
             receipt_started_at: None,
@@ -2497,17 +2580,26 @@ impl App {
     fn discover_cached_skills(
         workspace: &std::path::Path,
         skills_dir: &std::path::Path,
+        scan_codewhale_only: bool,
     ) -> Vec<(String, String)> {
-        crate::skills::discover_for_workspace_and_dir(workspace, skills_dir)
-            .list()
-            .iter()
-            .map(|s| (s.name.clone(), s.description.clone()))
-            .collect()
+        crate::skills::discover_for_workspace_and_dir_with_mode(
+            workspace,
+            skills_dir,
+            crate::skills::SkillDiscoveryMode::from_codewhale_only(scan_codewhale_only),
+        )
+        .list()
+        .iter()
+        .map(|s| (s.name.clone(), s.description.clone()))
+        .collect()
     }
 
     pub fn refresh_skill_cache(&mut self) {
         let skills_dir = self.skills_dir.clone();
-        self.cached_skills = Self::discover_cached_skills(&self.workspace, &skills_dir);
+        self.cached_skills = Self::discover_cached_skills(
+            &self.workspace,
+            &skills_dir,
+            self.skills_scan_codewhale_only,
+        );
     }
 
     pub fn submit_api_key(&mut self) -> Result<SavedCredential, ApiKeyError> {
@@ -2569,9 +2661,37 @@ impl App {
 
         let entering_yolo = mode == AppMode::Yolo && previous_mode != AppMode::Yolo;
         let leaving_yolo = previous_mode == AppMode::Yolo && mode != AppMode::Yolo;
+        let entering_plan = mode == AppMode::Plan && previous_mode != AppMode::Plan;
+        let leaving_plan = previous_mode == AppMode::Plan && mode != AppMode::Plan;
         self.mode = mode;
         self.status_message = Some(format!("Switched to {} mode", mode.label()));
 
+        // Restore outgoing mode state before capturing incoming mode state. This
+        // keeps cross-mode hops such as Plan -> YOLO and YOLO -> Plan from
+        // saving transient policy values as the next mode's baseline.
+        if leaving_yolo && let Some(restore) = self.yolo_restore.take() {
+            self.allow_shell = restore.allow_shell;
+            self.trust_mode = restore.trust_mode;
+            self.approval_mode = restore.approval_mode;
+        }
+
+        // Plan save/restore (#3279): Plan mode derives its write-blocking from
+        // the mode itself (turn_loop), but the TUI approval surface reads
+        // `app.approval_mode` without consulting `app.mode`.  Save the Agent-era
+        // approval mode when entering Plan so it is restored when the user
+        // switches back to Agent.
+        if leaving_plan && let Some(restore) = self.plan_restore.take() {
+            self.approval_mode = restore.approval_mode;
+        }
+
+        if entering_plan {
+            self.plan_restore = Some(PlanRestoreState {
+                approval_mode: self.approval_mode,
+            });
+        }
+
+        // YOLO save/restore: captures the full pre-YOLO permission surface so
+        // exiting YOLO puts the user back exactly where they were.
         if entering_yolo {
             self.yolo_restore = Some(YoloRestoreState {
                 allow_shell: self.allow_shell,
@@ -2581,10 +2701,6 @@ impl App {
             self.allow_shell = true;
             self.trust_mode = true;
             self.approval_mode = ApprovalMode::Auto;
-        } else if leaving_yolo && let Some(restore) = self.yolo_restore.take() {
-            self.allow_shell = restore.allow_shell;
-            self.trust_mode = restore.trust_mode;
-            self.approval_mode = restore.approval_mode;
         }
 
         self.yolo = mode == AppMode::Yolo;
@@ -5439,6 +5555,13 @@ pub enum AppAction {
     },
     /// Send a message to the AI (normal chat mode).
     SendMessage(String),
+    /// Update the runtime goal status (`/goal pause|resume|clear|…`) without
+    /// dispatching a model turn. The UI layer translates this into
+    /// `Op::SetGoalStatus`.
+    SetGoalStatus {
+        status: crate::tools::goal::GoalStatus,
+        clear: bool,
+    },
     ListSubAgents,
     FetchModels,
     /// Query the active provider's account balance / credits over the network
@@ -5456,6 +5579,14 @@ pub enum AppAction {
     },
     UpdateCompaction(CompactionConfig),
     UpdateStreamChunkTimeout(u64),
+    UpdateSubagentRuntimeConfig {
+        enabled: bool,
+        max_subagents: usize,
+        launch_concurrency: usize,
+        max_spawn_depth: u32,
+        api_timeout_secs: u64,
+        heartbeat_timeout_secs: u64,
+    },
     OpenContextInspector,
     CompactContext,
     PurgeContext,
@@ -5577,6 +5708,16 @@ mod tests {
             resume_session_id: None,
             initial_input: None,
         }
+    }
+
+    #[cfg(unix)]
+    fn create_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
     }
 
     #[test]
@@ -5982,17 +6123,18 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_focus_accepts_work_and_maps_legacy_trackers_to_work() {
+    fn sidebar_focus_accepts_pinned_and_maps_legacy_trackers_to_pinned() {
         assert_eq!(SidebarFocus::from_setting("auto"), SidebarFocus::Auto);
-        assert_eq!(SidebarFocus::from_setting("work"), SidebarFocus::Work);
-        assert_eq!(SidebarFocus::from_setting("plan"), SidebarFocus::Work);
-        assert_eq!(SidebarFocus::from_setting("todos"), SidebarFocus::Work);
+        assert_eq!(SidebarFocus::from_setting("pinned"), SidebarFocus::Pinned);
+        assert_eq!(SidebarFocus::from_setting("work"), SidebarFocus::Pinned);
+        assert_eq!(SidebarFocus::from_setting("plan"), SidebarFocus::Pinned);
+        assert_eq!(SidebarFocus::from_setting("todos"), SidebarFocus::Pinned);
         assert_eq!(SidebarFocus::from_setting("tasks"), SidebarFocus::Tasks);
         assert_eq!(SidebarFocus::from_setting("agents"), SidebarFocus::Agents);
         assert_eq!(SidebarFocus::from_setting("context"), SidebarFocus::Context);
         assert_eq!(SidebarFocus::from_setting("hidden"), SidebarFocus::Hidden);
         assert_eq!(SidebarFocus::from_setting("off"), SidebarFocus::Hidden);
-        assert_eq!(SidebarFocus::Work.as_setting(), "work");
+        assert_eq!(SidebarFocus::Pinned.as_setting(), "pinned");
         assert_eq!(SidebarFocus::Hidden.as_setting(), "hidden");
     }
 
@@ -6496,6 +6638,89 @@ mod tests {
     }
 
     #[test]
+    fn cached_skills_respect_codewhale_only_scan_config() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+
+        let claude_dir = workspace
+            .join(".claude")
+            .join("skills")
+            .join("claude-skill");
+        std::fs::create_dir_all(&claude_dir).expect("claude skill dir");
+        std::fs::write(
+            claude_dir.join("SKILL.md"),
+            "---\nname: claude-skill\ndescription: Claude skill\n---\nbody\n",
+        )
+        .expect("write claude skill");
+
+        let codewhale_dir = workspace
+            .join(".codewhale")
+            .join("skills")
+            .join("codewhale-skill");
+        std::fs::create_dir_all(&codewhale_dir).expect("codewhale skill dir");
+        std::fs::write(
+            codewhale_dir.join("SKILL.md"),
+            "---\nname: codewhale-skill\ndescription: CodeWhale skill\n---\nbody\n",
+        )
+        .expect("write codewhale skill");
+
+        let mut options = test_options(false);
+        options.workspace = workspace.clone();
+        options.skills_dir = tmp.path().join("global-skills");
+        let app = App::new(
+            options,
+            &Config {
+                skills: Some(crate::config::SkillsConfig {
+                    scan_codewhale_only: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(app.skills_dir, workspace.join(".codewhale").join("skills"));
+        assert!(
+            app.cached_skills
+                .iter()
+                .any(|(name, _)| name == "codewhale-skill"),
+            "CodeWhale skill should be cached: {:?}",
+            app.cached_skills
+        );
+        assert!(
+            !app.cached_skills
+                .iter()
+                .any(|(name, _)| name == "claude-skill"),
+            "strict scan should not cache Claude skills: {:?}",
+            app.cached_skills
+        );
+    }
+
+    #[test]
+    fn resolve_skills_dir_requires_codewhale_skills_to_be_directory() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".codewhale")).expect("codewhale dir");
+        std::fs::write(
+            workspace.join(".codewhale").join("skills"),
+            "not a directory",
+        )
+        .expect("skills file");
+
+        let global_skills_dir = tmp.path().join("global-skills");
+        let config = Config {
+            skills: Some(crate::config::SkillsConfig {
+                scan_codewhale_only: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resolved = resolve_skills_dir(&workspace, &global_skills_dir, &config);
+
+        assert_eq!(resolved, global_skills_dir);
+    }
+
+    #[test]
     fn cached_skills_include_configured_directory() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
@@ -6524,6 +6749,103 @@ mod tests {
                 .any(|(name, description)| name == "configured-skill"
                     && description == "Configured skill"),
             "configured skill dir should be merged: {:?}",
+            app.cached_skills
+        );
+    }
+
+    #[test]
+    fn cached_skills_preserve_configured_directory_in_codewhale_only_scan() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+
+        let codewhale_skill_dir = workspace
+            .join(".codewhale")
+            .join("skills")
+            .join("workspace-codewhale");
+        std::fs::create_dir_all(&codewhale_skill_dir).expect("workspace codewhale skill dir");
+        std::fs::write(
+            codewhale_skill_dir.join("SKILL.md"),
+            "---\nname: workspace-codewhale\ndescription: Workspace CodeWhale skill\n---\nbody\n",
+        )
+        .expect("write workspace codewhale skill");
+
+        let configured_dir = tmp.path().join("configured-skills");
+        let configured_skill_dir = configured_dir.join("configured-skill");
+        std::fs::create_dir_all(&configured_skill_dir).expect("configured skill dir");
+        std::fs::write(
+            configured_skill_dir.join("SKILL.md"),
+            "---\nname: configured-skill\ndescription: Configured skill\n---\nbody\n",
+        )
+        .expect("write configured skill");
+
+        let mut options = test_options(false);
+        options.workspace = workspace.clone();
+        options.skills_dir = configured_dir.clone();
+        let config = Config {
+            skills_dir: Some(configured_dir.to_string_lossy().into_owned()),
+            skills: Some(crate::config::SkillsConfig {
+                scan_codewhale_only: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let app = App::new(options, &config);
+
+        assert_eq!(app.skills_dir, configured_dir);
+        assert!(
+            app.cached_skills
+                .iter()
+                .any(|(name, _)| name == "workspace-codewhale"),
+            "workspace CodeWhale skill should still be cached: {:?}",
+            app.cached_skills
+        );
+        assert!(
+            app.cached_skills
+                .iter()
+                .any(|(name, _)| name == "configured-skill"),
+            "explicit configured skills_dir should still be cached: {:?}",
+            app.cached_skills
+        );
+    }
+
+    #[test]
+    fn cached_skills_reject_codewhale_only_workspace_symlink_escape() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let escape_target = tmp.path().join("escape-target");
+        let escaped_skill_dir = escape_target.join("escaped-skill");
+        std::fs::create_dir_all(workspace.join(".codewhale")).expect("codewhale dir");
+        std::fs::create_dir_all(&escaped_skill_dir).expect("escaped skill dir");
+        std::fs::write(
+            escaped_skill_dir.join("SKILL.md"),
+            "---\nname: escaped-skill\ndescription: Escaped skill\n---\nbody\n",
+        )
+        .expect("write escaped skill");
+
+        let link_path = workspace.join(".codewhale").join("skills");
+        if create_dir_symlink(&escape_target, &link_path).is_err() {
+            return;
+        }
+
+        let global_skills_dir = tmp.path().join("global-skills");
+        let mut options = test_options(false);
+        options.workspace = workspace.clone();
+        options.skills_dir = global_skills_dir.clone();
+        let config = Config {
+            skills: Some(crate::config::SkillsConfig {
+                scan_codewhale_only: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let app = App::new(options, &config);
+
+        assert_eq!(app.skills_dir, global_skills_dir);
+        assert!(
+            !app.cached_skills
+                .iter()
+                .any(|(name, _)| name == "escaped-skill"),
+            "strict app cache must not follow escaped workspace CodeWhale symlinks: {:?}",
             app.cached_skills
         );
     }
@@ -6889,6 +7211,52 @@ mod tests {
         assert_eq!(app.approval_mode, ApprovalMode::Auto);
 
         app.set_mode(AppMode::Agent);
+        assert!(!app.allow_shell);
+        assert!(!app.trust_mode);
+        assert_eq!(app.approval_mode, ApprovalMode::Never);
+    }
+
+    #[test]
+    fn set_mode_plan_restores_previous_approval_on_agent_exit() {
+        let config = Config {
+            approval_policy: Some("never".to_string()),
+            ..Default::default()
+        };
+        let mut options = test_options(false);
+        options.start_in_agent_mode = true; // avoid coupling to settings.default_mode
+        let mut app = App::new(options, &config);
+        assert_eq!(app.mode, AppMode::Agent);
+        assert_eq!(app.approval_mode, ApprovalMode::Never);
+
+        app.set_mode(AppMode::Plan);
+        app.approval_mode = ApprovalMode::Suggest;
+
+        app.set_mode(AppMode::Agent);
+        assert_eq!(app.mode, AppMode::Agent);
+        assert_eq!(app.approval_mode, ApprovalMode::Never);
+    }
+
+    #[test]
+    fn set_mode_plan_to_yolo_keeps_yolo_permissions_and_restores_agent_baseline() {
+        let mut options = test_options(false);
+        options.allow_shell = false;
+        options.start_in_agent_mode = true; // avoid coupling to settings.default_mode
+        let mut app = App::new(options, &Config::default());
+        app.allow_shell = false;
+        app.trust_mode = false;
+        app.approval_mode = ApprovalMode::Never;
+
+        app.set_mode(AppMode::Plan);
+        app.approval_mode = ApprovalMode::Suggest;
+
+        app.set_mode(AppMode::Yolo);
+        assert_eq!(app.mode, AppMode::Yolo);
+        assert!(app.allow_shell);
+        assert!(app.trust_mode);
+        assert_eq!(app.approval_mode, ApprovalMode::Auto);
+
+        app.set_mode(AppMode::Agent);
+        assert_eq!(app.mode, AppMode::Agent);
         assert!(!app.allow_shell);
         assert!(!app.trust_mode);
         assert_eq!(app.approval_mode, ApprovalMode::Never);

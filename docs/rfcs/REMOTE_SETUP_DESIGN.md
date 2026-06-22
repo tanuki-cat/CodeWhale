@@ -22,7 +22,7 @@ Decisions locked with the user:
 
 ## Prior art: Hermes Agent (reference only — do not copy)
 
-`/Volumes/VIXinSSD/hermesagent` (Nous Research's Hermes Agent, Python) solves the
+Nous Research's Hermes Agent (Python) solves the
 same problem and **validates this design**. Use it for ideas; keep CodeWhale's
 style (Rust core, zero-dep Node bridges, plain-text replies).
 

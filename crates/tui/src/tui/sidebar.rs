@@ -1,4 +1,4 @@
-//! Sidebar rendering — Work / Tasks / Agents / Context panels.
+//! Sidebar rendering — Pinned / Tasks / Agents / Context panels.
 //!
 //! Extracted from `tui/ui.rs` (P1.2). The sidebar appears to the right of
 //! the chat transcript when the available width allows it. Each section
@@ -57,7 +57,7 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
 
     match app.sidebar_focus {
         SidebarFocus::Auto => render_sidebar_auto(f, area, app),
-        SidebarFocus::Work => render_sidebar_work(f, area, app),
+        SidebarFocus::Pinned => render_sidebar_pinned(f, area, app),
         SidebarFocus::Tasks => render_sidebar_tasks(f, area, app),
         SidebarFocus::Agents => render_sidebar_subagents(f, area, app),
         SidebarFocus::Context => render_context_panel(f, area, app),
@@ -72,7 +72,22 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
 /// useful content, or as the one quiet empty state when nothing else is active.
 fn render_sidebar_auto(f: &mut Frame, area: Rect, app: &mut App) {
     let visible = auto_sidebar_panels(auto_sidebar_state(app));
+    render_sidebar_panel_stack(f, area, app, &visible);
+}
 
+/// Build the pinned panel stack. This uses the same content-sensitive panels
+/// as Auto, but it never participates in idle auto-collapse.
+fn render_sidebar_pinned(f: &mut Frame, area: Rect, app: &mut App) {
+    let visible = auto_sidebar_panels(auto_sidebar_state(app));
+    render_sidebar_panel_stack(f, area, app, &visible);
+}
+
+fn render_sidebar_panel_stack(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    visible: &[AutoSidebarPanel],
+) {
     let constraints: Vec<Constraint> = match visible.len() {
         1 => vec![Constraint::Min(0)],
         2 => vec![Constraint::Percentage(50), Constraint::Min(0)],
@@ -119,14 +134,11 @@ fn render_sidebar_auto(f: &mut Frame, area: Rect, app: &mut App) {
 fn auto_sidebar_state(app: &mut App) -> AutoSidebarState {
     AutoSidebarState {
         work_has_content: sidebar_work_summary(app).has_useful_content(),
-        // The jobs/tasks panel appears only for real background work — running
-        // shell jobs, RLM, or durable Fleet tasks (`Background` entries).
-        // Per-turn model reasoning (`ModelReasoning`) never counts, so an
-        // ordinary reasoning turn shows no panel at all.
-        tasks_empty: !app
-            .task_panel
-            .iter()
-            .any(|entry| entry.kind == TaskPanelEntryKind::Background),
+        // The jobs/tasks panel appears in Auto mode only for live background
+        // work — running or queued shell jobs, RLM, or durable Fleet tasks.
+        // Completed jobs, per-turn tools, and model reasoning do not reopen
+        // the panel; they remain visible only when Tasks is explicitly focused.
+        tasks_empty: !app.task_panel.iter().any(background_task_is_live),
         agents_empty: app.subagent_cache.is_empty()
             && app.agent_progress.is_empty()
             && active_fanout_counts(app).is_none()
@@ -211,6 +223,8 @@ pub(crate) struct SidebarWorkSummary {
     strategy_explanation: Option<String>,
     strategy_steps: Vec<SidebarWorkStrategyStep>,
     state_updating: bool,
+    pause_indicator: Option<String>,
+    workflow_paused: bool,
 }
 
 impl SidebarWorkSummary {
@@ -297,6 +311,37 @@ fn has_renderable_strategy(summary: &SidebarWorkSummary) -> bool {
 }
 
 fn sidebar_work_summary(app: &mut App) -> SidebarWorkSummary {
+    fn live_goal_objective(app: &App) -> Option<String> {
+        if app.paused || app.paused_quarry.is_some() {
+            app.hunt
+                .quarry
+                .clone()
+                .or_else(|| app.paused_quarry.clone())
+        } else {
+            app.hunt.quarry.clone()
+        }
+    }
+
+    fn live_pause_indicator(app: &App) -> Option<String> {
+        if app.paused && app.is_loading {
+            Some("(Pausing)".to_string())
+        } else if app.paused || app.paused_quarry.is_some() {
+            Some("(Paused)".to_string())
+        } else {
+            None
+        }
+    }
+
+    fn apply_live_goal_state(summary: &mut SidebarWorkSummary, app: &App) {
+        summary.goal_objective = live_goal_objective(app);
+        summary.goal_token_budget = app.hunt.token_budget;
+        summary.goal_completed = app.hunt.verdict == HuntVerdict::Hunted;
+        summary.goal_started_at = app.hunt.started_at;
+        summary.tokens_used = app.session.total_conversation_tokens;
+        summary.pause_indicator = live_pause_indicator(app);
+        summary.workflow_paused = app.paused || app.paused_quarry.is_some();
+    }
+
     let fresh = (|| {
         let todos = app.todos.try_lock().ok()?;
         let plan = app.plan_state.try_lock().ok()?;
@@ -329,8 +374,8 @@ fn sidebar_work_summary(app: &mut App) -> SidebarWorkSummary {
             )
         };
 
-        Some(SidebarWorkSummary {
-            goal_objective: app.hunt.quarry.clone(),
+        let mut summary = SidebarWorkSummary {
+            goal_objective: live_goal_objective(app),
             goal_token_budget: app.hunt.token_budget,
             goal_completed: app.hunt.verdict == HuntVerdict::Hunted,
             goal_started_at: app.hunt.started_at,
@@ -340,7 +385,11 @@ fn sidebar_work_summary(app: &mut App) -> SidebarWorkSummary {
             strategy_explanation,
             strategy_steps,
             state_updating: false,
-        })
+            pause_indicator: live_pause_indicator(app),
+            workflow_paused: app.paused || app.paused_quarry.is_some(),
+        };
+        apply_live_goal_state(&mut summary, app);
+        Some(summary)
     })();
 
     if let Some(summary) = fresh {
@@ -350,23 +399,16 @@ fn sidebar_work_summary(app: &mut App) -> SidebarWorkSummary {
 
     if let Some(cached) = app.cached_work_summary.as_ref() {
         let mut summary = cached.clone();
-        summary.goal_objective = app.hunt.quarry.clone();
-        summary.goal_token_budget = app.hunt.token_budget;
-        summary.goal_completed = app.hunt.verdict == HuntVerdict::Hunted;
-        summary.goal_started_at = app.hunt.started_at;
-        summary.tokens_used = app.session.total_conversation_tokens;
+        apply_live_goal_state(&mut summary, app);
         return summary;
     }
 
-    SidebarWorkSummary {
-        goal_objective: app.hunt.quarry.clone(),
-        goal_token_budget: app.hunt.token_budget,
-        goal_completed: app.hunt.verdict == HuntVerdict::Hunted,
-        goal_started_at: app.hunt.started_at,
-        tokens_used: app.session.total_conversation_tokens,
+    let mut summary = SidebarWorkSummary {
         state_updating: true,
         ..SidebarWorkSummary::default()
-    }
+    };
+    apply_live_goal_state(&mut summary, app);
+    summary
 }
 
 fn work_panel_lines(
@@ -412,7 +454,13 @@ fn work_panel_hover_texts(
         && !objective.trim().is_empty()
         && texts.len() < max_rows
     {
-        let icon = if summary.goal_completed { "✓" } else { "◆" };
+        let icon = if summary.goal_completed {
+            "✓"
+        } else if summary.workflow_paused {
+            "⏸"
+        } else {
+            "◆"
+        };
         texts.push(format!("{icon} {objective}"));
 
         if let Some(started) = summary.goal_started_at
@@ -591,7 +639,13 @@ fn push_work_goal_lines(
         return;
     }
 
-    let icon = if summary.goal_completed { "✓" } else { "◆" };
+    let icon = if summary.goal_completed {
+        "✓"
+    } else if summary.workflow_paused {
+        "⏸"
+    } else {
+        "◆"
+    };
     let status_style = if summary.goal_completed {
         Style::default()
             .fg(theme.success)
@@ -601,12 +655,17 @@ fn push_work_goal_lines(
             .fg(theme.warning)
             .add_modifier(ratatui::style::Modifier::BOLD)
     };
+    let label = if let Some(indicator) = summary.pause_indicator.as_deref() {
+        format!("{objective} {indicator}")
+    } else {
+        objective.to_string()
+    };
 
     lines.push(Line::from(Span::styled(
         format!(
             "{} {}",
             icon,
-            truncate_line_to_width(objective, content_width.saturating_sub(2).max(1))
+            truncate_line_to_width(&label, content_width.saturating_sub(2).max(1))
         ),
         status_style,
     )));
@@ -950,8 +1009,9 @@ fn task_panel_rows(
     let theme = &app.ui_theme;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(max_rows.max(4));
     let mut actions: Vec<Option<String>> = Vec::with_capacity(max_rows.max(4));
+    let explicit_tasks_focus = app.sidebar_focus == SidebarFocus::Tasks;
 
-    if app.runtime_turn_id.is_some() {
+    if explicit_tasks_focus && app.runtime_turn_id.is_some() {
         let status = app
             .runtime_turn_status
             .as_deref()
@@ -972,18 +1032,25 @@ fn task_panel_rows(
     }
 
     let active_rows = active_tool_rows(app);
-    if !active_rows.is_empty() && lines.len() < max_rows {
+    if explicit_tasks_focus && !active_rows.is_empty() && lines.len() < max_rows {
         push_sidebar_label_theme(&mut lines, "Live tools", theme);
         push_tool_rows(&mut lines, &active_rows, content_width, max_rows, theme);
     }
 
     let reasoning_rows = reasoning_task_rows(app);
-    if !reasoning_rows.is_empty() && lines.len() < max_rows {
+    if explicit_tasks_focus && !reasoning_rows.is_empty() && lines.len() < max_rows {
         push_sidebar_label_theme(&mut lines, "Model reasoning", theme);
         push_reasoning_rows(&mut lines, &reasoning_rows, content_width, max_rows, theme);
     }
 
-    let background_rows = background_task_rows(app, &active_rows);
+    let background_rows = background_task_rows(
+        app,
+        if explicit_tasks_focus {
+            &active_rows
+        } else {
+            &[]
+        },
+    );
     // Lines pushed so far (turn label, Live tools header, live tool rows)
     // are not clickable — backfill their action slots.
     actions.resize(lines.len(), None);
@@ -1025,6 +1092,9 @@ fn task_panel_rows(
                 .map(format_duration_ms)
                 .unwrap_or_else(|| "-".to_string());
             let (label, detail) = background_task_labels(task, &duration);
+            let label = background_task_spinner_prefix(task)
+                .map(|prefix| format!("{prefix} {label}"))
+                .unwrap_or(label);
             let (show_action, detail_action) = background_task_click_actions(task);
             let label = if background_task_has_stop_target(task) {
                 label_with_stop_target(&label, content_width.max(1))
@@ -1055,12 +1125,12 @@ fn task_panel_rows(
                 .any(|task| task.id.starts_with("shell_") && task.status == "running");
             let hint_action = if stale_running_shells.len() == 1 {
                 Some((
-                    "Ctrl+K -> cancel stale job".to_string(),
+                    "Ctrl+X -> cancel stale job".to_string(),
                     format!("/jobs cancel {}", stale_running_shells[0].id),
                 ))
             } else if any_running_shell {
                 Some((
-                    "Ctrl+K -> /jobs cancel-all".to_string(),
+                    "Ctrl+X -> /jobs cancel-all".to_string(),
                     "/jobs cancel-all".to_string(),
                 ))
             } else {
@@ -1078,7 +1148,7 @@ fn task_panel_rows(
         }
     }
 
-    if lines.len() < max_rows {
+    if explicit_tasks_focus && lines.len() < max_rows {
         let recent_rows = recent_tool_rows(app, 4);
         if !recent_rows.is_empty() {
             push_sidebar_label_theme(&mut lines, "Recent tools", theme);
@@ -1120,25 +1190,33 @@ fn task_panel_rows(
 
 fn task_panel_hover_texts(app: &App, max_rows: usize) -> Vec<String> {
     let mut texts = Vec::with_capacity(max_rows.max(4));
+    let explicit_tasks_focus = app.sidebar_focus == SidebarFocus::Tasks;
 
-    if let Some(turn_id) = app.runtime_turn_id.as_ref() {
+    if explicit_tasks_focus && let Some(turn_id) = app.runtime_turn_id.as_ref() {
         let status = app.runtime_turn_status.as_deref().unwrap_or("unknown");
         texts.push(format!("turn {turn_id} ({status})"));
     }
 
     let active_rows = active_tool_rows(app);
-    if !active_rows.is_empty() && texts.len() < max_rows {
+    if explicit_tasks_focus && !active_rows.is_empty() && texts.len() < max_rows {
         texts.push("Live tools".to_string());
         push_tool_row_hover_texts(&mut texts, &active_rows, max_rows);
     }
 
     let reasoning_rows = reasoning_task_rows(app);
-    if !reasoning_rows.is_empty() && texts.len() < max_rows {
+    if explicit_tasks_focus && !reasoning_rows.is_empty() && texts.len() < max_rows {
         texts.push("Model reasoning".to_string());
         push_reasoning_row_hover_texts(&mut texts, &reasoning_rows, max_rows);
     }
 
-    let background_rows = background_task_rows(app, &active_rows);
+    let background_rows = background_task_rows(
+        app,
+        if explicit_tasks_focus {
+            &active_rows
+        } else {
+            &[]
+        },
+    );
     if !background_rows.is_empty() && texts.len() < max_rows {
         let running = background_rows
             .iter()
@@ -1161,6 +1239,9 @@ fn task_panel_hover_texts(app: &App, max_rows: usize) -> Vec<String> {
                 .map(format_duration_ms)
                 .unwrap_or_else(|| "-".to_string());
             let (label, detail) = background_task_labels(task, &duration);
+            let label = background_task_spinner_prefix(task)
+                .map(|prefix| format!("{prefix} {label}"))
+                .unwrap_or(label);
             texts.push(label);
             if texts.len() >= max_rows {
                 break;
@@ -1179,14 +1260,14 @@ fn task_panel_hover_texts(app: &App, max_rows: usize) -> Vec<String> {
                 .iter()
                 .any(|task| task.id.starts_with("shell_") && task.status == "running");
             if stale_running_shells == 1 {
-                texts.push("Ctrl+K -> cancel stale job".to_string());
+                texts.push("Ctrl+X -> cancel stale job".to_string());
             } else if any_running_shell {
-                texts.push("Ctrl+K -> /jobs cancel-all".to_string());
+                texts.push("Ctrl+X -> /jobs cancel-all".to_string());
             }
         }
     }
 
-    if texts.len() < max_rows {
+    if explicit_tasks_focus && texts.len() < max_rows {
         let recent_rows = recent_tool_rows(app, 4);
         if !recent_rows.is_empty() {
             texts.push("Recent tools".to_string());
@@ -1304,6 +1385,13 @@ fn push_reasoning_row_hover_texts(
 
 fn background_task_labels(task: &TaskPanelEntry, duration: &str) -> (String, String) {
     let stale_label = stale_no_output_label(task);
+    let owner_label = task
+        .owner_agent_name
+        .as_deref()
+        .or(task.owner_agent_id.as_deref())
+        .filter(|owner| !owner.trim().is_empty())
+        .map(|owner| format!("by {owner}"))
+        .unwrap_or_default();
     let status = stale_label
         .as_ref()
         .map(|label| format!("{} ({label})", task.status))
@@ -1315,6 +1403,7 @@ fn background_task_labels(task: &TaskPanelEntry, duration: &str) -> (String, Str
             format!("Bash {status} {command} {duration}"),
             compact_join([
                 format!("{} \u{00B7} Bash", task.id),
+                owner_label,
                 stale_label.unwrap_or_default(),
             ]),
         );
@@ -1327,8 +1416,28 @@ fn background_task_labels(task: &TaskPanelEntry, duration: &str) -> (String, Str
             status,
             duration
         ),
-        compact_join([task.prompt_summary.clone(), stale_label.unwrap_or_default()]),
+        compact_join([
+            task.prompt_summary.clone(),
+            owner_label,
+            stale_label.unwrap_or_default(),
+        ]),
     )
+}
+
+fn background_task_is_live(task: &TaskPanelEntry) -> bool {
+    task.kind == TaskPanelEntryKind::Background
+        && matches!(task.status.as_str(), "queued" | "running")
+}
+
+const BRAILLE_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const BRAILLE_SPINNER_FRAME_MS: u64 = 100;
+
+fn background_task_spinner_prefix(task: &TaskPanelEntry) -> Option<&'static str> {
+    if task.status != "running" {
+        return None;
+    }
+    let frame = task.duration_ms.unwrap_or_default() / BRAILLE_SPINNER_FRAME_MS;
+    Some(BRAILLE_SPINNER_FRAMES[frame as usize % BRAILLE_SPINNER_FRAMES.len()])
 }
 
 fn stale_no_output_label(task: &TaskPanelEntry) -> Option<String> {
@@ -2134,6 +2243,8 @@ pub struct SidebarSubagentSummary {
 #[derive(Debug, Clone)]
 pub struct SidebarAgentRow {
     pub id: String,
+    pub parent_run_id: Option<String>,
+    pub spawn_depth: u32,
     pub name: String,
     pub role: String,
     pub status: String,
@@ -2185,6 +2296,8 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
                 .unwrap_or_else(|| agent.name.clone());
             SidebarAgentRow {
                 id: agent.agent_id.clone(),
+                parent_run_id: agent.parent_run_id.clone(),
+                spawn_depth: agent.spawn_depth,
                 name: display_name,
                 role: agent.agent_type.as_str().to_string(),
                 status: agent
@@ -2218,23 +2331,75 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
                     .get(id.as_str())
                     .cloned()
                     .unwrap_or_else(|| id.clone());
+                let meta = app.agent_progress_meta.get(id.as_str());
+                let spawn_depth = meta.map(|meta| meta.spawn_depth).unwrap_or_default();
                 SidebarAgentRow {
                     id: id.clone(),
+                    parent_run_id: meta.and_then(|meta| meta.parent_run_id.clone()),
+                    spawn_depth,
                     name: display_name,
-                    role: "agent".to_string(),
+                    role: if spawn_depth > 1 {
+                        "child".to_string()
+                    } else {
+                        "agent".to_string()
+                    },
                     status: sidebar_progress_status_text(progress).to_string(),
                     objective: None,
                     git_branch: None,
                     progress: Some(progress.clone()),
                     steps_taken: 0,
-                    duration_ms: app.agent_activity_started_at.map(|started| {
-                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-                    }),
+                    duration_ms: None,
                 }
             }),
     );
 
-    rows
+    sort_sidebar_agent_rows_as_tree(rows)
+}
+
+fn sort_sidebar_agent_rows_as_tree(rows: Vec<SidebarAgentRow>) -> Vec<SidebarAgentRow> {
+    let known_ids: std::collections::HashSet<String> =
+        rows.iter().map(|row| row.id.clone()).collect();
+    let mut children: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut roots = Vec::new();
+
+    for (idx, row) in rows.iter().enumerate() {
+        if let Some(parent) = row.parent_run_id.as_deref()
+            && known_ids.contains(parent)
+        {
+            children.entry(parent.to_string()).or_default().push(idx);
+            continue;
+        }
+        roots.push(idx);
+    }
+
+    fn push_tree(
+        idx: usize,
+        rows: &[SidebarAgentRow],
+        children: &std::collections::HashMap<String, Vec<usize>>,
+        seen: &mut std::collections::HashSet<usize>,
+        out: &mut Vec<SidebarAgentRow>,
+    ) {
+        if !seen.insert(idx) {
+            return;
+        }
+        out.push(rows[idx].clone());
+        if let Some(child_indices) = children.get(&rows[idx].id) {
+            for child_idx in child_indices {
+                push_tree(*child_idx, rows, children, seen, out);
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(rows.len());
+    let mut seen = std::collections::HashSet::new();
+    for idx in roots {
+        push_tree(idx, &rows, &children, &mut seen, &mut out);
+    }
+    for idx in 0..rows.len() {
+        push_tree(idx, &rows, &children, &mut seen, &mut out);
+    }
+    out
 }
 
 fn subagent_status_text(status: &SubAgentStatus) -> &'static str {
@@ -2244,6 +2409,7 @@ fn subagent_status_text(status: &SubAgentStatus) -> &'static str {
         SubAgentStatus::Interrupted(_) => "interrupted",
         SubAgentStatus::Failed(_) => "failed",
         SubAgentStatus::Cancelled => "canceled",
+        SubAgentStatus::BudgetExhausted => "budget",
     }
 }
 
@@ -2367,7 +2533,8 @@ fn subagent_panel_rows(
             break;
         }
         let (marker, color) = agent_status_marker(row.status.as_str(), theme);
-        let label = format!("{marker} {} {}", row.role, row.name);
+        let tree_prefix = agent_tree_prefix(row);
+        let label = format!("{tree_prefix}{marker} {} {}", row.role, row.name);
         lines.push(Line::from(Span::styled(
             truncate_line_to_width(&label, content_width.max(1)),
             Style::default().fg(color),
@@ -2396,9 +2563,6 @@ fn subagent_panel_rows(
         }
         if let Some(branch) = row.git_branch.as_deref() {
             detail_parts.push(format!("branch {branch}"));
-        }
-        if let Some(duration) = row.duration_ms {
-            detail_parts.push(format_duration_ms(duration));
         }
         if detail_parts.is_empty() {
             detail_parts.push(row.status.clone());
@@ -2429,6 +2593,14 @@ fn subagent_panel_rows(
 
     debug_assert_eq!(lines.len(), actions.len());
     (lines, actions)
+}
+
+fn agent_tree_prefix(row: &SidebarAgentRow) -> String {
+    if row.parent_run_id.is_none() && row.spawn_depth <= 1 {
+        return String::new();
+    }
+    let depth = row.spawn_depth.max(2).saturating_sub(2).min(6);
+    format!("{}└─ ", "  ".repeat(depth as usize))
 }
 
 fn subagent_panel_hover_texts(
@@ -2519,8 +2691,20 @@ fn subagent_panel_hover_texts(
 /// without spamming raw ids into the normal view.
 fn agent_row_hover_text(row: &SidebarAgentRow) -> String {
     let (marker, _) = agent_status_marker(row.status.as_str(), &palette::UI_THEME);
-    let mut text = format!("{marker} {} {}", row.role, row.name);
+    let mut text = format!(
+        "{}{} {} {}",
+        agent_tree_prefix(row),
+        marker,
+        row.role,
+        row.name
+    );
     let _ = write!(text, "\nid: {}", row.id);
+    if let Some(parent) = row.parent_run_id.as_deref() {
+        let _ = write!(text, "\nparent: {parent}");
+    }
+    if row.spawn_depth > 0 {
+        let _ = write!(text, "\ndepth: {}", row.spawn_depth);
+    }
     let mut status_line = format!("status: {}", row.status);
     if let Some(duration) = row.duration_ms {
         let _ = write!(status_line, " · elapsed {}", format_duration_ms(duration));
@@ -2841,11 +3025,13 @@ fn sidebar_hover_rows(
 mod tests {
     use super::{
         ACTIVE_TOOL_COMPLETED_ROW_TTL, ACTIVE_TOOL_STALE_RUNNING_ROW_TTL, AutoSidebarPanel,
-        AutoSidebarState, SidebarAgentRow, SidebarHoverRow, SidebarHoverSection, SidebarHoverState,
-        SidebarSubagentSummary, SidebarToolRow, SidebarWorkChecklistItem, SidebarWorkStrategyStep,
-        SidebarWorkSummary, ToolRowOrder, auto_sidebar_panels, context_panel_cost_line,
-        editorial_tool_rows, normalize_activity_text, sidebar_agent_rows, sidebar_hover_rows,
-        sidebar_work_summary, subagent_panel_hover_texts, subagent_panel_lines,
+        AutoSidebarState, BRAILLE_SPINNER_FRAME_MS, SidebarAgentRow, SidebarFocus, SidebarHoverRow,
+        SidebarHoverSection, SidebarHoverState, SidebarSubagentSummary, SidebarToolRow,
+        SidebarWorkChecklistItem, SidebarWorkStrategyStep, SidebarWorkSummary, ToolRowOrder,
+        agent_row_hover_text, auto_sidebar_panels, background_task_spinner_prefix,
+        context_panel_cost_line, editorial_tool_rows, normalize_activity_text, render_sidebar,
+        sidebar_agent_rows, sidebar_hover_rows, sidebar_work_summary,
+        sort_sidebar_agent_rows_as_tree, subagent_panel_hover_texts, subagent_panel_lines,
         subagent_panel_rows, task_panel_hover_texts, task_panel_lines, task_panel_rows,
         work_panel_empty_hint, work_panel_hover_texts, work_panel_lines,
     };
@@ -2855,11 +3041,13 @@ mod tests {
     use crate::tools::plan::StepStatus;
     use crate::tools::todo::TodoStatus;
     use crate::tui::active_cell::ActiveCell;
-    use crate::tui::app::{App, HuntVerdict, TaskPanelEntry, TaskPanelEntryKind, TuiOptions};
+    use crate::tui::app::{
+        AgentProgressMeta, App, HuntVerdict, TaskPanelEntry, TaskPanelEntryKind, TuiOptions,
+    };
     use crate::tui::history::{
         ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolStatus,
     };
-    use ratatui::text::Line;
+    use ratatui::{Terminal, backend::TestBackend, text::Line};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -3021,6 +3209,44 @@ mod tests {
         });
 
         assert_eq!(panels, vec![AutoSidebarPanel::Work]);
+    }
+
+    #[test]
+    fn pinned_sidebar_renders_agents_section_when_subagents_are_active() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Pinned;
+        app.subagent_cache
+            .push(cached_agent("agent-active-1", Some("critic")));
+        app.agent_progress.insert(
+            "agent-active-1".to_string(),
+            "checking sidebar visibility".to_string(),
+        );
+
+        let backend = TestBackend::new(72, 18);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, frame.area(), &mut app))
+            .expect("draw sidebar");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            rendered.contains("Agents"),
+            "pinned sidebar must surface active sub-agents: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("critic") || rendered.contains("Agent 1"),
+            "pinned sidebar should render the child agent label: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("checking sidebar visibility"),
+            "pinned sidebar should render child progress: {rendered:?}"
+        );
     }
 
     #[test]
@@ -3426,8 +3652,57 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_work_summary_uses_paused_quarry_when_goal_is_cleared() {
+        let mut app = create_test_app();
+        app.hunt.quarry = None;
+        app.paused = true;
+        app.paused_quarry = Some("Scan nested git repositories".to_string());
+
+        let summary = sidebar_work_summary(&mut app);
+
+        assert_eq!(
+            summary.goal_objective.as_deref(),
+            Some("Scan nested git repositories")
+        );
+        assert_eq!(summary.pause_indicator.as_deref(), Some("(Paused)"));
+        assert!(summary.workflow_paused);
+    }
+
+    #[test]
+    fn work_panel_renders_paused_command_goal() {
+        let mut app = create_test_app();
+        app.hunt.quarry = None;
+        app.paused = false;
+        app.paused_quarry = Some("Deploy to staging".to_string());
+
+        let summary = sidebar_work_summary(&mut app);
+        let text = lines_to_text(&work_panel_lines(
+            &summary,
+            80,
+            8,
+            PaletteMode::Dark,
+            &palette::UI_THEME,
+        ));
+
+        assert!(
+            text.first().is_some_and(|line| line.contains('⏸')),
+            "paused command should use pause icon: {text:?}"
+        );
+        assert!(
+            text.first()
+                .is_some_and(|line| line.contains("Deploy to staging")),
+            "paused command title should remain visible: {text:?}"
+        );
+        assert!(
+            text.first().is_some_and(|line| line.contains("(Paused)")),
+            "paused state should be visible: {text:?}"
+        );
+    }
+
+    #[test]
     fn tasks_panel_renders_active_tool_rows_before_background_empty_state() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         let mut active = ActiveCell::new();
         active.push_tool(
             "tool-1",
@@ -3467,6 +3742,7 @@ mod tests {
     #[test]
     fn tasks_panel_renders_recent_completed_tool_rows() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         app.history
             .push(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
                 name: "read_file".to_string(),
@@ -3494,6 +3770,7 @@ mod tests {
     #[test]
     fn tasks_panel_expires_completed_active_tool_rows() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         let mut active = ActiveCell::new();
         active.push_tool(
             "tool-1",
@@ -3533,6 +3810,7 @@ mod tests {
     #[test]
     fn tasks_panel_lingers_fresh_completed_active_tool_rows() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         let mut active = ActiveCell::new();
         active.push_tool(
             "tool-1",
@@ -3561,6 +3839,7 @@ mod tests {
     #[test]
     fn tasks_panel_collapses_stale_running_tool_rows() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         let mut active = ActiveCell::new();
         for (idx, command) in ["long one", "long two"].into_iter().enumerate() {
             active.push_tool(
@@ -3571,6 +3850,8 @@ mod tests {
                     output: None,
                     live_output: None,
                     shell_task_id: None,
+                    owner_agent_id: None,
+                    owner_agent_name: None,
                     started_at: None,
                     duration_ms: Some(ACTIVE_TOOL_STALE_RUNNING_ROW_TTL.as_millis() as u64 + 1),
                     source: ExecSource::Assistant,
@@ -3596,6 +3877,7 @@ mod tests {
     #[test]
     fn tasks_panel_does_not_double_count_running_shell_job_as_live_and_background() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         let mut active = ActiveCell::new();
         active.push_tool(
             "shell-1",
@@ -3605,6 +3887,8 @@ mod tests {
                 output: None,
                 live_output: None,
                 shell_task_id: None,
+                owner_agent_id: None,
+                owner_agent_name: None,
                 started_at: Some(std::time::Instant::now()),
                 duration_ms: None,
                 source: ExecSource::Assistant,
@@ -3621,6 +3905,8 @@ mod tests {
             kind: TaskPanelEntryKind::Background,
             stale: false,
             elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
         });
 
         let text = lines_to_text(&task_panel_lines(&app, 80, 10));
@@ -3651,10 +3937,12 @@ mod tests {
             status: "running".to_string(),
             prompt_summary: "shell: cd /tmp/repo && cargo test --workspace --all-features"
                 .to_string(),
-            duration_ms: Some(178_000),
+            duration_ms: Some(0),
             kind: TaskPanelEntryKind::Background,
             stale: false,
             elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
         });
 
         let text = lines_to_text(&task_panel_lines(&app, 96, 8));
@@ -3665,14 +3953,69 @@ mod tests {
             "background shell headline should show the command, not only the shell id: {text:?}"
         );
         assert!(
+            text.iter().any(|line| line.contains("⠋ Bash running")),
+            "running background shell should show a braille spinner prefix: {text:?}"
+        );
+        assert!(
             text.iter().any(|line| line.contains("shell_33a08c3c")),
             "shell id should remain available as detail: {text:?}"
         );
     }
 
     #[test]
+    fn tasks_panel_attributes_subagent_owned_shell_jobs() {
+        let mut app = create_test_app();
+        app.task_panel.push(TaskPanelEntry {
+            id: "shell_owned".to_string(),
+            status: "running".to_string(),
+            prompt_summary: "shell: cargo test -p codewhale-tui".to_string(),
+            duration_ms: Some(2_000),
+            kind: TaskPanelEntryKind::Background,
+            stale: false,
+            elapsed_since_output_ms: None,
+            owner_agent_id: Some("agent_verifier".to_string()),
+            owner_agent_name: Some("verifier".to_string()),
+        });
+
+        let text = lines_to_text(&task_panel_lines(&app, 96, 8));
+
+        assert!(
+            text.iter().any(|line| line.contains("by verifier")),
+            "owned shell job should show sub-agent attribution: {text:?}"
+        );
+        assert!(
+            text.iter().any(|line| line.contains("shell_owned")),
+            "shell id should remain visible with attribution: {text:?}"
+        );
+    }
+
+    #[test]
+    fn background_task_spinner_advances_at_readable_cadence() {
+        let mut task = TaskPanelEntry {
+            id: "shell_33a08c3c".to_string(),
+            status: "running".to_string(),
+            prompt_summary: "shell: cargo test".to_string(),
+            duration_ms: Some(0),
+            kind: TaskPanelEntryKind::Background,
+            stale: false,
+            elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+        };
+
+        assert_eq!(background_task_spinner_prefix(&task), Some("⠋"));
+
+        task.duration_ms = Some(BRAILLE_SPINNER_FRAME_MS - 1);
+        assert_eq!(background_task_spinner_prefix(&task), Some("⠋"));
+
+        task.duration_ms = Some(BRAILLE_SPINNER_FRAME_MS);
+        assert_eq!(background_task_spinner_prefix(&task), Some("⠙"));
+    }
+
+    #[test]
     fn tasks_panel_renders_model_reasoning_outside_background_commands() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         app.task_panel.push(TaskPanelEntry {
             id: "reasoning-1".to_string(),
             status: "running".to_string(),
@@ -3681,6 +4024,8 @@ mod tests {
             kind: TaskPanelEntryKind::ModelReasoning,
             stale: false,
             elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
         });
 
         let text = lines_to_text(&task_panel_lines(&app, 80, 8));
@@ -3701,8 +4046,90 @@ mod tests {
     }
 
     #[test]
+    fn tasks_panel_auto_mode_shows_only_live_background_jobs() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Auto;
+        app.runtime_turn_id = Some("turn_abcdef123456".to_string());
+        app.runtime_turn_status = Some("in_progress".to_string());
+        let mut active = ActiveCell::new();
+        active.push_tool(
+            "tool-1",
+            HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                name: "read_file".to_string(),
+                status: ToolStatus::Running,
+                input_summary: Some("src/main.rs".to_string()),
+                output: None,
+                prompts: None,
+                spillover_path: None,
+                output_summary: None,
+                is_diff: false,
+            })),
+        );
+        app.active_cell = Some(active);
+        app.history
+            .push(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                name: "grep_files".to_string(),
+                status: ToolStatus::Success,
+                input_summary: Some("pattern: AgentProgress".to_string()),
+                output: Some("found".to_string()),
+                prompts: None,
+                spillover_path: None,
+                output_summary: Some("found AgentProgress".to_string()),
+                is_diff: false,
+            })));
+        app.task_panel.push(TaskPanelEntry {
+            id: "reasoning-1".to_string(),
+            status: "running".to_string(),
+            prompt_summary: "model reasoning".to_string(),
+            duration_ms: Some(4_200),
+            kind: TaskPanelEntryKind::ModelReasoning,
+            stale: false,
+            elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+        });
+        app.task_panel.push(TaskPanelEntry {
+            id: "shell_live".to_string(),
+            status: "running".to_string(),
+            prompt_summary: "shell: cargo test -p codewhale-tui".to_string(),
+            duration_ms: Some(0),
+            kind: TaskPanelEntryKind::Background,
+            stale: false,
+            elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+        });
+
+        let text = lines_to_text(&task_panel_lines(&app, 96, 12));
+
+        assert!(
+            text.iter().any(|line| line == "Bash jobs: 1 running"),
+            "auto Tasks should keep live background jobs visible: {text:?}"
+        );
+        assert!(
+            text.iter().any(|line| line.contains("⠋ Bash running")),
+            "auto Tasks should animate running background jobs: {text:?}"
+        );
+        for hidden in [
+            "Turn",
+            "Live tools",
+            "Model reasoning",
+            "Recent tools",
+            "[~] read_file",
+            "[✓] grep_files",
+            "thinking",
+        ] {
+            assert!(
+                !text.iter().any(|line| line.contains(hidden)),
+                "auto Tasks should not show {hidden:?}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn task_panel_actions_make_single_background_job_clickable() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         app.task_panel.push(TaskPanelEntry {
             id: "shell_only".to_string(),
             status: "running".to_string(),
@@ -3711,6 +4138,8 @@ mod tests {
             kind: TaskPanelEntryKind::Background,
             stale: false,
             elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
         });
 
         let (lines, actions) = task_panel_rows(&app, 80, 12);
@@ -3740,6 +4169,7 @@ mod tests {
     #[test]
     fn stale_background_job_row_shows_no_output_warning_and_cancel_hint() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         app.task_panel.push(TaskPanelEntry {
             id: "shell_stale".to_string(),
             status: "running".to_string(),
@@ -3748,6 +4178,8 @@ mod tests {
             kind: TaskPanelEntryKind::Background,
             stale: true,
             elapsed_since_output_ms: Some(61_000),
+            owner_agent_id: None,
+            owner_agent_name: None,
         });
 
         let (lines, actions) = task_panel_rows(&app, 80, 12);
@@ -3780,6 +4212,7 @@ mod tests {
     #[test]
     fn task_panel_actions_route_each_job_to_its_own_id() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         app.task_panel.push(TaskPanelEntry {
             id: "shell_aaa".to_string(),
             status: "running".to_string(),
@@ -3788,6 +4221,8 @@ mod tests {
             kind: TaskPanelEntryKind::Background,
             stale: false,
             elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
         });
         app.task_panel.push(TaskPanelEntry {
             id: "task_bbb".to_string(),
@@ -3797,6 +4232,8 @@ mod tests {
             kind: TaskPanelEntryKind::Background,
             stale: false,
             elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
         });
 
         let (lines, actions) = task_panel_rows(&app, 96, 16);
@@ -3845,7 +4282,7 @@ mod tests {
 
         let hint_idx = text
             .iter()
-            .position(|line| line.contains("Ctrl+K"))
+            .position(|line| line.contains("Ctrl+X"))
             .expect("cancel-all hint row");
         assert_eq!(actions[hint_idx].as_deref(), Some("/jobs cancel-all"));
     }
@@ -3853,6 +4290,7 @@ mod tests {
     #[test]
     fn task_panel_finished_job_detail_row_shows_instead_of_cancels() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         app.task_panel.push(TaskPanelEntry {
             id: "shell_done".to_string(),
             status: "completed".to_string(),
@@ -3861,6 +4299,8 @@ mod tests {
             kind: TaskPanelEntryKind::Background,
             stale: false,
             elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
         });
 
         let (lines, actions) = task_panel_rows(&app, 80, 12);
@@ -3881,6 +4321,7 @@ mod tests {
     #[test]
     fn task_panel_actions_align_with_lines_when_live_tools_present() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         app.runtime_turn_id = Some("0196f0a3-aaaa-bbbb-cccc-ddddeeee0000".to_string());
         let mut active = ActiveCell::new();
         active.push_tool(
@@ -3891,6 +4332,8 @@ mod tests {
                 output: None,
                 live_output: None,
                 shell_task_id: None,
+                owner_agent_id: None,
+                owner_agent_name: None,
                 started_at: Some(Instant::now()),
                 duration_ms: None,
                 source: ExecSource::Assistant,
@@ -3907,6 +4350,8 @@ mod tests {
             kind: TaskPanelEntryKind::Background,
             stale: false,
             elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
         });
 
         let (lines, actions) = task_panel_rows(&app, 96, 16);
@@ -3944,6 +4389,8 @@ mod tests {
         };
         let rows = vec![SidebarAgentRow {
             id: "agent_0123456789".to_string(),
+            parent_run_id: None,
+            spawn_depth: 1,
             name: "investigator".to_string(),
             role: "worker".to_string(),
             status: "running".to_string(),
@@ -3982,6 +4429,8 @@ mod tests {
         };
         let rows = vec![SidebarAgentRow {
             id: "agent_fedcba987654".to_string(),
+            parent_run_id: None,
+            spawn_depth: 1,
             name: "scout".to_string(),
             role: "explorer".to_string(),
             status: "running".to_string(),
@@ -4009,8 +4458,135 @@ mod tests {
     }
 
     #[test]
+    fn subagent_sidebar_orders_and_indents_nested_children() {
+        let rows = vec![
+            SidebarAgentRow {
+                id: "agent_grandchild".to_string(),
+                parent_run_id: Some("agent_parent".to_string()),
+                spawn_depth: 2,
+                name: "nested-reader".to_string(),
+                role: "explore".to_string(),
+                status: "done".to_string(),
+                objective: None,
+                git_branch: None,
+                progress: None,
+                steps_taken: 1,
+                duration_ms: Some(250),
+            },
+            SidebarAgentRow {
+                id: "agent_parent".to_string(),
+                parent_run_id: None,
+                spawn_depth: 1,
+                name: "nested-parent".to_string(),
+                role: "explore".to_string(),
+                status: "running".to_string(),
+                objective: None,
+                git_branch: None,
+                progress: Some("waiting on child".to_string()),
+                steps_taken: 2,
+                duration_ms: Some(500),
+            },
+        ];
+        let sorted = sort_sidebar_agent_rows_as_tree(rows);
+        assert_eq!(sorted[0].id, "agent_parent");
+        assert_eq!(sorted[1].id, "agent_grandchild");
+
+        let summary = SidebarSubagentSummary {
+            cached_total: 2,
+            cached_running: 1,
+            ..SidebarSubagentSummary::default()
+        };
+        let (lines, _) = subagent_panel_rows(&summary, &sorted, 64, 8, &palette::UI_THEME);
+        let text = lines_to_text(&lines);
+        let parent_idx = text
+            .iter()
+            .position(|line| line.contains("nested-parent"))
+            .expect("parent row");
+        let child_idx = text
+            .iter()
+            .position(|line| line.contains("nested-reader"))
+            .expect("child row");
+        assert!(
+            parent_idx < child_idx,
+            "parent must render before child: {text:?}"
+        );
+        assert!(
+            text[child_idx].contains("└─"),
+            "nested child should render with a tree branch marker: {text:?}"
+        );
+
+        let hover = agent_row_hover_text(&sorted[1]);
+        assert!(hover.contains("parent: agent_parent"));
+        assert!(hover.contains("depth: 2"));
+    }
+
+    #[test]
+    fn subagent_sidebar_orders_and_indents_live_progress_children() {
+        let mut app = create_test_app();
+        app.agent_progress
+            .insert("agent_parent".to_string(), "running".to_string());
+        app.agent_progress_meta.insert(
+            "agent_parent".to_string(),
+            AgentProgressMeta {
+                parent_run_id: None,
+                spawn_depth: 1,
+            },
+        );
+        app.agent_progress.insert(
+            "agent_child".to_string(),
+            "step 2: finished tool 'read_file'".to_string(),
+        );
+        app.agent_progress_meta.insert(
+            "agent_child".to_string(),
+            AgentProgressMeta {
+                parent_run_id: Some("agent_parent".to_string()),
+                spawn_depth: 2,
+            },
+        );
+        app.ensure_agent_label("agent_parent");
+        app.ensure_agent_label("agent_child");
+
+        let rows = sidebar_agent_rows(&app);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "agent_parent");
+        assert_eq!(rows[1].id, "agent_child");
+        assert_eq!(rows[1].parent_run_id.as_deref(), Some("agent_parent"));
+        assert_eq!(rows[1].spawn_depth, 2);
+        assert_eq!(rows[1].role, "child");
+
+        let summary = SidebarSubagentSummary {
+            progress_only_count: 2,
+            ..SidebarSubagentSummary::default()
+        };
+        let (lines, _) = subagent_panel_rows(&summary, &rows, 64, 8, &palette::UI_THEME);
+        let text = lines_to_text(&lines);
+        let parent_idx = text
+            .iter()
+            .position(|line| line.contains("Agent 1"))
+            .expect("live parent row");
+        let child_idx = text
+            .iter()
+            .position(|line| line.contains("Agent 2"))
+            .expect("live child row");
+        assert!(
+            parent_idx < child_idx,
+            "live parent must render before child: {text:?}"
+        );
+        assert!(
+            text[child_idx].contains("└─"),
+            "live child should render with a tree branch marker: {text:?}"
+        );
+
+        let hover = agent_row_hover_text(&rows[1]);
+        assert!(hover.contains("parent: agent_parent"));
+        assert!(hover.contains("depth: 2"));
+    }
+
+    #[test]
     fn tasks_panel_collapses_repeated_low_value_recent_tools_after_failures() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         for path in ["src/a.rs", "src/b.rs", "src/c.rs"] {
             app.history
                 .push(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
@@ -4077,6 +4653,7 @@ mod tests {
     #[test]
     fn tasks_panel_collapses_repeated_pending_ci_polls() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         for _ in 0..3 {
             app.history.push(HistoryCell::Tool(ToolCell::Exec(ExecCell {
                 command: "cd /tmp/repo && sleep 15 && gh pr checks 1616 --repo Hmbown/CodeWhale"
@@ -4085,6 +4662,8 @@ mod tests {
                 output: Some("Lint pending\nTest pending".to_string()),
                 live_output: None,
                 shell_task_id: None,
+                owner_agent_id: None,
+                owner_agent_name: None,
                 started_at: None,
                 duration_ms: Some(15_000),
                 source: ExecSource::Assistant,
@@ -4121,12 +4700,15 @@ mod tests {
     #[test]
     fn tasks_panel_failed_shell_rows_point_to_activity_details() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         app.history.push(HistoryCell::Tool(ToolCell::Exec(ExecCell {
             command: "cargo test -p codewhale-tui".to_string(),
             status: ToolStatus::Failed,
             output: Some("test failed".to_string()),
             live_output: None,
             shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
             started_at: None,
             duration_ms: Some(1_250),
             source: ExecSource::Assistant,
@@ -4152,12 +4734,15 @@ mod tests {
     #[test]
     fn tasks_panel_keeps_duration_and_status_on_recent_shell_rows() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         app.history.push(HistoryCell::Tool(ToolCell::Exec(ExecCell {
             command: "cargo check".to_string(),
             status: ToolStatus::Success,
             output: Some("Finished".to_string()),
             live_output: None,
             shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
             started_at: None,
             duration_ms: Some(1_250),
             source: ExecSource::Assistant,
@@ -4181,6 +4766,7 @@ mod tests {
     #[test]
     fn tasks_panel_uses_plain_names_for_shell_background_helpers() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         let mut active = ActiveCell::new();
         active.push_tool(
             "shell-wait",
@@ -4212,6 +4798,7 @@ mod tests {
     #[test]
     fn tasks_panel_collapses_repeated_shell_waits_for_same_job() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         let mut active = ActiveCell::new();
         for id in ["shell-wait-1", "shell-wait-2"] {
             active.push_tool(
@@ -4248,6 +4835,7 @@ mod tests {
     #[test]
     fn tasks_panel_collapses_repeated_shell_waits_without_task_marker() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         let mut active = ActiveCell::new();
         for (id, summary) in [
             ("shell-wait-1", "Background task running (no new output)."),
@@ -4310,6 +4898,8 @@ mod tests {
         let rows = vec![
             SidebarAgentRow {
                 id: "agent_a5e674dc".to_string(),
+                parent_run_id: None,
+                spawn_depth: 1,
                 name: "check-docs-mcp".to_string(),
                 role: "explore".to_string(),
                 status: "running".to_string(),
@@ -4321,6 +4911,8 @@ mod tests {
             },
             SidebarAgentRow {
                 id: "agent_850aa63f".to_string(),
+                parent_run_id: None,
+                spawn_depth: 1,
                 name: "check-install-docs".to_string(),
                 role: "general".to_string(),
                 status: "done".to_string(),
@@ -4599,6 +5191,8 @@ mod tests {
             "currently reviewing sidebar hover popover wrapping and hitbox metadata";
         let rows = vec![SidebarAgentRow {
             id: long_id.to_string(),
+            parent_run_id: None,
+            spawn_depth: 1,
             name: "sidebar-detail-worker-with-long-name".to_string(),
             role: "worker".to_string(),
             status: "running".to_string(),
@@ -4632,6 +5226,8 @@ mod tests {
         };
         let rows = vec![SidebarAgentRow {
             id: "019e9142-83f6-7713-87f1-28902e74bf05".to_string(),
+            parent_run_id: None,
+            spawn_depth: 1,
             name: "doc-checker".to_string(),
             role: "worker".to_string(),
             status: "running".to_string(),
@@ -4675,6 +5271,7 @@ mod tests {
     #[test]
     fn tasks_panel_shows_stable_turn_label_not_uuid() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         app.runtime_turn_id = Some("0196f0a3-1111-2222-3333-444455556666".to_string());
         app.runtime_turn_status = Some("in_progress".to_string());
         app.turn_counter = 3;
@@ -4699,6 +5296,7 @@ mod tests {
     #[test]
     fn tasks_panel_turn_label_falls_back_before_first_counted_turn() {
         let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
         app.runtime_turn_id = Some("0196f0a3-1111-2222-3333-444455556666".to_string());
         app.runtime_turn_status = Some("in_progress".to_string());
         app.turn_counter = 0;
@@ -4743,6 +5341,8 @@ mod tests {
             nickname: nickname.map(str::to_string),
             status: crate::tools::subagent::SubAgentStatus::Running,
             worker_status: None,
+            parent_run_id: None,
+            spawn_depth: 0,
             result: None,
             steps_taken: 1,
             checkpoint: None,

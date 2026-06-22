@@ -3,8 +3,8 @@
 //! Tool cards are the boxes that appear when the agent runs `read_file`,
 //! `exec_shell`, `apply_patch`, etc. The visual vocabulary is intentionally
 //! sparse: a single verb glyph identifies the family, a left rail anchors
-//! the card to the timeline, and the spinner cadence (720 ms/step) reuses
-//! the existing tool-status animation.
+//! the card to the timeline, and the spinner cadence reuses the existing
+//! tool-status animation.
 //!
 //! This module owns:
 //!

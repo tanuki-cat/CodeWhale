@@ -1,6 +1,7 @@
 use super::*;
 use crate::worker_profile::ShellPolicy;
-use axum::{Json, Router, routing::post};
+use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+use std::collections::HashSet;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
@@ -23,6 +24,8 @@ fn make_snapshot(status: SubAgentStatus) -> SubAgentResult {
         nickname: None,
         status,
         worker_status: None,
+        parent_run_id: None,
+        spawn_depth: 0,
         result: None,
         steps_taken: 0,
         checkpoint: None,
@@ -149,6 +152,113 @@ fn headless_worker_record_tracks_lifecycle_without_tui_projection() {
             .iter()
             .any(|event| event.tool_name.as_deref() == Some("read_file"))
     );
+}
+
+#[test]
+fn worker_record_usage_accumulates_provider_tokens() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 4);
+    manager.register_worker(make_worker_spec("agent_usage", tmp.path().to_path_buf()));
+
+    manager.record_worker_usage(
+        "agent_usage",
+        &Usage {
+            input_tokens: 100,
+            output_tokens: 25,
+            prompt_cache_hit_tokens: Some(70),
+            prompt_cache_miss_tokens: Some(30),
+            ..Usage::default()
+        },
+    );
+    manager.record_worker_usage(
+        "agent_usage",
+        &Usage {
+            input_tokens: 40,
+            output_tokens: 10,
+            ..Usage::default()
+        },
+    );
+
+    let record = manager
+        .get_worker_record("agent_usage")
+        .expect("worker record");
+    assert_eq!(record.usage.status, "reported");
+    assert_eq!(record.usage.input_tokens, Some(140));
+    assert_eq!(record.usage.output_tokens, Some(35));
+    assert_eq!(record.usage.total_tokens, Some(175));
+    assert_eq!(record.usage.token_budget, None);
+    assert!(
+        record.usage.note.contains("175 tokens"),
+        "usage note includes reported total: {}",
+        record.usage.note
+    );
+}
+
+#[test]
+fn token_budget_scope_is_shared_across_nested_workers_and_blocks_when_spent() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().to_path_buf();
+    let mut manager =
+        SubAgentManager::new(workspace.clone(), 4).with_default_token_budget(Some(100));
+
+    manager.register_worker(make_worker_spec("agent_root", workspace.clone()));
+    let root_scope = manager
+        .resolve_spawn_budget_scope("agent_root", None, None)
+        .expect("root budget resolves")
+        .expect("root budget present");
+    manager.attach_budget_scope("agent_root", root_scope);
+    manager.record_worker_usage(
+        "agent_root",
+        &Usage {
+            input_tokens: 40,
+            output_tokens: 10,
+            ..Usage::default()
+        },
+    );
+
+    let mut child_spec = make_worker_spec("agent_child", workspace);
+    child_spec.parent_run_id = Some("agent_root".to_string());
+    let child_scope = manager
+        .resolve_spawn_budget_scope("agent_child", Some("agent_root"), None)
+        .expect("child inherits budget")
+        .expect("child budget present");
+    assert_eq!(child_scope.scope_id, "agent_root");
+    assert_eq!(child_scope.limit, 100);
+    assert_eq!(child_scope.spent, 50);
+    manager.register_worker(child_spec);
+    manager.attach_budget_scope("agent_child", child_scope);
+    manager.record_worker_usage(
+        "agent_child",
+        &Usage {
+            input_tokens: 30,
+            output_tokens: 20,
+            ..Usage::default()
+        },
+    );
+
+    let root = manager.get_worker_record("agent_root").expect("root");
+    let child = manager.get_worker_record("agent_child").expect("child");
+    assert_eq!(root.usage.budget_spent_tokens, Some(100));
+    assert_eq!(child.usage.budget_spent_tokens, Some(100));
+    assert_eq!(root.usage.budget_remaining_tokens, Some(0));
+    assert_eq!(child.usage.budget_remaining_tokens, Some(0));
+    assert_eq!(root.usage.status, "budget_exhausted");
+
+    let err = manager
+        .resolve_spawn_budget_scope("agent_grandchild", Some("agent_child"), None)
+        .expect_err("spent shared budget blocks further child spawn");
+    assert!(
+        err.to_string().contains("token budget exhausted"),
+        "actionable exhaustion error: {err}"
+    );
+
+    let override_scope = manager
+        .resolve_spawn_budget_scope("agent_override", Some("agent_child"), Some(20))
+        .expect("explicit override starts new scope")
+        .expect("override budget present");
+    assert_eq!(override_scope.scope_id, "agent_override");
+    assert_eq!(override_scope.limit, 20);
+    assert_eq!(override_scope.spent, 0);
 }
 
 #[test]
@@ -387,6 +497,71 @@ async fn delayed_chat_client(
     (client, calls, bodies)
 }
 
+async fn transient_header_timeout_then_success_chat_client(
+    response_text: &str,
+) -> (DeepSeekClient, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let response_text = response_text.to_string();
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let calls = Arc::clone(&calls);
+            move |Json(_body): Json<Value>| {
+                let calls = Arc::clone(&calls);
+                let response_text = response_text.clone();
+                async move {
+                    let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempt == 1 {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "error": {
+                                    "message": "SSE stream request did not receive response headers after 45s"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(json!({
+                        "id": format!("chatcmpl-test-{attempt}"),
+                        "model": "deepseek-v4-flash",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": response_text
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 1,
+                            "completion_tokens": 1,
+                            "total_tokens": 2
+                        }
+                    }))
+                    .into_response()
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake transient chat server");
+    let addr = listener.local_addr().expect("fake chat server addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let config = crate::config::Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(format!("http://{addr}/v1")),
+        ..crate::config::Config::default()
+    };
+    let client = DeepSeekClient::new(&config).expect("fake transient chat client");
+    (client, calls)
+}
+
 fn estimate_tool_description_tokens_conservative(text: &str) -> usize {
     text.chars().count().div_ceil(3)
 }
@@ -545,13 +720,42 @@ fn explore_prompt_orients_before_searching() {
 }
 
 #[test]
+fn explore_prompt_is_quick_bounded_and_read_only() {
+    let prompt = SubAgentType::Explore.system_prompt();
+    assert!(prompt.contains("Default to `EFFORT: quick`"));
+    assert!(prompt.contains("3-5 tool calls"));
+    assert!(prompt.contains("strictly read-only"));
+    assert!(prompt.contains("ALREADY_KNOWN"));
+    assert!(prompt.contains("STOP_CONDITION"));
+    assert!(prompt.contains("Return partial findings"));
+}
+
+#[test]
+fn implementer_prompt_is_not_forced_into_explorer_cap() {
+    let prompt = SubAgentType::Implementer.system_prompt();
+    assert!(prompt.contains("not limited to an explorer-style 3-5 tool-call cap"));
+    assert!(prompt.contains("Checkpoint before expanding scope"));
+    assert!(!prompt.contains("Default to `EFFORT: quick`"));
+}
+
+#[test]
+fn review_and_verifier_prompts_stop_after_decisive_evidence() {
+    let review = SubAgentType::Review.system_prompt();
+    let verifier = SubAgentType::Verifier.system_prompt();
+    assert!(review.contains("stop after decisive evidence"));
+    assert!(verifier.contains("stop after decisive pass/fail evidence"));
+}
+
+#[test]
 fn agent_description_explains_background_child_and_transcript_handle() {
     let tmp = tempdir().expect("tempdir");
     let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 1);
     let tool = AgentTool::new(manager, stub_runtime());
     let description = tool.description();
 
-    assert!(description.contains("Start one focused child agent task"));
+    assert!(description.contains("Start, inspect, peek at, or cancel focused child agent tasks"));
+    assert!(description.contains("runs or queues"));
+    assert!(description.contains("provider rate-limit"));
     assert!(description.contains("background"));
     assert!(description.contains("transcript_handle"));
     assert!(
@@ -669,6 +873,57 @@ fn test_parse_spawn_request_accepts_model_strength() {
 }
 
 #[test]
+fn explore_subagent_defaults_to_faster_model_strength() {
+    // type: "explore" with no model_strength and no model defaults to Faster:
+    // bounded read-only lookup is exactly the cheap-sibling job.
+    let input = json!({
+        "prompt": "find every caller of normalize_model_name",
+        "type": "explore"
+    });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    assert_eq!(parsed.agent_type, SubAgentType::Explore);
+    assert_eq!(parsed.model_strength, SubAgentModelStrength::Faster);
+
+    // Explicit model_strength: "same" wins for explore too.
+    let input = json!({
+        "prompt": "explore but stay capable",
+        "type": "explore",
+        "model_strength": "same"
+    });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    assert_eq!(parsed.agent_type, SubAgentType::Explore);
+    assert_eq!(parsed.model_strength, SubAgentModelStrength::Same);
+
+    // An explicit model pins the child (downstream Fixed route) and disables
+    // the explore→faster default, so model_strength falls back to Same.
+    let input = json!({
+        "prompt": "explore on a specific model",
+        "type": "explore",
+        "model": "GLM-5.2"
+    });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    assert_eq!(parsed.agent_type, SubAgentType::Explore);
+    assert_eq!(parsed.model_strength, SubAgentModelStrength::Same);
+}
+
+#[test]
+fn non_explore_subagents_keep_default_same_model_strength() {
+    // Non-explore roles keep the conservative Same default even with no model.
+    for role in ["general", "plan", "review", "implementer"] {
+        let input = json!({
+            "prompt": "do some work",
+            "type": role
+        });
+        let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+        assert_eq!(
+            parsed.model_strength,
+            SubAgentModelStrength::Same,
+            "role {role:?} should default to Same"
+        );
+    }
+}
+
+#[test]
 fn test_parse_spawn_request_accepts_child_thinking() {
     let input = json!({
         "prompt": "scan parser references",
@@ -750,15 +1005,16 @@ fn test_parse_spawn_request_rejects_invalid_session_name() {
 
 #[test]
 fn test_parse_spawn_request_rejects_out_of_range_max_depth() {
+    let ceiling = codewhale_config::MAX_SPAWN_DEPTH_CEILING;
     let input = json!({
         "name": "review.parser",
         "prompt": "inspect parser",
-        "max_depth": 4
+        "max_depth": ceiling + 1
     });
     let err = parse_spawn_request(&input).expect_err("max_depth should be capped at schema range");
     assert!(
         err.to_string()
-            .contains("max_depth must be between 0 and 3")
+            .contains(&format!("max_depth must be between 0 and {ceiling}"))
     );
 }
 
@@ -887,6 +1143,33 @@ fn test_delegate_defaults_to_fork_context() {
     );
     let parsed = parse_spawn_request(&input).expect("delegate override should parse");
     assert!(!parsed.fork_context);
+}
+
+#[test]
+fn spawn_request_parses_token_budget_override() {
+    let parsed = parse_spawn_request(&json!({
+        "prompt": "fan out safely",
+        "token_budget": 12_345
+    }))
+    .expect("token budget parses");
+    assert_eq!(parsed.token_budget, Some(12_345));
+
+    let parsed = parse_spawn_request(&json!({
+        "prompt": "fleet-shaped alias",
+        "max_tokens": 4_000
+    }))
+    .expect("max_tokens alias parses");
+    assert_eq!(parsed.token_budget, Some(4_000));
+
+    let err = parse_spawn_request(&json!({
+        "prompt": "bad budget",
+        "token_budget": 0
+    }))
+    .expect_err("zero budget is invalid in tool input");
+    assert!(
+        err.to_string().contains("must be greater than zero"),
+        "clear token budget error: {err}"
+    );
 }
 
 #[test]
@@ -1074,6 +1357,126 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
         "thinking description should teach child thinking control: {thinking}"
     );
     assert!(agent_schema["properties"].get("model").is_some());
+    let worktree = schema_property_description(&agent_schema, "worktree");
+    assert!(
+        worktree.contains("git worktree") && worktree.contains("parallel edit"),
+        "worktree description should teach isolated parallel edits: {worktree}"
+    );
+    assert!(agent_schema["properties"].get("worktree_branch").is_some());
+    assert!(agent_schema["properties"].get("worktree_path").is_some());
+}
+
+#[test]
+fn agent_tool_prompt_schema_prefers_structured_briefs() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 1);
+    let agent_schema = AgentTool::new(manager, stub_runtime()).input_schema();
+    let prompt = schema_property_description(&agent_schema, "prompt");
+    assert!(prompt.contains("Subagent Brief"));
+    assert!(prompt.contains("QUESTION"));
+    assert!(prompt.contains("STOP_CONDITION"));
+    assert!(prompt.contains("ALREADY_KNOWN"));
+}
+
+#[test]
+fn agent_tool_schema_advertises_status_peek_cancel_actions() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 1);
+    let agent_schema = AgentTool::new(manager, stub_runtime()).input_schema();
+
+    let action = schema_property_description(&agent_schema, "action");
+    assert!(action.contains("status"));
+    assert!(action.contains("peek"));
+    assert!(action.contains("cancel"));
+    assert!(agent_schema["properties"].get("agent_id").is_some());
+}
+
+#[tokio::test]
+async fn agent_tool_status_returns_running_child_projection() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(
+        tmp.path().to_path_buf(),
+        2,
+    )));
+    let agent_id = "agent_status_probe".to_string();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        agent_id.clone(),
+        SubAgentType::General,
+        "probe".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.read().await.current_session_boot_id.clone(),
+    );
+    agent.status = SubAgentStatus::Running;
+    {
+        let mut manager_guard = manager.write().await;
+        manager_guard.agents.insert(agent_id.clone(), agent);
+        manager_guard.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+        manager_guard
+            .record_worker_progress(&agent_id, "step 1: requesting model response".to_string());
+    }
+
+    let tool = AgentTool::new(Arc::clone(&manager), stub_runtime());
+    let context = ToolContext::new(tmp.path());
+    let result = tool
+        .execute(json!({"action": "status", "agent_id": agent_id}), &context)
+        .await
+        .expect("status action succeeds");
+
+    assert_eq!(result.metadata.as_ref().unwrap()["action"], json!("status"));
+    assert!(result.content.contains("agent_status_probe"));
+    assert!(result.content.contains("running"));
+    assert!(result.content.contains("transcript_handle"));
+}
+
+#[tokio::test]
+async fn agent_tool_cancel_stops_running_child() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(
+        tmp.path().to_path_buf(),
+        2,
+    )));
+    let agent_id = "agent_cancel_probe".to_string();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        agent_id.clone(),
+        SubAgentType::General,
+        "cancel".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.read().await.current_session_boot_id.clone(),
+    );
+    agent.status = SubAgentStatus::Running;
+    {
+        let mut manager_guard = manager.write().await;
+        manager_guard.agents.insert(agent_id.clone(), agent);
+        manager_guard.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+    }
+
+    let tool = AgentTool::new(Arc::clone(&manager), stub_runtime());
+    let context = ToolContext::new(tmp.path());
+    let result = tool
+        .execute(json!({"action": "cancel", "agent_id": agent_id}), &context)
+        .await
+        .expect("cancel action succeeds");
+
+    assert_eq!(result.metadata.as_ref().unwrap()["action"], json!("cancel"));
+    assert!(result.content.contains("cancelled"));
+    let snapshot = manager
+        .read()
+        .await
+        .get_result("agent_cancel_probe")
+        .expect("agent remains listed");
+    assert_eq!(snapshot.status, SubAgentStatus::Cancelled);
 }
 
 #[test]
@@ -1520,6 +1923,7 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
         fork_context: false,
         started_at: Instant::now(),
         max_steps: 3,
+        token_budget: None,
         input_rx: task_input_rx,
         launch_gate: None,
     };
@@ -1634,6 +2038,86 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
         1,
         "projection inspection must not respawn the child implicitly"
     );
+}
+
+#[test]
+fn transient_provider_classifier_matches_sse_header_timeout() {
+    let err = anyhow::anyhow!("SSE stream request did not receive response headers after 45s");
+
+    assert!(is_transient_subagent_provider_error(&err));
+}
+
+#[tokio::test]
+async fn subagent_retries_transient_provider_header_timeout_before_succeeding() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(
+        tmp.path().to_path_buf(),
+        2,
+    )));
+    let agent_id = "agent_transient_provider_retry".to_string();
+    let (task_input_tx, task_input_rx) = mpsc::unbounded_channel();
+    let agent = SubAgent::new(
+        agent_id.clone(),
+        SubAgentType::General,
+        "Inspect transient provider recovery".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some("Blue".to_string()),
+        Some(vec![]),
+        task_input_tx,
+        tmp.path().to_path_buf(),
+        "boot_test".to_string(),
+    );
+    {
+        let mut manager = manager.write().await;
+        manager.agents.insert(agent_id.clone(), agent);
+        manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+    }
+
+    let (client, calls) =
+        transient_header_timeout_then_success_chat_client("recovered answer").await;
+    let mut runtime = stub_runtime().with_step_api_timeout(Duration::from_secs(5));
+    runtime.client = client;
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path());
+
+    let task = SubAgentTask {
+        manager_handle: Arc::clone(&manager),
+        runtime,
+        agent_id: agent_id.clone(),
+        agent_type: SubAgentType::General,
+        prompt: "Inspect transient provider recovery".to_string(),
+        assignment: make_assignment(),
+        allowed_tools: Some(vec![]),
+        fork_context: false,
+        started_at: Instant::now(),
+        max_steps: 3,
+        token_budget: None,
+        input_rx: task_input_rx,
+        launch_gate: None,
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::spawn(run_subagent_task(task)),
+    )
+    .await
+    .expect("sub-agent task should finish")
+    .expect("sub-agent join should succeed");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one transient provider failure should be retried exactly once"
+    );
+    let snapshot = {
+        let manager = manager.read().await;
+        manager
+            .get_result(&agent_id)
+            .expect("agent should stay registered")
+    };
+    assert_eq!(snapshot.status, SubAgentStatus::Completed);
+    assert_eq!(snapshot.result.as_deref(), Some("recovered answer"));
 }
 
 #[tokio::test]
@@ -1776,6 +2260,76 @@ async fn test_running_count_counts_running_agents_until_status_reconciles() {
     manager.agents.insert(agent.id.clone(), agent);
 
     assert_eq!(manager.running_count(), 1);
+}
+
+#[tokio::test]
+async fn admission_limit_counts_queued_and_running_workers_separately() {
+    let mut manager = SubAgentManager::new(PathBuf::from("."), 2).with_admission_limit(4);
+    let mut handles = Vec::new();
+
+    for (agent_id, queued) in [
+        ("agent_admit_a", false),
+        ("agent_admit_b", false),
+        ("agent_admit_c", true),
+        ("agent_admit_d", true),
+    ] {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let mut agent = SubAgent::new(
+            agent_id.to_string(),
+            SubAgentType::Explore,
+            "prompt".to_string(),
+            make_assignment(),
+            "deepseek-v4-flash".to_string(),
+            Some("Blue".to_string()),
+            Some(vec!["read_file".to_string()]),
+            input_tx,
+            PathBuf::from("."),
+            "boot_test".to_string(),
+        );
+        agent.status = SubAgentStatus::Running;
+        agent.task_handle = Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }));
+        handles.push(agent_id.to_string());
+        manager.agents.insert(agent_id.to_string(), agent);
+        manager.register_worker(make_worker_spec(agent_id, PathBuf::from(".")));
+        if queued {
+            manager.record_worker_event(
+                agent_id,
+                AgentWorkerStatus::Queued,
+                Some(SUBAGENT_QUEUED_LAUNCH_REASON.to_string()),
+                None,
+                None,
+            );
+        }
+
+        if manager.admitted_count() < 4 {
+            manager
+                .check_admission_capacity()
+                .expect("admission remains below total ceiling");
+        }
+    }
+
+    assert_eq!(manager.admitted_count(), 4);
+    assert_eq!(manager.active_count(), 2);
+    assert_eq!(manager.queued_count(), 2);
+    let err = manager
+        .check_admission_capacity()
+        .expect_err("admission ceiling rejects fifth worker");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("max_admitted 4") && msg.contains("running 2") && msg.contains("queued 2"),
+        "error distinguishes running vs queued counts: {msg}"
+    );
+
+    for agent_id in handles {
+        manager
+            .agents
+            .get_mut(&agent_id)
+            .and_then(|agent| agent.task_handle.take())
+            .expect("live task handle")
+            .abort();
+    }
 }
 
 #[tokio::test]
@@ -2069,6 +2623,42 @@ fn parse_spawn_request_extracts_cwd_when_present() {
 }
 
 #[test]
+fn parse_spawn_request_accepts_worktree_isolation() {
+    let input = json!({
+        "prompt": "build feature A",
+        "worktree": true,
+        "worktree_branch": "codex/agent-feature-a",
+        "worktree_path": "feature-a",
+        "worktree_base": "HEAD"
+    });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    let worktree = parsed.worktree.expect("worktree request");
+    assert_eq!(worktree.branch.as_deref(), Some("codex/agent-feature-a"));
+    assert_eq!(worktree.base_ref.as_deref(), Some("HEAD"));
+    assert_eq!(
+        worktree
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
+        Some("feature-a".to_string())
+    );
+}
+
+#[test]
+fn parse_spawn_request_rejects_cwd_with_worktree_isolation() {
+    let input = json!({
+        "prompt": "build feature A",
+        "cwd": ".worktrees/manual",
+        "worktree": true
+    });
+    let err = parse_spawn_request(&input).expect_err("cwd and worktree should conflict");
+    assert!(
+        err.to_string().contains("either cwd or worktree"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn parse_spawn_request_cwd_absent_yields_none() {
     let input = json!({ "prompt": "no cwd" });
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
@@ -2080,6 +2670,59 @@ fn parse_spawn_request_cwd_empty_string_yields_none() {
     let input = json!({ "prompt": "empty cwd", "cwd": "   " });
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
     assert!(parsed.cwd.is_none(), "whitespace-only cwd should be None");
+}
+
+#[test]
+fn create_isolated_worktree_creates_branch_checkout_outside_parent_repo() {
+    let repo = init_subagent_git_repo();
+    let worktree_home = tempdir().expect("worktree home");
+    let request = SubAgentWorktreeRequest {
+        branch: Some("codex/agent-isolated-test".to_string()),
+        path: Some(worktree_home.path().join("isolated")),
+        base_ref: None,
+    };
+
+    let path = create_isolated_worktree(
+        repo.path(),
+        &request,
+        Some("isolated-test"),
+        &SubAgentType::Implementer,
+    )
+    .expect("worktree should be created");
+
+    assert!(path.exists(), "worktree path should exist");
+    assert!(
+        !path.starts_with(repo.path()),
+        "generated worktree must be outside the parent checkout"
+    );
+    assert_eq!(
+        current_git_branch(&path).as_deref(),
+        Some("codex/agent-isolated-test")
+    );
+}
+
+#[test]
+fn create_isolated_worktree_rejects_invalid_branch_as_input() {
+    let repo = init_subagent_git_repo();
+    let worktree_home = tempdir().expect("worktree home");
+    let request = SubAgentWorktreeRequest {
+        branch: Some("bad branch name".to_string()),
+        path: Some(worktree_home.path().join("isolated")),
+        base_ref: None,
+    };
+
+    let err = create_isolated_worktree(
+        repo.path(),
+        &request,
+        Some("isolated-test"),
+        &SubAgentType::Implementer,
+    )
+    .expect_err("invalid branch should fail");
+
+    assert!(
+        err.to_string().contains("Invalid worktree_branch"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -2112,7 +2755,7 @@ fn build_subagent_system_prompt_skips_role_when_blank() {
 #[test]
 fn subagent_done_sentinel_format_is_well_formed() {
     let res = make_snapshot(SubAgentStatus::Completed);
-    let sentinel = subagent_done_sentinel("agent_xyz", &res);
+    let sentinel = subagent_done_sentinel("agent_xyz", &res, false);
     assert!(sentinel.starts_with("<codewhale:subagent.done>"));
     assert!(sentinel.ends_with("</codewhale:subagent.done>"));
 
@@ -2125,6 +2768,8 @@ fn subagent_done_sentinel_format_is_well_formed() {
     assert_eq!(parsed["status"], "completed");
     assert_eq!(parsed["agent_type"], "general");
     assert_eq!(parsed["summary_location"], "previous_line");
+    // issue #2652: a complete (non-truncated) summary is tagged as such.
+    assert_eq!(parsed["summary_kind"], "complete");
     assert!(parsed.get("details").is_none());
     assert!(parsed.get("result_clipped").is_none());
     assert!(parsed.get("summary_complete").is_none());
@@ -2138,19 +2783,80 @@ fn subagent_done_sentinel_format_is_well_formed() {
 fn subagent_done_sentinel_keeps_large_result_out_of_metadata() {
     let mut res = make_snapshot(SubAgentStatus::Completed);
     res.result = Some("x".repeat(2048));
-    let sentinel = subagent_done_sentinel("agent_big", &res);
+    let sentinel = subagent_done_sentinel("agent_big", &res, false);
     let inner = sentinel
         .trim_start_matches("<codewhale:subagent.done>")
         .trim_end_matches("</codewhale:subagent.done>");
     let parsed: serde_json::Value = serde_json::from_str(inner).expect("inner JSON parses");
     assert_eq!(parsed["agent_id"], "agent_big");
     assert_eq!(parsed["summary_location"], "previous_line");
+    assert_eq!(parsed["summary_kind"], "complete");
     assert!(parsed.get("result_clipped").is_none());
     assert!(parsed.get("summary_complete").is_none());
     assert!(parsed.get("next_action").is_none());
     assert!(
         !inner.contains(&"x".repeat(128)),
         "sentinel should not duplicate large result text"
+    );
+}
+
+#[test]
+fn subagent_done_sentinel_marks_truncated_summaries() {
+    // issue #2652: when the child summary was length-gated, the sentinel must
+    // advertise summary_kind:"truncated" so the parent can steer verification.
+    let res = make_snapshot(SubAgentStatus::Completed);
+    let sentinel = subagent_done_sentinel("agent_trunc", &res, true);
+    let inner = sentinel
+        .trim_start_matches("<codewhale:subagent.done>")
+        .trim_end_matches("</codewhale:subagent.done>");
+    let parsed: serde_json::Value = serde_json::from_str(inner).expect("inner JSON parses");
+    assert_eq!(parsed["summary_kind"], "truncated");
+}
+
+#[test]
+fn stamp_subagent_summary_appends_note_when_short() {
+    // issue #2652: a short (complete) summary gets the soft self-report note
+    // and is NOT marked truncated.
+    let (stamped, truncated) = stamp_subagent_summary("All tests pass.");
+    assert!(!truncated);
+    assert!(stamped.starts_with("All tests pass."));
+    assert!(
+        stamped.contains("[Sub-agent self-report"),
+        "short summary gets the provenance note"
+    );
+    assert!(
+        !stamped.contains("[Sub-agent summary truncated"),
+        "short summary must not get the truncation footer"
+    );
+}
+
+#[test]
+fn stamp_subagent_summary_truncates_when_over_budget() {
+    // issue #2652: a summary exceeding the budget is head+tail truncated using
+    // the existing [Output truncated ...] vocabulary, honestly noting there is
+    // no retrieve handle, and is marked truncated.
+    let big = "a".repeat(SUBAGENT_SUMMARY_CHAR_BUDGET + 5_000);
+    let (stamped, truncated) = stamp_subagent_summary(&big);
+    assert!(truncated);
+    assert!(
+        stamped.contains("[Sub-agent summary truncated"),
+        "long summary gets the truncation footer"
+    );
+    assert!(
+        stamped.contains("not in the spillover store"),
+        "footer is honest about the missing retrieve handle"
+    );
+    assert!(
+        !stamped.contains("[Sub-agent self-report"),
+        "truncated summary must not also get the self-report note"
+    );
+    // Head and tail slices are present; a run of budget-length 'a's is gone
+    // from the middle.
+    assert!(stamped.contains(&"a".repeat(SUBAGENT_SUMMARY_HEAD_CHARS)));
+    assert!(stamped.contains(&"a".repeat(SUBAGENT_SUMMARY_TAIL_CHARS)));
+    assert!(
+        stamped.chars().filter(|c| *c == 'a').count() < big.chars().count(),
+        "truncation removed middle characters"
     );
 }
 
@@ -2232,6 +2938,38 @@ fn would_exceed_depth_at_boundary() {
         !below_max.would_exceed_depth(),
         "depth 2 + max 3 → next is 3, allowed"
     );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn rate_limit_pause_blocks_subagent_spawn() {
+    let _guard = crate::retry_status::test_guard();
+    crate::retry_status::clear();
+    crate::retry_status::clear_rate_limit();
+    crate::retry_status::note_rate_limit(Duration::from_secs(30));
+
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+
+    let err = spawn_subagent_from_input(
+        json!({"prompt": "inspect the retry gate"}),
+        Arc::clone(&manager),
+        runtime,
+    )
+    .await
+    .expect_err("active provider rate-limit pause must refuse new sub-agent work");
+
+    assert!(
+        err.to_string().contains("rate-limiting"),
+        "error should name the provider throttle: {err}"
+    );
+    assert!(
+        manager.read().await.list().is_empty(),
+        "refused spawn must not register or launch a worker"
+    );
+    crate::retry_status::clear_rate_limit();
 }
 
 #[test]
@@ -2795,11 +3533,13 @@ fn stub_runtime() -> SubAgentRuntime {
         max_spawn_depth: DEFAULT_MAX_SPAWN_DEPTH,
         cancel_token: CancellationToken::new(),
         mailbox: None,
+        parent_agent_id: None,
         parent_completion_tx: None,
         fork_context: None,
         mcp_pool: None,
         step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
         speech_output_dir: None,
+        todos: crate::tools::todo::new_shared_todo_list(),
     }
 }
 
@@ -2832,6 +3572,14 @@ fn stub_client_for_provider(provider: &str) -> DeepSeekClient {
         }
         "zai" => {
             providers.zai = crate::config::ProviderConfig {
+                api_key: Some("test-key".to_string()),
+                ..Default::default()
+            };
+        }
+        // OpenAI Codex (ChatGPT backend). Exercises the faster-lane reasoning
+        // rule: GPT-5.5 children stay on GPT-5.5 and resolve Low reasoning.
+        "openai-codex" => {
+            providers.openai_codex = crate::config::ProviderConfig {
                 api_key: Some("test-key".to_string()),
                 ..Default::default()
             };
@@ -3075,12 +3823,11 @@ fn persist_round_trip_preserves_session_boot_id() {
 
 // === Issue #756: parent-completion wakeup ===
 //
-// When a direct child of the engine finishes, `run_subagent_task` emits
-// a `SubAgentCompletion` on the runtime's `parent_completion_tx`. The
-// engine's turn loop drains that channel before deciding to end the turn.
-// These tests cover the gating logic in `emit_parent_completion` so the
-// parent isn't flooded with grandchild completions and so the function
-// is safe when no channel is wired.
+// When an agent finishes, `run_subagent_task` emits a `SubAgentCompletion` on
+// the runtime's `parent_completion_tx`. For root-spawned agents the engine turn
+// loop drains that channel; for nested agents the running parent sub-agent
+// owns a local receiver and injects the completion into its own transcript.
+// These tests cover the routing logic and no-channel safety.
 
 fn runtime_with_depth(
     spawn_depth: u32,
@@ -3117,20 +3864,16 @@ fn child_runtime_inherits_speech_output_dir() {
 }
 
 #[test]
-fn emit_parent_completion_skips_grandchildren() {
+fn emit_parent_completion_fires_for_nested_child() {
     let (tx, mut rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
     let runtime = runtime_with_depth(2, Some(tx));
 
-    let sent = emit_parent_completion(&runtime, "agent_grandchild", "ignored");
+    let sent = emit_parent_completion(&runtime, "agent_grandchild", "nested summary");
 
-    assert!(
-        !sent,
-        "depth=2 grandchild must not fire on the parent channel"
-    );
-    assert!(
-        rx.try_recv().is_err(),
-        "channel should remain empty for grandchildren"
-    );
+    assert!(sent, "depth=2 child should send to its wired parent inbox");
+    let received = rx.try_recv().expect("nested completion should be routed");
+    assert_eq!(received.agent_id, "agent_grandchild");
+    assert_eq!(received.payload, "nested summary");
 }
 
 #[test]
@@ -3178,6 +3921,81 @@ fn emit_parent_completion_dropped_receiver_does_not_panic() {
     );
 }
 
+#[test]
+fn terminal_results_excluding_returns_only_current_root_undelivered_agents() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 4);
+    let current_boot = manager.current_session_boot_id.clone();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+
+    let mut root = SubAgent::new(
+        "agent_root_done".to_string(),
+        SubAgentType::General,
+        "root".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx.clone(),
+        tmp.path().to_path_buf(),
+        current_boot.clone(),
+    );
+    root.status = SubAgentStatus::Completed;
+    root.result = Some("root result".to_string());
+
+    let mut nested = SubAgent::new(
+        "agent_nested_done".to_string(),
+        SubAgentType::General,
+        "nested".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx.clone(),
+        tmp.path().to_path_buf(),
+        current_boot,
+    );
+    nested.status = SubAgentStatus::Completed;
+
+    let mut prior = SubAgent::new(
+        "agent_prior_done".to_string(),
+        SubAgentType::General,
+        "prior".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        "prior_boot".to_string(),
+    );
+    prior.status = SubAgentStatus::Completed;
+
+    manager.agents.insert(root.id.clone(), root);
+    manager.agents.insert(nested.id.clone(), nested);
+    manager.agents.insert(prior.id.clone(), prior);
+
+    manager.register_worker(make_worker_spec(
+        "agent_root_done",
+        tmp.path().to_path_buf(),
+    ));
+    let mut nested_spec = make_worker_spec("agent_nested_done", tmp.path().to_path_buf());
+    nested_spec.parent_run_id = Some("agent_root_parent".to_string());
+    manager.register_worker(nested_spec);
+    manager.register_worker(make_worker_spec(
+        "agent_prior_done",
+        tmp.path().to_path_buf(),
+    ));
+
+    let delivered = HashSet::from(["agent_already_delivered".to_string()]);
+    let results = manager.terminal_results_excluding(&delivered);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].agent_id, "agent_root_done");
+
+    let delivered = HashSet::from(["agent_root_done".to_string()]);
+    assert!(manager.terminal_results_excluding(&delivered).is_empty());
+}
+
 #[tokio::test]
 async fn run_subagent_task_emits_parent_completion_before_terminal_update() {
     let manager = Arc::new(RwLock::new(SubAgentManager::new(PathBuf::from("."), 2)));
@@ -3213,6 +4031,7 @@ async fn run_subagent_task_emits_parent_completion_before_terminal_update() {
         fork_context: false,
         started_at: Instant::now(),
         max_steps: 0,
+        token_budget: None,
         input_rx: task_input_rx,
         launch_gate: None,
     };
@@ -3246,8 +4065,8 @@ async fn run_subagent_task_emits_parent_completion_before_terminal_update() {
 #[test]
 fn child_runtime_propagates_completion_tx_for_gating() {
     // The channel is cloned through `child_runtime()` so descendants carry
-    // it. The gate at the send site (`spawn_depth == 1`) is what limits
-    // who actually fires — `child_runtime` simply must not strand it.
+    // it. Running sub-agents replace the channel in the runtime handed to
+    // their nested tool registry, so this propagation must not strand it.
     let (tx, _rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
     let parent = runtime_with_depth(0, Some(tx));
 
@@ -3258,6 +4077,54 @@ fn child_runtime_propagates_completion_tx_for_gating() {
         child.parent_completion_tx.is_some(),
         "child carries the wakeup channel forward"
     );
+}
+
+#[test]
+fn nested_tool_runtime_routes_child_completions_to_local_inbox() {
+    let (root_tx, mut root_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let direct_child_runtime = runtime_with_depth(1, Some(root_tx));
+    let fork_context = SubAgentForkContext {
+        system: None,
+        messages: Vec::new(),
+        structured_state_block: None,
+    };
+
+    let (tool_runtime, mut local_rx) =
+        runtime_for_nested_agent_tools(&direct_child_runtime, "agent_parent", fork_context);
+    let nested_child_runtime = tool_runtime.child_runtime();
+
+    let sent = emit_parent_completion(
+        &nested_child_runtime,
+        "agent_nested",
+        "nested child summary\n<codewhale:subagent.done>{}</codewhale:subagent.done>",
+    );
+
+    assert!(sent, "nested child should report to the local parent inbox");
+    let local = local_rx
+        .try_recv()
+        .expect("local parent inbox receives nested completion");
+    assert_eq!(local.agent_id, "agent_nested");
+    assert!(
+        root_rx.try_recv().is_err(),
+        "root engine must not receive nested child completion directly"
+    );
+}
+
+#[test]
+fn child_completion_runtime_message_preserves_agent_and_provenance_guidance() {
+    let message = child_completion_runtime_message(&[SubAgentCompletion {
+        agent_id: "agent_nested".to_string(),
+        payload: "SUMMARY\n### EVIDENCE\n- src/lib.rs:1-3".to_string(),
+    }]);
+    assert_eq!(message.role, "user");
+    let text = match &message.content[0] {
+        ContentBlock::Text { text, .. } => text,
+        other => panic!("expected text block, got {other:?}"),
+    };
+    assert!(text.contains("child_subagent_completion"));
+    assert!(text.contains("agent_id: agent_nested"));
+    assert!(text.contains("cite the child agent_id and the EVIDENCE lines"));
+    assert!(text.contains("src/lib.rs:1-3"));
 }
 
 #[test]
@@ -3310,7 +4177,7 @@ fn subagent_completion_payload_carries_existing_sentinel_format() {
     snap.result = Some("Found three errors.".to_string());
 
     let summary = summarize_subagent_result(&snap);
-    let sentinel = subagent_done_sentinel("agent_test", &snap);
+    let sentinel = subagent_done_sentinel("agent_test", &snap, false);
     let payload = format!("{summary}\n{sentinel}");
 
     let mut lines = payload.lines();
@@ -3415,7 +4282,10 @@ fn faster_route_uses_known_deepseek_and_glm_family_siblings() {
         SubAgentThinking::Inherit,
         "inspect docs",
     );
-    assert_eq!(route.model, "GLM-5.1");
+    // GLM-5.2 faster/explore children route to GLM-5-Turbo (same-family fast
+    // sibling), not down to GLM-5.1.
+    assert_eq!(route.model, "GLM-5-Turbo");
+    assert_ne!(route.model, "GLM-5.1");
 
     let mut openrouter = stub_runtime_for_provider("openrouter");
     openrouter.model = "z-ai/glm-5.2".to_string();
@@ -3426,7 +4296,52 @@ fn faster_route_uses_known_deepseek_and_glm_family_siblings() {
         SubAgentThinking::Inherit,
         "inspect docs",
     );
-    assert_eq!(route.model, "z-ai/glm-5.1");
+    assert_eq!(route.model, "z-ai/glm-5-turbo");
+    assert_ne!(route.model, "z-ai/glm-5.1");
+}
+
+#[test]
+fn gpt55_faster_route_stays_on_gpt55_with_low_reasoning() {
+    // AC: a faster/explore child of a GPT-5.5 (OpenAI Codex) parent must stay
+    // on GPT-5.5 — there is no cheaper same-provider sibling, so we never
+    // fabricate a DeepSeek/GLM id — and resolve Low reasoning rather than Off,
+    // because the Codex adapter has no true "off" on the wire.
+    //
+    // The Codex client validates OAuth credentials at construction time, so we
+    // stub the access-token env var for the duration of this test (save/restore
+    // to avoid leaking into parallel tests).
+    let prev_token = std::env::var_os("OPENAI_CODEX_ACCESS_TOKEN");
+    // Safety: this test does not run concurrently with other tests that read
+    // OPENAI_CODEX_ACCESS_TOKEN, and we restore the original value below.
+    unsafe {
+        std::env::set_var("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
+    }
+    let mut codex = stub_runtime_for_provider("openai-codex");
+    unsafe {
+        match prev_token {
+            Some(prev) => std::env::set_var("OPENAI_CODEX_ACCESS_TOKEN", prev),
+            None => std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN"),
+        }
+    }
+    codex.model = "gpt-5.5".to_string();
+    let route = fallback_subagent_assignment_route(
+        &codex,
+        None,
+        ModelRoute::Faster,
+        SubAgentThinking::Inherit,
+        "inspect one file",
+    );
+    assert_eq!(route.model, "gpt-5.5");
+    assert!(
+        !route.model.contains("deepseek"),
+        "no DeepSeek id may be fabricated: {route:?}"
+    );
+    assert!(
+        !route.model.contains("glm"),
+        "no GLM id may be fabricated: {route:?}"
+    );
+    assert_eq!(route.reasoning_effort.as_deref(), Some("low"));
+    assert_ne!(route.reasoning_effort.as_deref(), Some("off"));
 }
 
 #[test]
@@ -3574,6 +4489,7 @@ async fn launch_gate_queues_extra_direct_children() {
             fork_context: false,
             started_at: Instant::now(),
             max_steps: 1,
+            token_budget: None,
             input_rx,
             launch_gate: gate,
         };
@@ -3637,5 +4553,226 @@ async fn launch_gate_queues_extra_direct_children() {
     assert!(
         started_b > completed_a,
         "queued child must not start until a permit frees: {messages:?}"
+    );
+}
+
+/// Stub chat server that always replies with a final assistant text whose
+/// `usage` reports the given token counts. Returns the client plus a call
+/// counter so tests can assert how many model turns ran before a budget cap
+/// fired. Mirrors `delayed_chat_client` but with configurable usage and no
+/// artificial latency.
+async fn token_heavy_chat_client(
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    response_text: &str,
+) -> (DeepSeekClient, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let response_text = response_text.to_string();
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let calls = Arc::clone(&calls);
+            let response_text = response_text.clone();
+            move |Json(_body): Json<Value>| {
+                let calls = Arc::clone(&calls);
+                let response_text = response_text.clone();
+                async move {
+                    let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    Json(json!({
+                        "id": format!("chatcmpl-budget-{attempt}"),
+                        "model": "deepseek-v4-flash",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": response_text
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens
+                        }
+                    }))
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake chat server");
+    let addr = listener.local_addr().expect("fake chat server addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let config = crate::config::Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(format!("http://{addr}/v1")),
+        ..crate::config::Config::default()
+    };
+    let client = DeepSeekClient::new(&config).expect("fake chat client");
+    (client, calls)
+}
+
+/// Shared scaffolding for the per-worker token-budget runtime tests: spins up
+/// a general worker against `token_heavy_chat_client` with the given cap and
+/// returns the manager, agent id, call counter, and spawned task handle.
+async fn spawn_budget_capped_worker(
+    workspace: &Path,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    token_budget: Option<u64>,
+    max_steps: u32,
+) -> (
+    Arc<RwLock<SubAgentManager>>,
+    String,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(
+        workspace.to_path_buf(),
+        2,
+    )));
+    let agent_id = "agent_budget_worker".to_string();
+    let (task_input_tx, task_input_rx) = mpsc::unbounded_channel();
+    let agent = SubAgent::new(
+        agent_id.clone(),
+        SubAgentType::General,
+        "Work within budget".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some("Budget".to_string()),
+        Some(vec![]),
+        task_input_tx,
+        workspace.to_path_buf(),
+        "boot_budget".to_string(),
+    );
+    {
+        let mut manager = manager.write().await;
+        manager.agents.insert(agent_id.clone(), agent);
+        manager.register_worker(make_worker_spec(&agent_id, workspace.to_path_buf()));
+    }
+
+    let (client, calls) =
+        token_heavy_chat_client(prompt_tokens, completion_tokens, "partial answer").await;
+    let mut runtime = stub_runtime();
+    runtime.client = client;
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(workspace.to_path_buf());
+
+    let task = SubAgentTask {
+        manager_handle: Arc::clone(&manager),
+        runtime: runtime.clone(),
+        agent_id: agent_id.clone(),
+        agent_type: SubAgentType::General,
+        prompt: "Work within budget".to_string(),
+        assignment: make_assignment(),
+        allowed_tools: Some(vec![]),
+        fork_context: false,
+        started_at: Instant::now(),
+        max_steps,
+        token_budget,
+        input_rx: task_input_rx,
+        launch_gate: None,
+    };
+    let task_handle = tokio::spawn(run_subagent_task(task));
+    (manager, agent_id, calls, task_handle)
+}
+
+#[tokio::test]
+async fn worker_stops_when_per_worker_token_budget_exceeded() {
+    let tmp = tempdir().expect("tempdir");
+    // 100 tokens/turn (60 in + 40 out) vs a 50-token cap: the worker must
+    // stop with `BudgetExhausted` after its very first model turn instead of
+    // running on to `max_steps`.
+    let (manager, agent_id, calls, task_handle) =
+        spawn_budget_capped_worker(tmp.path(), 60, 40, Some(50), 4).await;
+
+    tokio::time::timeout(Duration::from_secs(5), task_handle)
+        .await
+        .expect("budget-capped worker must terminate")
+        .expect("task should finish");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "worker must stop after the first over-budget turn, not run to max_steps"
+    );
+
+    let result = {
+        let manager = manager.read().await;
+        manager.get_result(&agent_id).expect("agent registered")
+    };
+    assert!(
+        matches!(result.status, SubAgentStatus::BudgetExhausted),
+        "expected BudgetExhausted, got {:?}",
+        result.status
+    );
+}
+
+#[tokio::test]
+async fn worker_without_per_worker_token_budget_runs_to_completion() {
+    let tmp = tempdir().expect("tempdir");
+    // No per-worker cap: a final-text response completes the worker normally
+    // even though each turn reports 100 tokens.
+    let (manager, agent_id, calls, task_handle) =
+        spawn_budget_capped_worker(tmp.path(), 60, 40, None, 4).await;
+
+    tokio::time::timeout(Duration::from_secs(5), task_handle)
+        .await
+        .expect("uncapped worker must terminate")
+        .expect("task should finish");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let result = {
+        let manager = manager.read().await;
+        manager.get_result(&agent_id).expect("agent registered")
+    };
+    assert!(
+        matches!(result.status, SubAgentStatus::Completed),
+        "uncapped worker should complete normally, got {:?}",
+        result.status
+    );
+}
+
+#[tokio::test]
+async fn per_worker_token_budget_does_not_double_count_scope_accounting() {
+    let tmp = tempdir().expect("tempdir");
+    // The per-worker runtime cap stops the worker, but the scope-level
+    // accounting (#3319 `aggregate_budget_spent` sums worker_records'
+    // `total_tokens`) must reflect the tokens actually consumed exactly once
+    // — never inflated by the runtime accumulator that triggered the stop.
+    let (manager, agent_id, calls, task_handle) =
+        spawn_budget_capped_worker(tmp.path(), 60, 40, Some(50), 4).await;
+
+    tokio::time::timeout(Duration::from_secs(5), task_handle)
+        .await
+        .expect("budget-capped worker must terminate")
+        .expect("task should finish");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let (result, worker_record) = {
+        let manager = manager.read().await;
+        (
+            manager.get_result(&agent_id).expect("agent registered"),
+            manager.get_worker_record(&agent_id).expect("worker record"),
+        )
+    };
+    assert!(
+        matches!(result.status, SubAgentStatus::BudgetExhausted),
+        "expected BudgetExhausted, got {:?}",
+        result.status
+    );
+    // One turn of 60 in + 40 out = 100 tokens, counted exactly once.
+    assert_eq!(
+        worker_record.usage.total_tokens,
+        Some(100),
+        "scope accounting must equal the single turn's tokens, not double-count: {:?}",
+        worker_record.usage
     );
 }

@@ -150,10 +150,20 @@ pub enum Event {
 
     // === Sub-Agent Events ===
     /// A sub-agent has been spawned
-    AgentSpawned { id: String, prompt: String },
+    AgentSpawned {
+        id: String,
+        prompt: String,
+        parent_run_id: Option<String>,
+        spawn_depth: u32,
+    },
 
     /// Sub-agent progress update
-    AgentProgress { id: String, status: String },
+    AgentProgress {
+        id: String,
+        status: String,
+        parent_run_id: Option<String>,
+        spawn_depth: u32,
+    },
 
     /// Sub-agent completed
     AgentComplete { id: String, result: String },
@@ -207,6 +217,9 @@ pub enum Event {
         /// Displayed in the approval view so users understand *why* the change
         /// is being made before reviewing *what* will change.
         intent_summary: Option<String>,
+        /// When true, the UI must show the prompt instead of consuming
+        /// session/auto approval shortcuts.
+        approval_force_prompt: bool,
     },
 
     /// Request user input for a tool call

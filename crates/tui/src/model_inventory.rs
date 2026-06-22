@@ -223,45 +223,19 @@ fn env_has_key_for(provider: ApiProvider) -> bool {
 }
 
 fn env_keys_for_provider(provider: ApiProvider) -> &'static [&'static str] {
-    match provider {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN => &["DEEPSEEK_API_KEY"],
-        ApiProvider::NvidiaNim => &["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY"],
-        ApiProvider::Openai => &["OPENAI_API_KEY"],
-        ApiProvider::Atlascloud => &["ATLASCLOUD_API_KEY"],
-        ApiProvider::WanjieArk => &[
-            "WANJIE_ARK_API_KEY",
-            "WANJIE_API_KEY",
-            "WANJIE_MAAS_API_KEY",
-        ],
-        ApiProvider::Volcengine => &[
-            "VOLCENGINE_API_KEY",
-            "VOLCENGINE_ARK_API_KEY",
-            "ARK_API_KEY",
-        ],
-        ApiProvider::Openrouter => &["OPENROUTER_API_KEY"],
-        ApiProvider::XiaomiMimo => &["XIAOMI_MIMO_API_KEY", "XIAOMI_API_KEY", "MIMO_API_KEY"],
-        ApiProvider::Novita => &["NOVITA_API_KEY"],
-        ApiProvider::Fireworks => &["FIREWORKS_API_KEY"],
-        ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => &["SILICONFLOW_API_KEY"],
-        ApiProvider::Arcee => &["ARCEE_API_KEY"],
-        ApiProvider::Moonshot => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
-        ApiProvider::Sglang => &["SGLANG_API_KEY"],
-        ApiProvider::Vllm => &["VLLM_API_KEY"],
-        ApiProvider::Ollama => &["OLLAMA_API_KEY"],
-        ApiProvider::Huggingface => &["HUGGINGFACE_API_KEY", "HF_TOKEN"],
-        ApiProvider::Deepinfra => &["DEEPINFRA_API_KEY", "DEEPINFRA_TOKEN"],
-        ApiProvider::Together => &["TOGETHER_API_KEY"],
-        ApiProvider::OpenaiCodex => &["OPENAI_CODEX_ACCESS_TOKEN", "CODEX_ACCESS_TOKEN"],
-        ApiProvider::Anthropic => &["ANTHROPIC_API_KEY"],
-        ApiProvider::Zai => &["ZAI_API_KEY", "Z_AI_API_KEY"],
-        ApiProvider::Stepfun => &["STEPFUN_API_KEY", "STEP_API_KEY"],
-        ApiProvider::Minimax => &["MINIMAX_API_KEY"],
-    }
+    provider.env_vars()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_env_keys_follow_provider_metadata() {
+        for provider in ApiProvider::all() {
+            assert_eq!(env_keys_for_provider(*provider), provider.env_vars());
+        }
+    }
 
     #[test]
     fn inventory_includes_only_usable_authenticated_providers() {

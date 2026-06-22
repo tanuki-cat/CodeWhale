@@ -10,8 +10,8 @@ describes *what will be done* and the invariants any future diet PR must hold.
   Legacy subagent-name cleanup + guardrail tests in this policy rebase on #2684.
 - PR **#2685** — git-history active + RLM/field errors.
 
-All file:line citations are against the verified tree at
-`/Users/huntermbown/Desktop/whalebro/codewhale` as of v0.8.52/0.8.53.
+All file:line citations are against the verified tree at the current CodeWhale
+checkout as of v0.8.52/0.8.53.
 
 ---
 

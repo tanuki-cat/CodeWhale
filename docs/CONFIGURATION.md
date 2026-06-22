@@ -121,7 +121,7 @@ Supported keys in the project overlay (top-level fields only):
 | `sandbox_mode` | `"read-only"` / `"workspace-write"` / `"danger-full-access"` |
 | `mcp_config_path` | per-repo MCP server set |
 | `notes_path` | keep notes in-repo |
-| `max_subagents` | clamp concurrency for a constrained repo (clamped to 1..=20) |
+| `max_subagents` | clamp sub-agent concurrency for a constrained repo (clamped to 1..=20) |
 | `allow_shell` | gate shell tool access on `false` |
 
 The overlay is intentionally narrow — it covers the fields a repo
@@ -827,7 +827,9 @@ Press **Ctrl+S** in the composer to park the current draft to
 drafts with one-line previews and timestamps; `/stash pop`
 restores the most recently parked draft (LIFO); `/stash clear`
 wipes the file. Capped at 200 entries; multiline drafts
-round-trip intact.
+round-trip intact. When a turn is already running and queued follow-ups exist,
+the pending-input preview advertises **Ctrl+S send now**; in that state Ctrl+S
+sends the next queued follow-up into the active turn instead of stashing.
 
 ## Settings File (Persistent UI Preferences)
 
@@ -886,12 +888,16 @@ Common settings keys:
   context panel, `/cost`, `/tokens`, and long-turn notification summaries. The
   aliases `rmb` and `yuan` normalize to `cny`.
 - `default_mode` (agent, plan, yolo; legacy `normal` is accepted and normalized to `agent`)
-- `sidebar_focus` (`auto`, `work`, `tasks`, `agents`, `context`, `hidden`; default
-  `auto`): selects the right sidebar focus. `auto` prioritizes Work, Tasks,
-  Agents, then optional Context, and uses Work as the single quiet empty state.
+- `sidebar_focus` (`pinned`, `auto`, `tasks`, `agents`, `context`, `hidden`; default
+  `pinned`): selects the right sidebar focus. `pinned` keeps the right sidebar
+  visible when the terminal is wide enough and composes Work, Tasks, Agents,
+  and optional Context as they have live content. `auto` uses the same composed
+  panels but collapses while idle. Saving
+  `/sidebar auto --save` records an explicit auto-collapse opt-in so upgraded
+  settings files that only captured the old default can migrate back to `pinned`.
   `hidden` disables the right sidebar entirely so raw terminal selection cannot
   cross from the transcript into sidebar borders. Legacy `plan` and `todos`
-  values are accepted and normalized to `work`.
+  values, plus the old `work` name, are accepted and normalized to `pinned`.
 - `max_history` (number of submitted input history entries; cleared drafts are
   also kept locally for composer history search)
 - `default_model` (model name override)
@@ -953,7 +959,7 @@ If you are upgrading from older releases:
 - `base_url` (string, optional): defaults to `https://api.deepseek.com/beta` for DeepSeek's OpenAI-compatible Chat Completions API, including legacy `provider = "deepseek-cn"` configs. Other defaults are `https://integrate.api.nvidia.com/v1` for `nvidia-nim`, `https://api.openai.com/v1` for `openai`, `https://api.atlascloud.ai/v1` for `atlascloud`, `https://maas-openapi.wanjiedata.com/api/v1` for `wanjie-ark`, `https://ark.cn-beijing.volces.com/api/coding/v3` for `volcengine`, `https://openrouter.ai/api/v1` for `openrouter`, `https://token-plan-sgp.xiaomimimo.com/v1` for `xiaomi-mimo` when the API key starts with `tp-...` and `https://api.xiaomimimo.com/v1` otherwise, `https://api.novita.ai/openai/v1` for `novita`, `https://api.fireworks.ai/inference/v1` for `fireworks`, `https://api.siliconflow.com/v1` for `siliconflow`, `https://api.siliconflow.cn/v1` for `siliconflow-CN`, `https://api.arcee.ai/api/v1` for `arcee`, `https://api.moonshot.ai/v1` for `moonshot`, `https://api.minimax.io/v1` for `minimax`, `https://api.z.ai/api/coding/paas/v4` for `zai`, `https://api.stepfun.ai/v1` for `stepfun`, `https://api.deepinfra.com/v1/openai` for `deepinfra`, `https://router.huggingface.co/v1` for `huggingface`, `https://api.together.xyz/v1` for `together`, `https://chatgpt.com/backend-api` for `openai-codex`, `https://api.anthropic.com` for `anthropic`, `http://localhost:30000/v1` for `sglang`, `http://localhost:8000/v1` for `vllm`, and `http://localhost:11434/v1` for `ollama`. Set `base_url = "https://token-plan-cn.xiaomimimo.com/v1"` explicitly if your Xiaomi MiMo Token Plan account is provisioned in the China region. Set `https://api.deepseek.com` or `https://api.deepseek.com/v1` explicitly to opt out of DeepSeek beta features.
 - `path_suffix` (string, optional provider-table key): override the chat-completions path for OpenAI-compatible gateways that do not serve `/v1/chat/completions`. For example, `[providers.openai] path_suffix = "/chat/completions"` sends chat requests to the unversioned base URL plus `/chat/completions`; `models` and `beta/*` requests keep their normal routing.
 - `insecure_skip_tls_verify` (bool, optional provider-table key): disabled by default. When true on the active provider table, only the LLM provider HTTP client skips TLS certificate verification. Prefer `SSL_CERT_FILE` for corporate or private CA bundles; `codewhale doctor` reports this setting when enabled.
-- `default_text_model` (string, optional): defaults to `deepseek-v4-pro` for DeepSeek and generic OpenAI-compatible endpoints, `deepseek-ai/deepseek-v4-pro` for NVIDIA NIM, `deepseek-ai/deepseek-v4-flash` for AtlasCloud, `deepseek-reasoner` for Wanjie Ark, `DeepSeek-V4-Pro` for Volcengine Ark, `deepseek/deepseek-v4-pro` for OpenRouter and Novita, `mimo-v2.5-pro` for Xiaomi MiMo, `accounts/fireworks/models/deepseek-v4-pro` for Fireworks, `deepseek-ai/DeepSeek-V4-Pro` for SiliconFlow and DeepInfra, `trinity-large-thinking` for Arcee AI, `kimi-k2.7-code` for Moonshot, `MiniMax-M3` for MiniMax, `GLM-5.1` for Z.ai, `step-3.7-flash` for StepFun, `deepseek-ai/DeepSeek-V4-Pro` for SGLang/vLLM, and `deepseek-coder:1.3b` for Ollama. Hugging Face and Together AI both default to `deepseek-ai/DeepSeek-V4-Pro`. Current public DeepSeek IDs are `deepseek-v4-pro` and `deepseek-v4-flash`, both with 1M context windows, 384K max output, and thinking mode enabled by default. Legacy `deepseek-chat` and `deepseek-reasoner` remain compatibility aliases for `deepseek-v4-flash` until July 24, 2026, except SiliconFlow maps `deepseek-reasoner` and `deepseek-r1` to its Pro model while `deepseek-chat` and `deepseek-v3` map to Flash. Provider-specific mappings translate `deepseek-v4-pro` / `deepseek-v4-flash` to each provider's model ID where supported. OpenRouter also recognizes recent large IDs such as `arcee-ai/trinity-large-thinking`, `minimax/minimax-m3`, `minimax/minimax-2.7`, `xiaomi/mimo-v2.5-pro`, `qwen/qwen3.6-flash`, `qwen/qwen3.6-35b-a3b`, `qwen/qwen3.6-max-preview`, `qwen/qwen3.6-27b`, `qwen/qwen3.6-plus`, `qwen/qwen3.7-max`, `google/gemma-4-31b-it`, `moonshotai/kimi-k2.7-code`, `moonshotai/kimi-k2.6`, `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`, and `nvidia/nemotron-3-ultra-550b-a55b`; direct Arcee uses bare IDs such as `trinity-large-thinking` and `trinity-large-preview`; direct Moonshot recognizes `kimi-k2.7-code`, `kimi-k2.6`, and Kimi Code's stable `kimi-for-coding`; direct MiniMax recognizes `MiniMax-M3` and the documented M2.x chat model IDs; direct Xiaomi MiMo recognizes chat IDs `mimo-v2.5-pro` and `mimo-v2.5`, while TTS IDs are selected through `codewhale speech` / `tts`. Generic `openai`, `atlascloud`, `wanjie-ark`, `xiaomi-mimo`, `arcee`, `moonshot`, `minimax`, `zai`, `stepfun`, and Ollama model IDs are passed through unchanged after known aliases are normalized. OpenRouter and SiliconFlow provider configs with a custom `base_url` also preserve explicit model values, which lets OpenAI-compatible gateways accept bare model IDs. Use `/models` or `codewhale models` to discover live IDs from your configured endpoint. `CODEWHALE_MODEL` overrides this for a single process; `DEEPSEEK_MODEL` is the legacy alias.
+- `default_text_model` (string, optional): defaults to `deepseek-v4-pro` for DeepSeek and generic OpenAI-compatible endpoints, `deepseek-ai/deepseek-v4-pro` for NVIDIA NIM, `deepseek-ai/deepseek-v4-flash` for AtlasCloud, `deepseek-reasoner` for Wanjie Ark, `DeepSeek-V4-Pro` for Volcengine Ark, `deepseek/deepseek-v4-pro` for OpenRouter and Novita, `mimo-v2.5-pro` for Xiaomi MiMo, `accounts/fireworks/models/deepseek-v4-pro` for Fireworks, `deepseek-ai/DeepSeek-V4-Pro` for SiliconFlow and DeepInfra, `trinity-large-thinking` for Arcee AI, `kimi-k2.7-code` for Moonshot, `MiniMax-M3` for MiniMax, `GLM-5.2` for Z.ai, `step-3.7-flash` for StepFun, `deepseek-ai/DeepSeek-V4-Pro` for SGLang/vLLM, and `deepseek-coder:1.3b` for Ollama. Hugging Face and Together AI both default to `deepseek-ai/DeepSeek-V4-Pro`. Current public DeepSeek IDs are `deepseek-v4-pro` and `deepseek-v4-flash`, both with 1M context windows, 384K max output, and thinking mode enabled by default. Legacy `deepseek-chat` and `deepseek-reasoner` remain compatibility aliases for `deepseek-v4-flash` until July 24, 2026, except SiliconFlow maps `deepseek-reasoner` and `deepseek-r1` to its Pro model while `deepseek-chat` and `deepseek-v3` map to Flash. Provider-specific mappings translate `deepseek-v4-pro` / `deepseek-v4-flash` to each provider's model ID where supported. OpenRouter also recognizes recent large IDs such as `arcee-ai/trinity-large-thinking`, `minimax/minimax-m3`, `minimax/minimax-2.7`, `xiaomi/mimo-v2.5-pro`, `qwen/qwen3.6-flash`, `qwen/qwen3.6-35b-a3b`, `qwen/qwen3.6-max-preview`, `qwen/qwen3.6-27b`, `qwen/qwen3.6-plus`, `qwen/qwen3.7-max`, `google/gemma-4-31b-it`, `moonshotai/kimi-k2.7-code`, `moonshotai/kimi-k2.6`, `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`, and `nvidia/nemotron-3-ultra-550b-a55b`; direct Arcee uses bare IDs such as `trinity-large-thinking` and `trinity-large-preview`; direct Moonshot recognizes `kimi-k2.7-code`, `kimi-k2.6`, and Kimi Code's stable `kimi-for-coding`; direct MiniMax recognizes `MiniMax-M3` and the documented M2.x chat model IDs; direct Xiaomi MiMo recognizes chat IDs `mimo-v2.5-pro` and `mimo-v2.5`, while TTS IDs are selected through `codewhale speech` / `tts`. Generic `openai`, `atlascloud`, `wanjie-ark`, `xiaomi-mimo`, `arcee`, `moonshot`, `minimax`, `zai`, `stepfun`, and Ollama model IDs are passed through unchanged after known aliases are normalized. OpenRouter and SiliconFlow provider configs with a custom `base_url` also preserve explicit model values, which lets OpenAI-compatible gateways accept bare model IDs. Use `/models` or `codewhale models` to discover live IDs from your configured endpoint. `CODEWHALE_MODEL` overrides this for a single process; `DEEPSEEK_MODEL` is the legacy alias.
 - `reasoning_effort` (string, optional): `off`, `low`, `medium`, `high`, `max`, `xhigh`, or `ultracode`; defaults to the configured UI tier. DeepSeek Platform receives top-level `thinking` / `reasoning_effort` fields. OpenAI Codex normalizes stale `off` to `low` and sends `max` / `ultracode` as Responses `xhigh`. Z.ai receives documented `thinking` controls and treats enabled thinking as the GLM coding high/max lane. NVIDIA NIM receives equivalent settings through `chat_template_kwargs`.
 - `verbosity` (string, optional): `normal` or `concise`. `normal` keeps the
   default conversational prompt. `concise` appends a prompt discipline block
@@ -985,22 +991,64 @@ If you are upgrading from older releases:
   Explicit tool `model` values win, then role/type
   overrides, then the parent runtime model. Supported convenience keys are
   `default_model`, `worker_model`, `explorer_model`, `awaiter_model`,
-  `review_model`, `custom_model`, `max_concurrent`, `launch_concurrency`,
-  `api_timeout_secs`, and `heartbeat_timeout_secs`. The `[subagents]
-  max_concurrent` value overrides top-level `max_subagents` and is also clamped
-  to `1..=20`. `[subagents] launch_concurrency` sets how many direct children
-  start at once before the rest queue for a launch slot; it defaults to the
-  resolved `max_subagents` cap and is clamped to `1..=max_subagents` (the
-  deprecated `interactive_max_launch` key is accepted as an alias, with the new
-  key winning when both are set). `[subagents]
-  api_timeout_secs` controls the per-step API timeout for sub-agent model calls
-  and is clamped to `1..=1800`, with `0` or unset preserving the legacy 120
-  second default. `[subagents] heartbeat_timeout_secs` controls stale running
-  agent cleanup, defaults to `300`, and is clamped to `30..=3600` while staying
-  above the resolved API timeout.
+  `review_model`, `custom_model`, `max_concurrent`, `max_admitted`,
+  `launch_concurrency`, `token_budget`, `api_timeout_secs`, and
+  `heartbeat_timeout_secs`. The `[subagents] max_concurrent` value overrides
+  top-level `max_subagents` and is also clamped to `1..=20`. `[subagents]
+  max_admitted` (aliases: `max_total`, `admission_limit`) is the bounded total
+  of queued plus running sub-agents; it defaults to `200` so high-fanout turns
+  can queue and drain while runtime launch pressure remains bounded, and is
+  clamped to `max_concurrent..=200`. `[subagents]
+  launch_concurrency` sets how many direct children start at once before the
+  rest queue for a launch slot; it defaults to the resolved `max_subagents` cap
+  and is clamped to `1..=max_subagents` (the deprecated
+  `interactive_max_launch` key is accepted as an alias, with the new key
+  winning when both are set). `[subagents] token_budget` is an optional
+  aggregate token ceiling for each root `agent` run and its descendants; unset
+  or `0` preserves unlimited legacy behavior. `[subagents] api_timeout_secs`
+  controls the per-step API timeout for sub-agent model calls and is clamped to
+  `1..=1800`, with `0` or unset preserving the legacy 120 second default.
+  `[subagents] heartbeat_timeout_secs` controls stale running agent cleanup,
+  defaults to `300`, and is clamped to `30..=3600` while staying above the
+  resolved API timeout. `[subagents.providers.<provider>]` accepts the same
+  fanout, depth, budget, and timeout knobs (`enabled`, `max_concurrent`,
+  `max_admitted`, `launch_concurrency`, `max_depth`, `token_budget`,
+  `api_timeout_secs`, `heartbeat_timeout_secs`) and inherits the global
+  `[subagents]` value for any key you omit. Provider keys accept canonical
+  names such as `deepseek`, `zai`, `openrouter`, `anthropic`, plus convenience
+  aliases such as `glm` for Z.ai and `deepseek_api` for direct DeepSeek:
+
+  ```toml
+  [subagents]
+  max_concurrent = 20
+  launch_concurrency = 20
+  max_admitted = 200
+  max_depth = 6
+
+  [subagents.providers.deepseek]
+  max_concurrent = 20
+  launch_concurrency = 20
+  max_admitted = 200
+
+  [subagents.providers.glm]
+  max_concurrent = 4
+  launch_concurrency = 3
+  max_admitted = 12
+  max_depth = 2
+
+  [subagents.providers.openrouter]
+  max_concurrent = 5
+  launch_concurrency = 3
+  max_admitted = 20
+  ```
+
+  `/config subagents status` prints both global values and the active
+  provider's resolved profile so rate-limit tuning is visible in the TUI.
   `[subagents.models]` accepts lower-case role or type keys such as `worker`,
-  `explorer`, `general`, `explore`, `plan`, and `review`. Values must normalize
-  to a supported DeepSeek model id before an agent is spawned.
+  `explorer`, `general`, `explore`, `plan`, and `review`. Values are validated
+  against the active provider at spawn time; direct DeepSeek requires DeepSeek
+  IDs, while OpenAI-compatible/custom provider routes pass explicit model IDs
+  through to that provider.
 - `skills_dir` (string, optional): defaults to `~/.codewhale/skills` (each skill is
   a directory containing `SKILL.md`). Workspace-local `.agents/skills` or
   `./skills` are preferred when present; the runtime also discovers global
@@ -1010,6 +1058,11 @@ If you are upgrading from older releases:
   documents, presentations, spreadsheets, PDFs, and Feishu/Lark. See
   [CLAUDE_PLUGIN_COMPAT.md](CLAUDE_PLUGIN_COMPAT.md) for the supported boundary
   between portable `SKILL.md` bundles and Claude Code plugin runtimes.
+- `[skills].scan_codewhale_only` (bool, default `false`): when `true`, session
+  skill discovery ignores cross-tool roots such as `.claude/skills`,
+  `.opencode/skills`, `.cursor/skills`, and `~/.agents/skills`. CodeWhale still
+  scans `<workspace>/.codewhale/skills`, `~/.codewhale/skills`, and any explicit
+  `skills_dir` override.
 - `mcp_config_path` (string, optional): defaults to `~/.codewhale/mcp.json`, with
   legacy `~/.deepseek/mcp.json` fallback when the CodeWhale path is absent.
   It is visible in `/config` and can be changed from the TUI. The new path is
@@ -1091,7 +1144,7 @@ If you are upgrading from older releases:
 - `tui.mouse_capture` (bool, optional, default `true` on non-Windows terminals and on Windows Terminal/ConEmu/Cmder when the alternate screen is active; `false` on legacy Windows console and inside JetBrains JediTerm — PyCharm/IDEA/CLion/etc. — where mouse-event escapes leak into the input stream as garbled text, see #878 / #898): enable internal mouse scrolling, transcript selection, right-click context actions, and transcript scrollbar dragging. TUI-owned drag selection copies only transcript text, removes visual wrap-column line breaks from paragraphs, and keeps selection scoped to the transcript pane. Set this to `false` or run with `--no-mouse-capture` for raw terminal selection; set it to `true` or run with `--mouse-capture` to opt in anywhere it's defaulted off. On raw terminal selection, especially on legacy Windows console or when mouse capture is disabled, selection may cross the right sidebar and include visual wraps because the terminal, not the TUI, owns the selection.
 - `tui.terminal_probe_timeout_ms` (int, optional, default `500`): startup terminal-mode probe timeout in milliseconds. Values are clamped to `100..=5000`; timeout emits a warning and aborts startup instead of hanging indefinitely.
 - `tui.stream_chunk_timeout_secs` (int, optional, default `300`): per-SSE-chunk idle timeout for streamed model responses. Slow local or compatible servers can raise this with `/config stream_chunk_timeout_secs <seconds>`; `0` maps to the default and explicit values must be `1..=3600`. The legacy `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` env var is still honored when this key is omitted.
-- `tui.osc8_links` (bool, optional, default `true`): emit OSC 8 escape sequences around URLs in transcript output so terminals that support them (iTerm2, Terminal.app 13+, Ghostty, Kitty, WezTerm, Alacritty, recent gnome-terminal/konsole) render them as Cmd+click hyperlinks. Terminals without OSC 8 support render the plain URL and ignore the escape. Set `false` for terminals that misrender the sequence; selection/clipboard output always strips the escapes.
+- `tui.osc8_links` (bool, optional, default on for macOS/Linux, off for Windows): emit OSC 8 escape sequences around URLs in transcript output so terminals that support them (iTerm2, Terminal.app 13+, Ghostty, Kitty, WezTerm, Alacritty, recent gnome-terminal/konsole) render them as Cmd+click hyperlinks. Terminals without OSC 8 support render the plain URL and ignore the escape. The escapes are emitted out-of-band (not inside buffer cells), so column corruption is not a concern; set `false` only for terminals that misrender the OSC 8 terminator itself. Windows legacy consoles default off; opt in with `true`.
 - `hooks` (optional): lifecycle hooks configuration (see `config.example.toml`).
 - `features.*` (optional): feature flag overrides (see below).
 

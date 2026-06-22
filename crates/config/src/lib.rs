@@ -105,8 +105,14 @@ const DEFAULT_OLLAMA_MODEL: &str = "deepseek-coder:1.3b";
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 
 // Z.ai (GLM Coding Plan) defaults
-const DEFAULT_ZAI_MODEL: &str = "GLM-5.1";
+const DEFAULT_ZAI_MODEL: &str = "GLM-5.2";
+const ZAI_GLM_5_1_MODEL: &str = "GLM-5.1";
+// GLM-5.2 is both the default and a named tier; the alias arm resolves the
+// `glm-5.2` spelling to DEFAULT_ZAI_MODEL directly, so this constant is only
+// referenced by the invariant test below.
+#[allow(dead_code)]
 const ZAI_GLM_5_2_MODEL: &str = "GLM-5.2";
+const ZAI_GLM_5_TURBO_MODEL: &str = "GLM-5-Turbo";
 const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 // StepFun / StepFlash defaults
 const DEFAULT_STEPFUN_MODEL: &str = "step-3.7-flash";
@@ -229,32 +235,7 @@ impl ProviderKind {
 
     #[must_use]
     pub fn all() -> &'static [Self] {
-        &[
-            Self::Deepseek,
-            Self::NvidiaNim,
-            Self::Openai,
-            Self::Atlascloud,
-            Self::WanjieArk,
-            Self::Volcengine,
-            Self::Openrouter,
-            Self::XiaomiMimo,
-            Self::Novita,
-            Self::Fireworks,
-            Self::Siliconflow,
-            Self::SiliconflowCN,
-            Self::Arcee,
-            Self::Moonshot,
-            Self::Sglang,
-            Self::Vllm,
-            Self::Ollama,
-            Self::Huggingface,
-            Self::Together,
-            Self::OpenaiCodex,
-            Self::Anthropic,
-            Self::Zai,
-            Self::Stepfun,
-            Self::Minimax,
-        ]
+        &Self::ALL
     }
 
     #[must_use]
@@ -678,6 +659,258 @@ pub struct ConfigToml {
     pub fleet: Option<FleetConfigToml>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderConfigField {
+    ApiKey,
+    BaseUrl,
+    Model,
+    Mode,
+    AuthMode,
+    InsecureSkipTlsVerify,
+    HttpHeaders,
+    PathSuffix,
+}
+
+impl ProviderConfigField {
+    fn parse(key: &str) -> Option<Self> {
+        Some(match key {
+            "api_key" => Self::ApiKey,
+            "base_url" => Self::BaseUrl,
+            "model" => Self::Model,
+            "mode" => Self::Mode,
+            "auth_mode" => Self::AuthMode,
+            "insecure_skip_tls_verify" => Self::InsecureSkipTlsVerify,
+            "http_headers" => Self::HttpHeaders,
+            "path_suffix" => Self::PathSuffix,
+            _ => return None,
+        })
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::BaseUrl => "base_url",
+            Self::Model => "model",
+            Self::Mode => "mode",
+            Self::AuthMode => "auth_mode",
+            Self::InsecureSkipTlsVerify => "insecure_skip_tls_verify",
+            Self::HttpHeaders => "http_headers",
+            Self::PathSuffix => "path_suffix",
+        }
+    }
+}
+
+fn parse_provider_config_key(key: &str) -> Option<(ProviderKind, ProviderConfigField)> {
+    let suffix = key.strip_prefix("providers.")?;
+    let (provider_key, field_key) = suffix.split_once('.')?;
+    let field = ProviderConfigField::parse(field_key)?;
+    let provider = ProviderKind::ALL
+        .iter()
+        .copied()
+        .find(|kind| kind.provider().provider_config_key() == provider_key)?;
+    Some((provider, field))
+}
+
+fn provider_config_key(provider: ProviderKind, field: ProviderConfigField) -> String {
+    format!(
+        "providers.{}.{}",
+        provider.provider().provider_config_key(),
+        field.key()
+    )
+}
+
+fn get_provider_config_value(
+    config: &ProviderConfigToml,
+    field: ProviderConfigField,
+) -> Option<String> {
+    match field {
+        ProviderConfigField::ApiKey => config.api_key.clone(),
+        ProviderConfigField::BaseUrl => config.base_url.clone(),
+        ProviderConfigField::Model => config.model.clone(),
+        ProviderConfigField::Mode => config.mode.clone(),
+        ProviderConfigField::AuthMode => config.auth_mode.clone(),
+        ProviderConfigField::InsecureSkipTlsVerify => config
+            .insecure_skip_tls_verify
+            .map(|value| value.to_string()),
+        ProviderConfigField::HttpHeaders => serialize_http_headers(&config.http_headers),
+        ProviderConfigField::PathSuffix => config.path_suffix.clone(),
+    }
+}
+
+fn get_provider_config_display_value(
+    config: &ProviderConfigToml,
+    field: ProviderConfigField,
+) -> Option<String> {
+    match field {
+        ProviderConfigField::ApiKey => config.api_key.as_deref().map(redact_secret),
+        ProviderConfigField::HttpHeaders => {
+            serialize_http_headers_for_display(&config.http_headers)
+        }
+        _ => get_provider_config_value(config, field),
+    }
+}
+
+fn set_provider_config_value(
+    config: &mut ConfigToml,
+    provider: ProviderKind,
+    field: ProviderConfigField,
+    value: &str,
+) -> Result<()> {
+    match field {
+        ProviderConfigField::ApiKey => {
+            let value = value.to_string();
+            config.providers.for_provider_mut(provider).api_key = Some(value.clone());
+            if provider == ProviderKind::Deepseek {
+                config.api_key = Some(value);
+            }
+        }
+        ProviderConfigField::BaseUrl => {
+            let value = value.to_string();
+            config.providers.for_provider_mut(provider).base_url = Some(value.clone());
+            if provider == ProviderKind::Deepseek {
+                config.base_url = Some(value);
+            }
+        }
+        ProviderConfigField::Model => {
+            let value = value.to_string();
+            config.providers.for_provider_mut(provider).model = Some(value.clone());
+            if provider == ProviderKind::Deepseek {
+                config.default_text_model = Some(value);
+            }
+        }
+        ProviderConfigField::Mode => {
+            config.providers.for_provider_mut(provider).mode = Some(value.to_string());
+        }
+        ProviderConfigField::AuthMode => {
+            config.providers.for_provider_mut(provider).auth_mode = Some(value.to_string());
+        }
+        ProviderConfigField::InsecureSkipTlsVerify => {
+            config
+                .providers
+                .for_provider_mut(provider)
+                .insecure_skip_tls_verify = Some(parse_bool(value)?);
+        }
+        ProviderConfigField::HttpHeaders => {
+            let headers = parse_http_headers(value)?;
+            config.providers.for_provider_mut(provider).http_headers = headers.clone();
+            if provider == ProviderKind::Deepseek {
+                config.http_headers = headers;
+            }
+        }
+        ProviderConfigField::PathSuffix => {
+            config.providers.for_provider_mut(provider).path_suffix = Some(value.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn unset_provider_config_value(
+    config: &mut ConfigToml,
+    provider: ProviderKind,
+    field: ProviderConfigField,
+) {
+    match field {
+        ProviderConfigField::ApiKey => {
+            config.providers.for_provider_mut(provider).api_key = None;
+            if provider == ProviderKind::Deepseek {
+                config.api_key = None;
+            }
+        }
+        ProviderConfigField::BaseUrl => {
+            config.providers.for_provider_mut(provider).base_url = None;
+            if provider == ProviderKind::Deepseek {
+                config.base_url = None;
+            }
+        }
+        ProviderConfigField::Model => {
+            config.providers.for_provider_mut(provider).model = None;
+            if provider == ProviderKind::Deepseek {
+                config.default_text_model = None;
+            }
+        }
+        ProviderConfigField::Mode => {
+            config.providers.for_provider_mut(provider).mode = None;
+        }
+        ProviderConfigField::AuthMode => {
+            config.providers.for_provider_mut(provider).auth_mode = None;
+        }
+        ProviderConfigField::InsecureSkipTlsVerify => {
+            config
+                .providers
+                .for_provider_mut(provider)
+                .insecure_skip_tls_verify = None;
+        }
+        ProviderConfigField::HttpHeaders => {
+            config
+                .providers
+                .for_provider_mut(provider)
+                .http_headers
+                .clear();
+            if provider == ProviderKind::Deepseek {
+                config.http_headers.clear();
+            }
+        }
+        ProviderConfigField::PathSuffix => {
+            config.providers.for_provider_mut(provider).path_suffix = None;
+        }
+    }
+}
+
+fn insert_provider_config_values(
+    out: &mut BTreeMap<String, String>,
+    provider: ProviderKind,
+    config: &ProviderConfigToml,
+) {
+    if let Some(v) = config.api_key.as_ref() {
+        out.insert(
+            provider_config_key(provider, ProviderConfigField::ApiKey),
+            redact_secret(v),
+        );
+    }
+    if let Some(v) = config.base_url.as_ref() {
+        out.insert(
+            provider_config_key(provider, ProviderConfigField::BaseUrl),
+            v.clone(),
+        );
+    }
+    if let Some(v) = config.model.as_ref() {
+        out.insert(
+            provider_config_key(provider, ProviderConfigField::Model),
+            v.clone(),
+        );
+    }
+    if let Some(v) = config.mode.as_ref() {
+        out.insert(
+            provider_config_key(provider, ProviderConfigField::Mode),
+            v.clone(),
+        );
+    }
+    if let Some(v) = config.auth_mode.as_ref() {
+        out.insert(
+            provider_config_key(provider, ProviderConfigField::AuthMode),
+            v.clone(),
+        );
+    }
+    if let Some(v) = config.insecure_skip_tls_verify {
+        out.insert(
+            provider_config_key(provider, ProviderConfigField::InsecureSkipTlsVerify),
+            v.to_string(),
+        );
+    }
+    if let Some(v) = serialize_http_headers_for_display(&config.http_headers) {
+        out.insert(
+            provider_config_key(provider, ProviderConfigField::HttpHeaders),
+            v,
+        );
+    }
+    if let Some(v) = config.path_suffix.as_ref() {
+        out.insert(
+            provider_config_key(provider, ProviderConfigField::PathSuffix),
+            v.clone(),
+        );
+    }
 }
 
 impl ConfigToml {
@@ -1107,7 +1340,7 @@ pub struct FleetConfigToml {
 /// workers so the two cannot drift into "two moving targets":
 /// - [`DEFAULT_SPAWN_DEPTH`] is the default recursion budget (the sub-agent
 ///   runtime's `DEFAULT_MAX_SPAWN_DEPTH` is defined as this value).
-/// - [`MAX_SPAWN_DEPTH_CEILING`] is the hard safety cap; every configured
+/// - [`MAX_SPAWN_DEPTH_CEILING`] is the opt-in safety cap; every configured
 ///   value (fleet `max_spawn_depth`, the `agent` tool's `max_depth`) clamps to it.
 ///
 /// A worker runs at `spawn_depth = 0` and may spawn while
@@ -1117,10 +1350,12 @@ pub struct FleetConfigToml {
 /// depth 0 even when the budget is 0.
 pub const DEFAULT_SPAWN_DEPTH: u32 = 3;
 
-/// Hard ceiling on recursion depth for any worker/sub-agent. See
-/// [`DEFAULT_SPAWN_DEPTH`]. Raising this single constant lifts the limit
-/// everywhere (the fleet clamp and `agent` validation both read it).
-pub const MAX_SPAWN_DEPTH_CEILING: u32 = 3;
+/// Hard ceiling on recursion depth for any worker/sub-agent. The default stays
+/// conservative at [`DEFAULT_SPAWN_DEPTH`], while explicit config can opt into
+/// deeper trees for direct-API providers that can tolerate the fanout.
+/// Raising this single constant lifts the limit everywhere (the fleet clamp
+/// and `agent` validation both read it).
+pub const MAX_SPAWN_DEPTH_CEILING: u32 = 8;
 
 /// Headless worker execution constraints (#3027).
 ///
@@ -1401,55 +1636,20 @@ impl ConfigToml {
         if project.tools.is_some() {
             self.tools = project.tools;
         }
-        merge_project_provider_config(&mut self.providers.deepseek, &project.providers.deepseek);
-        merge_project_provider_config(
-            &mut self.providers.nvidia_nim,
-            &project.providers.nvidia_nim,
-        );
-        merge_project_provider_config(&mut self.providers.openai, &project.providers.openai);
-        merge_project_provider_config(
-            &mut self.providers.atlascloud,
-            &project.providers.atlascloud,
-        );
-        merge_project_provider_config(
-            &mut self.providers.wanjie_ark,
-            &project.providers.wanjie_ark,
-        );
-        merge_project_provider_config(
-            &mut self.providers.volcengine,
-            &project.providers.volcengine,
-        );
-        merge_project_provider_config(
-            &mut self.providers.openrouter,
-            &project.providers.openrouter,
-        );
-        merge_project_provider_config(
-            &mut self.providers.xiaomi_mimo,
-            &project.providers.xiaomi_mimo,
-        );
-        merge_project_provider_config(&mut self.providers.novita, &project.providers.novita);
-        merge_project_provider_config(&mut self.providers.fireworks, &project.providers.fireworks);
-        merge_project_provider_config(
-            &mut self.providers.siliconflow,
-            &project.providers.siliconflow,
-        );
-        merge_project_provider_config(
-            &mut self.providers.siliconflow_cn,
-            &project.providers.siliconflow_cn,
-        );
-        merge_project_provider_config(&mut self.providers.arcee, &project.providers.arcee);
-        merge_project_provider_config(&mut self.providers.moonshot, &project.providers.moonshot);
-        merge_project_provider_config(&mut self.providers.sglang, &project.providers.sglang);
-        merge_project_provider_config(&mut self.providers.vllm, &project.providers.vllm);
-        merge_project_provider_config(&mut self.providers.ollama, &project.providers.ollama);
-        merge_project_provider_config(
-            &mut self.providers.huggingface,
-            &project.providers.huggingface,
-        );
+        for provider in ProviderKind::ALL {
+            merge_project_provider_config(
+                self.providers.for_provider_mut(provider),
+                project.providers.for_provider(provider),
+            );
+        }
     }
 
     #[must_use]
     pub fn get_value(&self, key: &str) -> Option<String> {
+        if let Some((provider, field)) = parse_provider_config_key(key) {
+            return get_provider_config_value(self.providers.for_provider(provider), field);
+        }
+
         match key {
             "provider" => Some(self.provider.as_str().to_string()),
             "api_key" => self.api_key.clone(),
@@ -1470,128 +1670,24 @@ impl ConfigToml {
                 .as_ref()
                 .and_then(|sinks| sinks.unix_socket_path.as_ref())
                 .map(|path| path.display().to_string()),
-            "providers.deepseek.api_key" => self.providers.deepseek.api_key.clone(),
-            "providers.deepseek.base_url" => self.providers.deepseek.base_url.clone(),
-            "providers.deepseek.model" => self.providers.deepseek.model.clone(),
-            "providers.deepseek.http_headers" => {
-                serialize_http_headers(&self.providers.deepseek.http_headers)
-            }
-            "providers.nvidia_nim.api_key" => self.providers.nvidia_nim.api_key.clone(),
-            "providers.nvidia_nim.base_url" => self.providers.nvidia_nim.base_url.clone(),
-            "providers.nvidia_nim.model" => self.providers.nvidia_nim.model.clone(),
-            "providers.nvidia_nim.http_headers" => {
-                serialize_http_headers(&self.providers.nvidia_nim.http_headers)
-            }
-            "providers.openai.api_key" => self.providers.openai.api_key.clone(),
-            "providers.openai.base_url" => self.providers.openai.base_url.clone(),
-            "providers.openai.model" => self.providers.openai.model.clone(),
-            "providers.openai.http_headers" => {
-                serialize_http_headers(&self.providers.openai.http_headers)
-            }
-            "providers.atlascloud.api_key" => self.providers.atlascloud.api_key.clone(),
-            "providers.atlascloud.base_url" => self.providers.atlascloud.base_url.clone(),
-            "providers.atlascloud.model" => self.providers.atlascloud.model.clone(),
-            "providers.atlascloud.http_headers" => {
-                serialize_http_headers(&self.providers.atlascloud.http_headers)
-            }
-            "providers.wanjie_ark.api_key" => self.providers.wanjie_ark.api_key.clone(),
-            "providers.wanjie_ark.base_url" => self.providers.wanjie_ark.base_url.clone(),
-            "providers.wanjie_ark.model" => self.providers.wanjie_ark.model.clone(),
-            "providers.volcengine.api_key" => self.providers.volcengine.api_key.clone(),
-            "providers.volcengine.base_url" => self.providers.volcengine.base_url.clone(),
-            "providers.volcengine.model" => self.providers.volcengine.model.clone(),
-            "providers.volcengine.http_headers" => {
-                serialize_http_headers(&self.providers.volcengine.http_headers)
-            }
-            "providers.wanjie_ark.http_headers" => {
-                serialize_http_headers(&self.providers.wanjie_ark.http_headers)
-            }
-            "providers.openrouter.api_key" => self.providers.openrouter.api_key.clone(),
-            "providers.openrouter.base_url" => self.providers.openrouter.base_url.clone(),
-            "providers.openrouter.model" => self.providers.openrouter.model.clone(),
-            "providers.openrouter.http_headers" => {
-                serialize_http_headers(&self.providers.openrouter.http_headers)
-            }
-            "providers.xiaomi_mimo.api_key" => self.providers.xiaomi_mimo.api_key.clone(),
-            "providers.xiaomi_mimo.base_url" => self.providers.xiaomi_mimo.base_url.clone(),
-            "providers.xiaomi_mimo.model" => self.providers.xiaomi_mimo.model.clone(),
-            "providers.xiaomi_mimo.mode" => self.providers.xiaomi_mimo.mode.clone(),
-            "providers.xiaomi_mimo.http_headers" => {
-                serialize_http_headers(&self.providers.xiaomi_mimo.http_headers)
-            }
-            "providers.novita.api_key" => self.providers.novita.api_key.clone(),
-            "providers.novita.base_url" => self.providers.novita.base_url.clone(),
-            "providers.novita.model" => self.providers.novita.model.clone(),
-            "providers.novita.http_headers" => {
-                serialize_http_headers(&self.providers.novita.http_headers)
-            }
-            "providers.fireworks.api_key" => self.providers.fireworks.api_key.clone(),
-            "providers.fireworks.base_url" => self.providers.fireworks.base_url.clone(),
-            "providers.fireworks.model" => self.providers.fireworks.model.clone(),
-            "providers.fireworks.http_headers" => {
-                serialize_http_headers(&self.providers.fireworks.http_headers)
-            }
-            "providers.siliconflow.api_key" => self.providers.siliconflow.api_key.clone(),
-            "providers.siliconflow.base_url" => self.providers.siliconflow.base_url.clone(),
-            "providers.siliconflow.model" => self.providers.siliconflow.model.clone(),
-            "providers.siliconflow.http_headers" => {
-                serialize_http_headers(&self.providers.siliconflow.http_headers)
-            }
-            "providers.siliconflow_cn.api_key" => self.providers.siliconflow_cn.api_key.clone(),
-            "providers.siliconflow_cn.base_url" => self.providers.siliconflow_cn.base_url.clone(),
-            "providers.siliconflow_cn.model" => self.providers.siliconflow_cn.model.clone(),
-            "providers.siliconflow_cn.http_headers" => {
-                serialize_http_headers(&self.providers.siliconflow_cn.http_headers)
-            }
-            "providers.arcee.api_key" => self.providers.arcee.api_key.clone(),
-            "providers.arcee.base_url" => self.providers.arcee.base_url.clone(),
-            "providers.arcee.model" => self.providers.arcee.model.clone(),
-            "providers.arcee.http_headers" => {
-                serialize_http_headers(&self.providers.arcee.http_headers)
-            }
-            "providers.moonshot.api_key" => self.providers.moonshot.api_key.clone(),
-            "providers.moonshot.base_url" => self.providers.moonshot.base_url.clone(),
-            "providers.moonshot.model" => self.providers.moonshot.model.clone(),
-            "providers.moonshot.auth_mode" => self.providers.moonshot.auth_mode.clone(),
-            "providers.moonshot.http_headers" => {
-                serialize_http_headers(&self.providers.moonshot.http_headers)
-            }
-            "providers.sglang.api_key" => self.providers.sglang.api_key.clone(),
-            "providers.sglang.base_url" => self.providers.sglang.base_url.clone(),
-            "providers.sglang.model" => self.providers.sglang.model.clone(),
-            "providers.sglang.http_headers" => {
-                serialize_http_headers(&self.providers.sglang.http_headers)
-            }
-            "providers.vllm.api_key" => self.providers.vllm.api_key.clone(),
-            "providers.vllm.base_url" => self.providers.vllm.base_url.clone(),
-            "providers.vllm.model" => self.providers.vllm.model.clone(),
-            "providers.vllm.http_headers" => {
-                serialize_http_headers(&self.providers.vllm.http_headers)
-            }
-            "providers.ollama.api_key" => self.providers.ollama.api_key.clone(),
-            "providers.ollama.base_url" => self.providers.ollama.base_url.clone(),
-            "providers.ollama.model" => self.providers.ollama.model.clone(),
-            "providers.ollama.http_headers" => {
-                serialize_http_headers(&self.providers.ollama.http_headers)
-            }
-            "providers.huggingface.api_key" => self.providers.huggingface.api_key.clone(),
-            "providers.huggingface.base_url" => self.providers.huggingface.base_url.clone(),
-            "providers.huggingface.model" => self.providers.huggingface.model.clone(),
-            "providers.huggingface.http_headers" => {
-                serialize_http_headers(&self.providers.huggingface.http_headers)
-            }
-            "providers.together.api_key" => self.providers.together.api_key.clone(),
-            "providers.together.base_url" => self.providers.together.base_url.clone(),
-            "providers.together.model" => self.providers.together.model.clone(),
-            "providers.together.http_headers" => {
-                serialize_http_headers(&self.providers.together.http_headers)
-            }
             _ => self.extras.get(key).map(toml::Value::to_string),
         }
     }
 
     #[must_use]
     pub fn get_display_value(&self, key: &str) -> Option<String> {
+        if let Some((provider, field)) = parse_provider_config_key(key) {
+            return get_provider_config_display_value(self.providers.for_provider(provider), field);
+        }
+
+        if key == "http_headers" {
+            return serialize_http_headers_for_display(&self.http_headers);
+        }
+
+        if let Some(value) = self.extras.get(key) {
+            return Some(redact_toml_value_for_display(key, value));
+        }
+
         self.get_value(key).map(|value| {
             if is_sensitive_config_key(key) {
                 redact_secret(&value)
@@ -1602,6 +1698,10 @@ impl ConfigToml {
     }
 
     pub fn set_value(&mut self, key: &str, value: &str) -> Result<()> {
+        if let Some((provider, field)) = parse_provider_config_key(key) {
+            return set_provider_config_value(self, provider, field, value);
+        }
+
         match key {
             "provider" => {
                 self.provider = ProviderKind::parse(value).with_context(|| {
@@ -1630,242 +1730,6 @@ impl ConfigToml {
                     .get_or_insert_with(HookSinksToml::default)
                     .unix_socket_path = Some(PathBuf::from(value));
             }
-            "providers.deepseek.api_key" => {
-                let value = value.to_string();
-                self.providers.deepseek.api_key = Some(value.clone());
-                self.api_key = Some(value);
-            }
-            "providers.deepseek.base_url" => {
-                let value = value.to_string();
-                self.providers.deepseek.base_url = Some(value.clone());
-                self.base_url = Some(value);
-            }
-            "providers.deepseek.model" => {
-                let value = value.to_string();
-                self.providers.deepseek.model = Some(value.clone());
-                self.default_text_model = Some(value);
-            }
-            "providers.deepseek.http_headers" => {
-                let headers = parse_http_headers(value)?;
-                self.providers.deepseek.http_headers = headers.clone();
-                self.http_headers = headers;
-            }
-            "providers.openai.api_key" => self.providers.openai.api_key = Some(value.to_string()),
-            "providers.openai.base_url" => self.providers.openai.base_url = Some(value.to_string()),
-            "providers.openai.model" => self.providers.openai.model = Some(value.to_string()),
-            "providers.openai.http_headers" => {
-                self.providers.openai.http_headers = parse_http_headers(value)?;
-            }
-            "providers.atlascloud.api_key" => {
-                self.providers.atlascloud.api_key = Some(value.to_string());
-            }
-            "providers.atlascloud.base_url" => {
-                self.providers.atlascloud.base_url = Some(value.to_string());
-            }
-            "providers.atlascloud.model" => {
-                self.providers.atlascloud.model = Some(value.to_string());
-            }
-            "providers.atlascloud.http_headers" => {
-                self.providers.atlascloud.http_headers = parse_http_headers(value)?;
-            }
-            "providers.wanjie_ark.api_key" => {
-                self.providers.wanjie_ark.api_key = Some(value.to_string());
-            }
-            "providers.wanjie_ark.base_url" => {
-                self.providers.wanjie_ark.base_url = Some(value.to_string());
-            }
-            "providers.wanjie_ark.model" => {
-                self.providers.wanjie_ark.model = Some(value.to_string());
-            }
-            "providers.volcengine.api_key" => {
-                self.providers.volcengine.api_key = Some(value.to_string());
-            }
-            "providers.volcengine.base_url" => {
-                self.providers.volcengine.base_url = Some(value.to_string());
-            }
-            "providers.volcengine.model" => {
-                self.providers.volcengine.model = Some(value.to_string());
-            }
-            "providers.volcengine.http_headers" => {
-                self.providers.volcengine.http_headers = parse_http_headers(value)?;
-            }
-            "providers.wanjie_ark.http_headers" => {
-                self.providers.wanjie_ark.http_headers = parse_http_headers(value)?;
-            }
-            "providers.nvidia_nim.api_key" => {
-                self.providers.nvidia_nim.api_key = Some(value.to_string());
-            }
-            "providers.nvidia_nim.base_url" => {
-                self.providers.nvidia_nim.base_url = Some(value.to_string());
-            }
-            "providers.nvidia_nim.model" => {
-                self.providers.nvidia_nim.model = Some(value.to_string());
-            }
-            "providers.nvidia_nim.http_headers" => {
-                self.providers.nvidia_nim.http_headers = parse_http_headers(value)?;
-            }
-            "providers.openrouter.api_key" => {
-                self.providers.openrouter.api_key = Some(value.to_string());
-            }
-            "providers.openrouter.base_url" => {
-                self.providers.openrouter.base_url = Some(value.to_string());
-            }
-            "providers.openrouter.model" => {
-                self.providers.openrouter.model = Some(value.to_string());
-            }
-            "providers.openrouter.http_headers" => {
-                self.providers.openrouter.http_headers = parse_http_headers(value)?;
-            }
-            "providers.xiaomi_mimo.api_key" => {
-                self.providers.xiaomi_mimo.api_key = Some(value.to_string());
-            }
-            "providers.xiaomi_mimo.base_url" => {
-                self.providers.xiaomi_mimo.base_url = Some(value.to_string());
-            }
-            "providers.xiaomi_mimo.model" => {
-                self.providers.xiaomi_mimo.model = Some(value.to_string());
-            }
-            "providers.xiaomi_mimo.mode" => {
-                self.providers.xiaomi_mimo.mode = Some(value.to_string());
-            }
-            "providers.xiaomi_mimo.http_headers" => {
-                self.providers.xiaomi_mimo.http_headers = parse_http_headers(value)?;
-            }
-            "providers.novita.api_key" => {
-                self.providers.novita.api_key = Some(value.to_string());
-            }
-            "providers.novita.base_url" => {
-                self.providers.novita.base_url = Some(value.to_string());
-            }
-            "providers.novita.model" => {
-                self.providers.novita.model = Some(value.to_string());
-            }
-            "providers.novita.http_headers" => {
-                self.providers.novita.http_headers = parse_http_headers(value)?;
-            }
-            "providers.fireworks.api_key" => {
-                self.providers.fireworks.api_key = Some(value.to_string());
-            }
-            "providers.fireworks.base_url" => {
-                self.providers.fireworks.base_url = Some(value.to_string());
-            }
-            "providers.fireworks.model" => {
-                self.providers.fireworks.model = Some(value.to_string());
-            }
-            "providers.fireworks.http_headers" => {
-                self.providers.fireworks.http_headers = parse_http_headers(value)?;
-            }
-            "providers.siliconflow.api_key" => {
-                self.providers.siliconflow.api_key = Some(value.to_string());
-            }
-            "providers.siliconflow.base_url" => {
-                self.providers.siliconflow.base_url = Some(value.to_string());
-            }
-            "providers.siliconflow.model" => {
-                self.providers.siliconflow.model = Some(value.to_string());
-            }
-            "providers.siliconflow.http_headers" => {
-                self.providers.siliconflow.http_headers = parse_http_headers(value)?;
-            }
-            "providers.siliconflow_cn.api_key" => {
-                self.providers.siliconflow_cn.api_key = Some(value.to_string());
-            }
-            "providers.siliconflow_cn.base_url" => {
-                self.providers.siliconflow_cn.base_url = Some(value.to_string());
-            }
-            "providers.siliconflow_cn.model" => {
-                self.providers.siliconflow_cn.model = Some(value.to_string());
-            }
-            "providers.siliconflow_cn.http_headers" => {
-                self.providers.siliconflow_cn.http_headers = parse_http_headers(value)?;
-            }
-            "providers.arcee.api_key" => {
-                self.providers.arcee.api_key = Some(value.to_string());
-            }
-            "providers.arcee.base_url" => {
-                self.providers.arcee.base_url = Some(value.to_string());
-            }
-            "providers.arcee.model" => {
-                self.providers.arcee.model = Some(value.to_string());
-            }
-            "providers.arcee.http_headers" => {
-                self.providers.arcee.http_headers = parse_http_headers(value)?;
-            }
-            "providers.moonshot.api_key" => {
-                self.providers.moonshot.api_key = Some(value.to_string());
-            }
-            "providers.moonshot.base_url" => {
-                self.providers.moonshot.base_url = Some(value.to_string());
-            }
-            "providers.moonshot.model" => {
-                self.providers.moonshot.model = Some(value.to_string());
-            }
-            "providers.moonshot.auth_mode" => {
-                self.providers.moonshot.auth_mode = Some(value.to_string());
-            }
-            "providers.moonshot.http_headers" => {
-                self.providers.moonshot.http_headers = parse_http_headers(value)?;
-            }
-            "providers.sglang.api_key" => {
-                self.providers.sglang.api_key = Some(value.to_string());
-            }
-            "providers.sglang.base_url" => {
-                self.providers.sglang.base_url = Some(value.to_string());
-            }
-            "providers.sglang.model" => {
-                self.providers.sglang.model = Some(value.to_string());
-            }
-            "providers.sglang.http_headers" => {
-                self.providers.sglang.http_headers = parse_http_headers(value)?;
-            }
-            "providers.vllm.api_key" => {
-                self.providers.vllm.api_key = Some(value.to_string());
-            }
-            "providers.vllm.base_url" => {
-                self.providers.vllm.base_url = Some(value.to_string());
-            }
-            "providers.vllm.model" => {
-                self.providers.vllm.model = Some(value.to_string());
-            }
-            "providers.vllm.http_headers" => {
-                self.providers.vllm.http_headers = parse_http_headers(value)?;
-            }
-            "providers.ollama.api_key" => {
-                self.providers.ollama.api_key = Some(value.to_string());
-            }
-            "providers.ollama.base_url" => {
-                self.providers.ollama.base_url = Some(value.to_string());
-            }
-            "providers.ollama.model" => {
-                self.providers.ollama.model = Some(value.to_string());
-            }
-            "providers.ollama.http_headers" => {
-                self.providers.ollama.http_headers = parse_http_headers(value)?;
-            }
-            "providers.huggingface.api_key" => {
-                self.providers.huggingface.api_key = Some(value.to_string());
-            }
-            "providers.huggingface.base_url" => {
-                self.providers.huggingface.base_url = Some(value.to_string());
-            }
-            "providers.huggingface.model" => {
-                self.providers.huggingface.model = Some(value.to_string());
-            }
-            "providers.huggingface.http_headers" => {
-                self.providers.huggingface.http_headers = parse_http_headers(value)?;
-            }
-            "providers.together.api_key" => {
-                self.providers.together.api_key = Some(value.to_string());
-            }
-            "providers.together.base_url" => {
-                self.providers.together.base_url = Some(value.to_string());
-            }
-            "providers.together.model" => {
-                self.providers.together.model = Some(value.to_string());
-            }
-            "providers.together.http_headers" => {
-                self.providers.together.http_headers = parse_http_headers(value)?;
-            }
             _ => {
                 self.extras
                     .insert(key.to_string(), toml::Value::String(value.to_string()));
@@ -1875,6 +1739,11 @@ impl ConfigToml {
     }
 
     pub fn unset_value(&mut self, key: &str) -> Result<()> {
+        if let Some((provider, field)) = parse_provider_config_key(key) {
+            unset_provider_config_value(self, provider, field);
+            return Ok(());
+        }
+
         match key {
             "provider" => self.provider = ProviderKind::Deepseek,
             "api_key" => self.api_key = None,
@@ -1894,108 +1763,6 @@ impl ConfigToml {
                     sinks.unix_socket_path = None;
                 }
             }
-            "providers.deepseek.api_key" => {
-                self.providers.deepseek.api_key = None;
-                self.api_key = None;
-            }
-            "providers.deepseek.base_url" => {
-                self.providers.deepseek.base_url = None;
-                self.base_url = None;
-            }
-            "providers.deepseek.model" => {
-                self.providers.deepseek.model = None;
-                self.default_text_model = None;
-            }
-            "providers.deepseek.http_headers" => {
-                self.providers.deepseek.http_headers.clear();
-                self.http_headers.clear();
-            }
-            "providers.openai.api_key" => self.providers.openai.api_key = None,
-            "providers.openai.base_url" => self.providers.openai.base_url = None,
-            "providers.openai.model" => self.providers.openai.model = None,
-            "providers.openai.http_headers" => self.providers.openai.http_headers.clear(),
-            "providers.atlascloud.api_key" => self.providers.atlascloud.api_key = None,
-            "providers.atlascloud.base_url" => self.providers.atlascloud.base_url = None,
-            "providers.atlascloud.model" => self.providers.atlascloud.model = None,
-            "providers.atlascloud.http_headers" => self.providers.atlascloud.http_headers.clear(),
-            "providers.wanjie_ark.api_key" => self.providers.wanjie_ark.api_key = None,
-            "providers.wanjie_ark.base_url" => self.providers.wanjie_ark.base_url = None,
-            "providers.wanjie_ark.model" => self.providers.wanjie_ark.model = None,
-            "providers.volcengine.api_key" => self.providers.volcengine.api_key = None,
-            "providers.volcengine.base_url" => self.providers.volcengine.base_url = None,
-            "providers.volcengine.model" => self.providers.volcengine.model = None,
-            "providers.volcengine.http_headers" => {
-                self.providers.volcengine.http_headers.clear();
-            }
-            "providers.wanjie_ark.http_headers" => {
-                self.providers.wanjie_ark.http_headers.clear();
-            }
-            "providers.nvidia_nim.api_key" => self.providers.nvidia_nim.api_key = None,
-            "providers.nvidia_nim.base_url" => self.providers.nvidia_nim.base_url = None,
-            "providers.nvidia_nim.model" => self.providers.nvidia_nim.model = None,
-            "providers.nvidia_nim.http_headers" => self.providers.nvidia_nim.http_headers.clear(),
-            "providers.openrouter.api_key" => self.providers.openrouter.api_key = None,
-            "providers.openrouter.base_url" => self.providers.openrouter.base_url = None,
-            "providers.openrouter.model" => self.providers.openrouter.model = None,
-            "providers.openrouter.http_headers" => self.providers.openrouter.http_headers.clear(),
-            "providers.xiaomi_mimo.api_key" => self.providers.xiaomi_mimo.api_key = None,
-            "providers.xiaomi_mimo.base_url" => self.providers.xiaomi_mimo.base_url = None,
-            "providers.xiaomi_mimo.model" => self.providers.xiaomi_mimo.model = None,
-            "providers.xiaomi_mimo.mode" => self.providers.xiaomi_mimo.mode = None,
-            "providers.xiaomi_mimo.http_headers" => {
-                self.providers.xiaomi_mimo.http_headers.clear();
-            }
-            "providers.novita.api_key" => self.providers.novita.api_key = None,
-            "providers.novita.base_url" => self.providers.novita.base_url = None,
-            "providers.novita.model" => self.providers.novita.model = None,
-            "providers.novita.http_headers" => self.providers.novita.http_headers.clear(),
-            "providers.fireworks.api_key" => self.providers.fireworks.api_key = None,
-            "providers.fireworks.base_url" => self.providers.fireworks.base_url = None,
-            "providers.fireworks.model" => self.providers.fireworks.model = None,
-            "providers.fireworks.http_headers" => self.providers.fireworks.http_headers.clear(),
-            "providers.siliconflow.api_key" => self.providers.siliconflow.api_key = None,
-            "providers.siliconflow.base_url" => self.providers.siliconflow.base_url = None,
-            "providers.siliconflow.model" => self.providers.siliconflow.model = None,
-            "providers.siliconflow.http_headers" => {
-                self.providers.siliconflow.http_headers.clear();
-            }
-            "providers.siliconflow_cn.api_key" => self.providers.siliconflow_cn.api_key = None,
-            "providers.siliconflow_cn.base_url" => self.providers.siliconflow_cn.base_url = None,
-            "providers.siliconflow_cn.model" => self.providers.siliconflow_cn.model = None,
-            "providers.siliconflow_cn.http_headers" => {
-                self.providers.siliconflow_cn.http_headers.clear();
-            }
-            "providers.arcee.api_key" => self.providers.arcee.api_key = None,
-            "providers.arcee.base_url" => self.providers.arcee.base_url = None,
-            "providers.arcee.model" => self.providers.arcee.model = None,
-            "providers.arcee.http_headers" => {
-                self.providers.arcee.http_headers.clear();
-            }
-            "providers.moonshot.api_key" => self.providers.moonshot.api_key = None,
-            "providers.moonshot.base_url" => self.providers.moonshot.base_url = None,
-            "providers.moonshot.model" => self.providers.moonshot.model = None,
-            "providers.moonshot.auth_mode" => self.providers.moonshot.auth_mode = None,
-            "providers.moonshot.http_headers" => self.providers.moonshot.http_headers.clear(),
-            "providers.sglang.api_key" => self.providers.sglang.api_key = None,
-            "providers.sglang.base_url" => self.providers.sglang.base_url = None,
-            "providers.sglang.model" => self.providers.sglang.model = None,
-            "providers.sglang.http_headers" => self.providers.sglang.http_headers.clear(),
-            "providers.vllm.api_key" => self.providers.vllm.api_key = None,
-            "providers.vllm.base_url" => self.providers.vllm.base_url = None,
-            "providers.vllm.model" => self.providers.vllm.model = None,
-            "providers.vllm.http_headers" => self.providers.vllm.http_headers.clear(),
-            "providers.ollama.api_key" => self.providers.ollama.api_key = None,
-            "providers.ollama.base_url" => self.providers.ollama.base_url = None,
-            "providers.ollama.model" => self.providers.ollama.model = None,
-            "providers.ollama.http_headers" => self.providers.ollama.http_headers.clear(),
-            "providers.huggingface.api_key" => self.providers.huggingface.api_key = None,
-            "providers.huggingface.base_url" => self.providers.huggingface.base_url = None,
-            "providers.huggingface.model" => self.providers.huggingface.model = None,
-            "providers.huggingface.http_headers" => self.providers.huggingface.http_headers.clear(),
-            "providers.together.api_key" => self.providers.together.api_key = None,
-            "providers.together.base_url" => self.providers.together.base_url = None,
-            "providers.together.model" => self.providers.together.model = None,
-            "providers.together.http_headers" => self.providers.together.http_headers.clear(),
             _ => {
                 self.extras.remove(key);
             }
@@ -2014,7 +1781,7 @@ impl ConfigToml {
         if let Some(v) = self.base_url.as_ref() {
             out.insert("base_url".to_string(), v.clone());
         }
-        if let Some(v) = serialize_http_headers(&self.http_headers) {
+        if let Some(v) = serialize_http_headers_for_display(&self.http_headers) {
             out.insert("http_headers".to_string(), v);
         }
         if let Some(v) = self.default_text_model.as_ref() {
@@ -2054,243 +1821,17 @@ impl ConfigToml {
                 v.display().to_string(),
             );
         }
-        if let Some(v) = self.providers.deepseek.api_key.as_ref() {
-            out.insert("providers.deepseek.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.deepseek.base_url.as_ref() {
-            out.insert("providers.deepseek.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.deepseek.model.as_ref() {
-            out.insert("providers.deepseek.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.deepseek.http_headers) {
-            out.insert("providers.deepseek.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.openai.api_key.as_ref() {
-            out.insert("providers.openai.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.openai.base_url.as_ref() {
-            out.insert("providers.openai.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.openai.model.as_ref() {
-            out.insert("providers.openai.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.openai.http_headers) {
-            out.insert("providers.openai.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.atlascloud.api_key.as_ref() {
-            out.insert("providers.atlascloud.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.atlascloud.base_url.as_ref() {
-            out.insert("providers.atlascloud.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.atlascloud.model.as_ref() {
-            out.insert("providers.atlascloud.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.atlascloud.http_headers) {
-            out.insert("providers.atlascloud.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.volcengine.api_key.as_ref() {
-            out.insert("providers.volcengine.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.volcengine.base_url.as_ref() {
-            out.insert("providers.volcengine.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.volcengine.model.as_ref() {
-            out.insert("providers.volcengine.model".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.wanjie_ark.api_key.as_ref() {
-            out.insert("providers.wanjie_ark.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.wanjie_ark.base_url.as_ref() {
-            out.insert("providers.wanjie_ark.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.wanjie_ark.model.as_ref() {
-            out.insert("providers.wanjie_ark.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.volcengine.http_headers) {
-            out.insert("providers.volcengine.http_headers".to_string(), v);
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.wanjie_ark.http_headers) {
-            out.insert("providers.wanjie_ark.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.nvidia_nim.api_key.as_ref() {
-            out.insert("providers.nvidia_nim.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.nvidia_nim.base_url.as_ref() {
-            out.insert("providers.nvidia_nim.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.nvidia_nim.model.as_ref() {
-            out.insert("providers.nvidia_nim.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.nvidia_nim.http_headers) {
-            out.insert("providers.nvidia_nim.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.openrouter.api_key.as_ref() {
-            out.insert("providers.openrouter.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.openrouter.base_url.as_ref() {
-            out.insert("providers.openrouter.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.openrouter.model.as_ref() {
-            out.insert("providers.openrouter.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.openrouter.http_headers) {
-            out.insert("providers.openrouter.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.xiaomi_mimo.api_key.as_ref() {
-            out.insert(
-                "providers.xiaomi_mimo.api_key".to_string(),
-                redact_secret(v),
+
+        for provider in ProviderKind::ALL {
+            insert_provider_config_values(
+                &mut out,
+                provider,
+                self.providers.for_provider(provider),
             );
-        }
-        if let Some(v) = self.providers.xiaomi_mimo.base_url.as_ref() {
-            out.insert("providers.xiaomi_mimo.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.xiaomi_mimo.model.as_ref() {
-            out.insert("providers.xiaomi_mimo.model".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.xiaomi_mimo.mode.as_ref() {
-            out.insert("providers.xiaomi_mimo.mode".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.xiaomi_mimo.http_headers) {
-            out.insert("providers.xiaomi_mimo.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.novita.api_key.as_ref() {
-            out.insert("providers.novita.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.novita.base_url.as_ref() {
-            out.insert("providers.novita.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.novita.model.as_ref() {
-            out.insert("providers.novita.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.novita.http_headers) {
-            out.insert("providers.novita.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.fireworks.api_key.as_ref() {
-            out.insert("providers.fireworks.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.fireworks.base_url.as_ref() {
-            out.insert("providers.fireworks.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.fireworks.model.as_ref() {
-            out.insert("providers.fireworks.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.fireworks.http_headers) {
-            out.insert("providers.fireworks.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.siliconflow.api_key.as_ref() {
-            out.insert(
-                "providers.siliconflow.api_key".to_string(),
-                redact_secret(v),
-            );
-        }
-        if let Some(v) = self.providers.siliconflow.base_url.as_ref() {
-            out.insert("providers.siliconflow.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.siliconflow.model.as_ref() {
-            out.insert("providers.siliconflow.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.siliconflow.http_headers) {
-            out.insert("providers.siliconflow.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.siliconflow_cn.api_key.as_ref() {
-            out.insert(
-                "providers.siliconflow_cn.api_key".to_string(),
-                redact_secret(v),
-            );
-        }
-        if let Some(v) = self.providers.siliconflow_cn.base_url.as_ref() {
-            out.insert("providers.siliconflow_cn.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.siliconflow_cn.model.as_ref() {
-            out.insert("providers.siliconflow_cn.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.siliconflow_cn.http_headers) {
-            out.insert("providers.siliconflow_cn.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.arcee.api_key.as_ref() {
-            out.insert("providers.arcee.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.arcee.base_url.as_ref() {
-            out.insert("providers.arcee.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.arcee.model.as_ref() {
-            out.insert("providers.arcee.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.arcee.http_headers) {
-            out.insert("providers.arcee.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.moonshot.api_key.as_ref() {
-            out.insert("providers.moonshot.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.moonshot.base_url.as_ref() {
-            out.insert("providers.moonshot.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.moonshot.model.as_ref() {
-            out.insert("providers.moonshot.model".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.moonshot.auth_mode.as_ref() {
-            out.insert("providers.moonshot.auth_mode".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.moonshot.http_headers) {
-            out.insert("providers.moonshot.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.sglang.api_key.as_ref() {
-            out.insert("providers.sglang.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.sglang.base_url.as_ref() {
-            out.insert("providers.sglang.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.sglang.model.as_ref() {
-            out.insert("providers.sglang.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.sglang.http_headers) {
-            out.insert("providers.sglang.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.vllm.api_key.as_ref() {
-            out.insert("providers.vllm.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.vllm.base_url.as_ref() {
-            out.insert("providers.vllm.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.vllm.model.as_ref() {
-            out.insert("providers.vllm.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.vllm.http_headers) {
-            out.insert("providers.vllm.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.ollama.api_key.as_ref() {
-            out.insert("providers.ollama.api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.providers.ollama.base_url.as_ref() {
-            out.insert("providers.ollama.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.ollama.model.as_ref() {
-            out.insert("providers.ollama.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.ollama.http_headers) {
-            out.insert("providers.ollama.http_headers".to_string(), v);
-        }
-        if let Some(v) = self.providers.huggingface.api_key.as_ref() {
-            out.insert(
-                "providers.huggingface.api_key".to_string(),
-                redact_secret(v),
-            );
-        }
-        if let Some(v) = self.providers.huggingface.base_url.as_ref() {
-            out.insert("providers.huggingface.base_url".to_string(), v.clone());
-        }
-        if let Some(v) = self.providers.huggingface.model.as_ref() {
-            out.insert("providers.huggingface.model".to_string(), v.clone());
-        }
-        if let Some(v) = serialize_http_headers(&self.providers.huggingface.http_headers) {
-            out.insert("providers.huggingface.http_headers".to_string(), v);
         }
 
         for (k, v) in &self.extras {
-            out.insert(k.clone(), v.to_string());
+            out.insert(k.clone(), redact_toml_value_for_display(k, v));
         }
         out
     }
@@ -2855,8 +2396,9 @@ fn canonical_zai_model_id(model: &str) -> Option<&'static str> {
     let normalized = model.trim().to_ascii_lowercase();
     let normalized = normalized.replace(['_', ' '], "-");
     match normalized.as_str() {
-        "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => Some(DEFAULT_ZAI_MODEL),
-        "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => Some(ZAI_GLM_5_2_MODEL),
+        "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => Some(ZAI_GLM_5_1_MODEL),
+        "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => Some(DEFAULT_ZAI_MODEL),
+        "glm-5-turbo" | "glm-5turbo" | "zai-glm-5-turbo" => Some(ZAI_GLM_5_TURBO_MODEL),
         _ => None,
     }
 }
@@ -3332,18 +2874,22 @@ pub struct ConfigStore {
     path: PathBuf,
     pub config: ConfigToml,
     permissions: PermissionsToml,
+    /// Original file text, retained so [`save`](Self::save) can merge
+    /// comments back after serialisation.
+    original_raw: Option<String>,
 }
 
 impl ConfigStore {
     pub fn load(path: Option<PathBuf>) -> Result<Self> {
         let path = resolve_config_path(path)?;
-        let config = if path.exists() {
+        let (config, original_raw) = if path.exists() {
             let raw = fs::read_to_string(&path)
                 .with_context(|| format!("failed to read config at {}", path.display()))?;
-            toml::from_str(&raw)
-                .with_context(|| format!("failed to parse config at {}", path.display()))?
+            let parsed: ConfigToml = toml::from_str(&raw)
+                .with_context(|| format!("failed to parse config at {}", path.display()))?;
+            (parsed, Some(raw))
         } else {
-            ConfigToml::default()
+            (ConfigToml::default(), None)
         };
         let permissions = load_sibling_permissions(&path)?;
 
@@ -3351,6 +2897,7 @@ impl ConfigStore {
             path,
             config,
             permissions,
+            original_raw,
         })
     }
 
@@ -3360,7 +2907,16 @@ impl ConfigStore {
                 format!("failed to create config directory {}", parent.display())
             })?;
         }
-        let body = toml::to_string_pretty(&self.config).context("failed to serialize config")?;
+        let body = if let Some(ref original_raw) = self.original_raw {
+            let serialized =
+                toml::to_string_pretty(&self.config).context("failed to serialize config")?;
+            merge_and_preserve_comments(&serialized, original_raw).unwrap_or_else(|e| {
+                tracing::warn!("failed to merge config comments, saving without them: {e:#}");
+                serialized
+            })
+        } else {
+            toml::to_string_pretty(&self.config).context("failed to serialize config")?
+        };
         match fs::read_to_string(&self.path) {
             Ok(existing) => {
                 if existing == body {
@@ -3523,6 +3079,91 @@ fn write_one_time_config_backup(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Merge comments and formatting from an original TOML file into a
+/// freshly serialized document so user annotations (comments, whitespace,
+/// disabled keys) survive config rewrites.
+///
+/// `original_raw` is the raw text of the file before the change; the
+/// function parses it internally with [`toml_edit`] so callers stay free
+/// of that dependency.
+pub fn merge_and_preserve_comments(serialized: &str, original_raw: &str) -> Result<String> {
+    let original = original_raw
+        .parse::<toml_edit::DocumentMut>()
+        .context("failed to parse original config for comment merge")?;
+
+    let mut new_doc = serialized
+        .parse::<toml_edit::DocumentMut>()
+        .context("failed to parse serialized config for comment merge")?;
+
+    // Reuse the original document’s trailing text (file-footer comments /
+    // disabled keys) so they survive the rewrite.
+    new_doc.set_trailing(original.trailing().clone());
+
+    // Copy the top-level table's decor (document-header comments, whitespace
+    // before the first key) which `toml_edit` stores on the root `Table` itself.
+    *new_doc.as_table_mut().decor_mut() = original.as_table().decor().clone();
+
+    merge_decor_table(new_doc.as_table_mut(), original.as_table());
+
+    Ok(new_doc.to_string())
+}
+
+/// Recursively copy `decor` (prefix/suffix comments and whitespace) from
+/// every key in `source` that also exists in `target`.
+fn merge_decor_table(target: &mut toml_edit::Table, source: &toml_edit::Table) {
+    // Collect keys first — the borrow checker won't let us hold
+    // `get_key_value_mut` while iterating.
+    let keys: Vec<String> = source.iter().map(|(k, _)| k.to_owned()).collect();
+    for key in &keys {
+        let Some((source_key, source_item)) = source.get_key_value(key) else {
+            continue;
+        };
+        let Some((mut target_key_mut, target_item)) = target.get_key_value_mut(key) else {
+            continue;
+        };
+
+        // Copy the key-level decor (comments before the key itself)
+        *target_key_mut.leaf_decor_mut() = source_key.leaf_decor().clone();
+
+        copy_item_decor(target_item, source_item);
+
+        if let (Some(tt), Some(st)) = (target_item.as_table_mut(), source_item.as_table()) {
+            merge_decor_table(tt, st);
+        }
+
+        if let (Some(ta), Some(sa)) = (
+            target_item.as_array_of_tables_mut(),
+            source_item.as_array_of_tables(),
+        ) {
+            for (i, source_table) in sa.iter().enumerate() {
+                if let Some(target_table) = ta.get_mut(i) {
+                    copy_item_decor_table(target_table, source_table);
+                    merge_decor_table(target_table, source_table);
+                }
+            }
+        }
+    }
+}
+
+/// Copy the decor (comments and surrounding whitespace) from `source` to `target`,
+/// respecting the concrete item type since [`toml_edit::Item`] has no uniform
+/// `decor` accessor.
+fn copy_item_decor(target: &mut toml_edit::Item, source: &toml_edit::Item) {
+    match (target, source) {
+        (toml_edit::Item::Table(tt), toml_edit::Item::Table(st)) => {
+            *tt.decor_mut() = st.decor().clone();
+        }
+        (toml_edit::Item::Value(tv), toml_edit::Item::Value(sv)) => {
+            *tv.decor_mut() = sv.decor().clone();
+        }
+        _ => {}
+    }
+}
+
+fn copy_item_decor_table(target: &mut toml_edit::Table, source: &toml_edit::Table) {
+    *target.decor_mut() = source.decor().clone();
+}
+
 /// Process-wide default [`Secrets`] façade. The first caller wins; the
 /// lock is exposed so test or CLI code can install an explicit
 /// backend (e.g. an [`codewhale_secrets::InMemoryKeyringStore`]) before
@@ -3590,6 +3231,38 @@ fn effective_home_dir() -> Option<PathBuf> {
         .or_else(dirs::home_dir)
 }
 
+/// Reject state subdirs that could escape the state root via path injection.
+///
+/// `ensure_state_dir` / `resolve_state_dir` are public APIs taking an arbitrary
+/// subdir string; every in-tree caller passes a hardcoded single component
+/// (e.g. `"sessions"`, `"."`). This validates defensively so a future caller
+/// can never traverse out of the state root via `..` components or an absolute
+/// path. Nested relative paths such as `"a/b"` are permitted.
+fn ensure_safe_state_subdir(subdir: &str) -> Result<()> {
+    if subdir.is_empty() {
+        bail!("state subdir must not be empty");
+    }
+    let path = std::path::Path::new(subdir);
+    if path.is_absolute() {
+        bail!("state subdir must not be an absolute path: {subdir}");
+    }
+    if path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::RootDir | std::path::Component::Prefix(_)
+        )
+    }) {
+        bail!("state subdir must not contain a root or prefix: {subdir}");
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("state subdir must not contain parent-dir (..) components: {subdir}");
+    }
+    Ok(())
+}
+
 /// Resolve a state subdirectory, preferring the CodeWhale root if
 /// it already exists, otherwise falling back to the legacy root.
 ///
@@ -3597,6 +3270,7 @@ fn effective_home_dir() -> Option<PathBuf> {
 /// migration has occurred or on a fresh install, but keeps reading
 /// from the legacy path for users who haven't migrated yet.
 pub fn resolve_state_dir(subdir: &str) -> Result<PathBuf> {
+    ensure_safe_state_subdir(subdir)?;
     let primary = codewhale_home()?.join(subdir);
     if primary.exists() {
         return Ok(primary);
@@ -3611,11 +3285,109 @@ pub fn resolve_state_dir(subdir: &str) -> Result<PathBuf> {
 
 /// Ensure a state subdirectory exists under the primary CodeWhale root,
 /// creating it if necessary. This is the write-path resolver.
+///
+/// On the first creation of a real subdirectory (not the root sentinel `"."`),
+/// if a legacy `~/.deepseek/<subdir>` exists but the primary
+/// `~/.codewhale/<subdir>` does not, the legacy directory is relocated into
+/// the primary location so the user keeps their data and the legacy tree
+/// stops growing (#3240). After migration, [`resolve_state_dir`] finds the
+/// data in the primary location; the read resolver itself is unchanged.
 pub fn ensure_state_dir(subdir: &str) -> Result<PathBuf> {
+    ensure_safe_state_subdir(subdir)?;
     let dir = codewhale_home()?.join(subdir);
+    migrate_legacy_state_dir(&dir, subdir)?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create {}/", dir.display()))?;
     Ok(dir)
+}
+
+/// One-time relocation of a legacy `~/.deepseek/<subdir>` state directory into
+/// the primary `~/.codewhale/<subdir>` location (#3240). No-op once the primary
+/// exists, for the root sentinel `"."` (a whole-tree move is owned by the
+/// config-file migration), or when no legacy directory is present.
+fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<()> {
+    if primary.exists() || subdir == "." || subdir.is_empty() {
+        return Ok(());
+    }
+    let legacy = match legacy_deepseek_home() {
+        Ok(home) => home.join(subdir),
+        Err(_) => return Ok(()),
+    };
+    if !legacy.exists() {
+        return Ok(());
+    }
+    // The primary's parent (the ~/.codewhale root) must exist for the rename.
+    if let Some(parent) = primary.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                target: "config::migration",
+                "Could not create {} for state migration ({}); writing to primary anyway",
+                parent.display(),
+                err
+            );
+        }
+    }
+    match std::fs::rename(&legacy, primary) {
+        Ok(()) => {
+            tracing::info!(
+                target: "config::migration",
+                "Migrated legacy state directory {} -> {} (relocated). The .deepseek copy was removed.",
+                legacy.display(),
+                primary.display()
+            );
+        }
+        Err(err) => {
+            // Cross-device rename or permission issue: fall back to a
+            // recursive copy so the user keeps their data. The legacy tree is
+            // left in place; it stops growing because writes now target the
+            // primary path.
+            match copy_dir_recursive(&legacy, primary) {
+                Ok(()) => {
+                    tracing::info!(
+                        target: "config::migration",
+                        "Migrated legacy state directory {} -> {} (copied; rename failed: {err}). \
+                         The legacy .deepseek copy was left in place.",
+                        legacy.display(),
+                        primary.display()
+                    );
+                }
+                Err(copy_err) => {
+                    tracing::warn!(
+                        target: "config::migration",
+                        "Could not migrate legacy state {} -> {} (rename: {err}; copy: {copy_err}). \
+                         New data is written to the primary path; the legacy tree remains untouched.",
+                        legacy.display(),
+                        primary.display()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy a directory tree from `src` to `dst`, creating `dst`.
+/// Symlinks and other non-file/non-dir entries are skipped (rare in state dirs).
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst).with_context(|| format!("failed to create {}", dst.display()))?;
+    for entry in
+        std::fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", src.display()))?;
+        let path = entry.path();
+        let target = dst.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to read file type for {}", path.display()))?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&path, &target)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&path, &target).with_context(|| {
+                format!("failed to copy {} -> {}", path.display(), target.display())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a project-local state subdirectory, preferring `.codewhale/`
@@ -3886,6 +3658,26 @@ fn serialize_http_headers(headers: &BTreeMap<String, String>) -> Option<String> 
     )
 }
 
+fn serialize_http_headers_for_display(headers: &BTreeMap<String, String>) -> Option<String> {
+    if headers.is_empty() {
+        return None;
+    }
+    Some(
+        headers
+            .iter()
+            .map(|(name, value)| {
+                let display_value = if is_sensitive_config_key(name) {
+                    redact_secret(value)
+                } else {
+                    value.clone()
+                };
+                format!("{name}={display_value}")
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
 fn redact_secret(secret: &str) -> String {
     let chars: Vec<char> = secret.chars().collect();
     if chars.len() <= 16 {
@@ -3905,7 +3697,78 @@ fn redact_secret(secret: &str) -> String {
 
 #[must_use]
 pub fn is_sensitive_config_key(key: &str) -> bool {
-    key == "api_key" || key.ends_with(".api_key")
+    let Some(segment) = key.rsplit('.').next() else {
+        return false;
+    };
+    let normalized = segment
+        .trim()
+        .trim_matches('"')
+        .replace('-', "_")
+        .to_ascii_lowercase();
+
+    matches!(
+        normalized.as_str(),
+        "api_key"
+            | "apikey"
+            | "api_keys"
+            | "authorization"
+            | "bearer"
+            | "client_secret"
+            | "credential"
+            | "credentials"
+            | "id_token"
+            | "password"
+            | "passwords"
+            | "passwd"
+            | "proxy_authorization"
+            | "refresh_token"
+            | "secret"
+            | "secrets"
+            | "token"
+            | "tokens"
+    ) || normalized.ends_with("_api_key")
+        || normalized.ends_with("_authorization")
+        || normalized.ends_with("_password")
+        || normalized.ends_with("_secret")
+        || normalized.ends_with("_token")
+}
+
+fn redact_toml_value_for_display(key: &str, value: &toml::Value) -> String {
+    redact_toml_value_for_display_inner(key, false, value).to_string()
+}
+
+fn redact_toml_value_for_display_inner(
+    key: &str,
+    sensitive_ancestor: bool,
+    value: &toml::Value,
+) -> toml::Value {
+    let sensitive = sensitive_ancestor || is_sensitive_config_key(key);
+    match value {
+        toml::Value::String(value) if sensitive => toml::Value::String(redact_secret(value)),
+        toml::Value::Array(values) => toml::Value::Array(
+            values
+                .iter()
+                .map(|value| redact_toml_value_for_display_inner(key, sensitive, value))
+                .collect(),
+        ),
+        toml::Value::Table(table) => {
+            let mut redacted = toml::map::Map::new();
+            for (child_key, child_value) in table {
+                let path = if key.is_empty() {
+                    child_key.clone()
+                } else {
+                    format!("{key}.{child_key}")
+                };
+                redacted.insert(
+                    child_key.clone(),
+                    redact_toml_value_for_display_inner(&path, sensitive, child_value),
+                );
+            }
+            toml::Value::Table(redacted)
+        }
+        _ if sensitive => toml::Value::String("********".to_string()),
+        _ => value.clone(),
+    }
 }
 
 fn normalize_config_file_path(path: PathBuf) -> Result<PathBuf> {
@@ -5460,6 +5323,77 @@ command = "cargo check"
     }
 
     #[test]
+    fn config_display_redacts_nested_extra_secrets() {
+        let mut config = ConfigToml::default();
+        let mut profile = toml::map::Map::new();
+        profile.insert(
+            "chatgpt_access_token".to_string(),
+            toml::Value::String("raw-chatgpt-access-token-value".to_string()),
+        );
+        profile.insert(
+            "safe_label".to_string(),
+            toml::Value::String("visible".to_string()),
+        );
+
+        let mut nested = toml::map::Map::new();
+        nested.insert(
+            "refresh_token".to_string(),
+            toml::Value::String("raw-refresh-token-value".to_string()),
+        );
+        nested.insert("expires_at".to_string(), toml::Value::Integer(1234));
+        profile.insert("session".to_string(), toml::Value::Table(nested));
+
+        config
+            .extras
+            .insert("extras".to_string(), toml::Value::Table(profile));
+
+        let listed = config.list_values();
+        let rendered = listed.get("extras").expect("extras are listed");
+
+        assert!(rendered.contains("chatgpt_access_token"));
+        assert!(rendered.contains("refresh_token"));
+        assert!(rendered.contains("safe_label = \"visible\""));
+        assert!(!rendered.contains("raw-chatgpt-access-token-value"));
+        assert!(!rendered.contains("raw-refresh-token-value"));
+
+        let display = config
+            .get_display_value("extras")
+            .expect("extras display value");
+        assert!(!display.contains("raw-chatgpt-access-token-value"));
+        assert!(!display.contains("raw-refresh-token-value"));
+    }
+
+    #[test]
+    fn config_display_redacts_sensitive_extra_leaf_keys_and_headers() {
+        let mut config = ConfigToml::default();
+        config.extras.insert(
+            "chatgpt_access_token".to_string(),
+            toml::Value::String("raw-chatgpt-token-value".to_string()),
+        );
+        config.http_headers.insert(
+            "Authorization".to_string(),
+            "Bearer raw-header-token".to_string(),
+        );
+        config
+            .http_headers
+            .insert("X-Test".to_string(), "ok".to_string());
+
+        assert_eq!(
+            config.get_display_value("chatgpt_access_token").as_deref(),
+            Some("\"raw-***alue\"")
+        );
+
+        let headers = config
+            .list_values()
+            .get("http_headers")
+            .expect("headers are listed")
+            .clone();
+        assert!(headers.contains("Authorization=Bear***oken"));
+        assert!(headers.contains("X-Test=ok"));
+        assert!(!headers.contains("raw-header-token"));
+    }
+
+    #[test]
     fn hook_sinks_config_uses_separate_table_from_lifecycle_hooks() -> Result<()> {
         let raw = r#"
 [hooks]
@@ -5732,6 +5666,98 @@ unix_socket_path = "/tmp/cw-hooks.sock"
     }
 
     #[test]
+    fn provider_key_value_api_covers_all_provider_metadata_entries() -> Result<()> {
+        for provider in ProviderKind::ALL {
+            let table = provider.provider().provider_config_key();
+            let mut config = ConfigToml::default();
+            let api_key = format!("secret-value-for-{table}-123456");
+            let api_key_path = format!("providers.{table}.api_key");
+            let base_url_path = format!("providers.{table}.base_url");
+            let model_path = format!("providers.{table}.model");
+            let headers_path = format!("providers.{table}.http_headers");
+            let mode_path = format!("providers.{table}.mode");
+            let auth_mode_path = format!("providers.{table}.auth_mode");
+            let insecure_path = format!("providers.{table}.insecure_skip_tls_verify");
+            let path_suffix_path = format!("providers.{table}.path_suffix");
+
+            config.set_value(&api_key_path, &api_key)?;
+            config.set_value(&base_url_path, "https://gateway.example/v1")?;
+            config.set_value(&model_path, "provider-test-model")?;
+            config.set_value(&headers_path, "X-Test=ok")?;
+            config.set_value(&mode_path, "concise")?;
+            config.set_value(&auth_mode_path, "api_key")?;
+            config.set_value(&insecure_path, "true")?;
+            config.set_value(&path_suffix_path, "/chat/completions")?;
+
+            assert_eq!(
+                config.get_value(&api_key_path).as_deref(),
+                Some(api_key.as_str())
+            );
+            assert_eq!(
+                config.get_value(&base_url_path).as_deref(),
+                Some("https://gateway.example/v1")
+            );
+            assert_eq!(
+                config.get_value(&model_path).as_deref(),
+                Some("provider-test-model")
+            );
+            assert_eq!(
+                config.get_value(&headers_path).as_deref(),
+                Some("X-Test=ok")
+            );
+            assert_eq!(config.get_value(&mode_path).as_deref(), Some("concise"));
+            assert_eq!(
+                config.get_value(&auth_mode_path).as_deref(),
+                Some("api_key")
+            );
+            assert_eq!(config.get_value(&insecure_path).as_deref(), Some("true"));
+            assert_eq!(
+                config.get_value(&path_suffix_path).as_deref(),
+                Some("/chat/completions")
+            );
+
+            let listed = config.list_values();
+            let listed_api_key = listed
+                .get(&api_key_path)
+                .expect("provider API key is listed");
+            assert!(listed_api_key.contains("***"));
+            assert_ne!(listed_api_key, &api_key);
+            assert_eq!(
+                listed.get(&headers_path).map(String::as_str),
+                Some("X-Test=ok")
+            );
+            assert_eq!(listed.get(&insecure_path).map(String::as_str), Some("true"));
+
+            config.unset_value(&api_key_path)?;
+            config.unset_value(&base_url_path)?;
+            config.unset_value(&model_path)?;
+            config.unset_value(&headers_path)?;
+            config.unset_value(&mode_path)?;
+            config.unset_value(&auth_mode_path)?;
+            config.unset_value(&insecure_path)?;
+            config.unset_value(&path_suffix_path)?;
+
+            assert_eq!(config.get_value(&api_key_path), None);
+            assert_eq!(config.get_value(&base_url_path), None);
+            assert_eq!(config.get_value(&model_path), None);
+            assert_eq!(config.get_value(&headers_path), None);
+            assert_eq!(config.get_value(&mode_path), None);
+            assert_eq!(config.get_value(&auth_mode_path), None);
+            assert_eq!(config.get_value(&insecure_path), None);
+            assert_eq!(config.get_value(&path_suffix_path), None);
+
+            if provider == ProviderKind::Deepseek {
+                assert_eq!(config.api_key, None);
+                assert_eq!(config.base_url, None);
+                assert_eq!(config.default_text_model, None);
+                assert!(config.http_headers.is_empty());
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn project_merge_denies_credentials_endpoints_and_provider_selection() {
         let mut base = ConfigToml {
             provider: ProviderKind::Deepseek,
@@ -5787,6 +5813,33 @@ unix_socket_path = "/tmp/cw-hooks.sock"
             Some("DeepSeek-V4-Pro")
         );
         assert_eq!(base.providers.moonshot.model.as_deref(), Some("kimi-k2.6"));
+    }
+
+    #[test]
+    fn project_merge_forwards_all_provider_model_overrides() {
+        let mut project_toml = String::new();
+        for provider in ProviderKind::ALL {
+            let key = provider.provider().provider_config_key();
+            project_toml.push_str(&format!(
+                "[providers.{key}]\nmodel = \"project-{key}-model\"\n\n"
+            ));
+        }
+
+        let project: ConfigToml =
+            toml::from_str(&project_toml).expect("project provider overrides parse");
+        let mut base = ConfigToml::default();
+
+        base.merge_project_overrides(project);
+
+        for provider in ProviderKind::ALL {
+            let key = provider.provider().provider_config_key();
+            let expected = format!("project-{key}-model");
+            assert_eq!(
+                base.providers.for_provider(provider).model.as_deref(),
+                Some(expected.as_str()),
+                "provider {key} should merge repo-local model override"
+            );
+        }
     }
 
     #[test]
@@ -6011,6 +6064,184 @@ unix_socket_path = "/tmp/cw-hooks.sock"
         let _ = fs::remove_dir_all(home);
     }
 
+    // ── ensure_state_dir legacy migration (#3240) ───────────────────────
+
+    /// Saves and restores the env vars that the state-resolvers read.
+    struct StateEnvRestore {
+        home: Option<OsString>,
+        userprofile: Option<OsString>,
+        codewhale_home: Option<OsString>,
+    }
+
+    impl Drop for StateEnvRestore {
+        fn drop(&mut self) {
+            // Safety: test-only environment mutation is serialized by env_lock().
+            unsafe {
+                match self.home.take() {
+                    Some(value) => env::set_var("HOME", value),
+                    None => env::remove_var("HOME"),
+                }
+                match self.userprofile.take() {
+                    Some(value) => env::set_var("USERPROFILE", value),
+                    None => env::remove_var("USERPROFILE"),
+                }
+                match self.codewhale_home.take() {
+                    Some(value) => env::set_var("CODEWHALE_HOME", value),
+                    None => env::remove_var("CODEWHALE_HOME"),
+                }
+            }
+        }
+    }
+
+    /// Points `HOME`/`USERPROFILE`/`CODEWHALE_HOME` at a fresh temp tree so
+    /// `codewhale_home()` -> `<home>/.codewhale` and `legacy_deepseek_home()`
+    /// -> `<home>/.deepseek`. Env is restored on drop.
+    struct StateDirEnv {
+        home: PathBuf,
+        _restore: StateEnvRestore,
+    }
+
+    impl StateDirEnv {
+        fn install(unique: u128) -> Self {
+            let home = std::env::temp_dir().join(format!(
+                "codewhale-state-migration-{}-{unique}",
+                std::process::id()
+            ));
+            let restore = StateEnvRestore {
+                home: env::var_os("HOME"),
+                userprofile: env::var_os("USERPROFILE"),
+                codewhale_home: env::var_os("CODEWHALE_HOME"),
+            };
+            // Safety: test-only environment mutation is serialized by env_lock().
+            unsafe {
+                env::set_var("HOME", &home);
+                env::set_var("USERPROFILE", &home);
+                env::set_var("CODEWHALE_HOME", home.join(CODEWHALE_APP_DIR));
+            }
+            Self {
+                home,
+                _restore: restore,
+            }
+        }
+        fn legacy(&self, sub: &str) -> PathBuf {
+            self.home.join(LEGACY_APP_DIR).join(sub)
+        }
+        fn primary(&self, sub: &str) -> PathBuf {
+            self.home.join(CODEWHALE_APP_DIR).join(sub)
+        }
+    }
+
+    #[test]
+    fn ensure_state_dir_relocates_legacy_subdir_on_first_write() {
+        let _lock = env_lock();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let state_env = StateDirEnv::install(unique);
+        // Seed a legacy subdir; primary must not exist yet.
+        fs::create_dir_all(state_env.legacy("slop_ledger")).expect("legacy dir");
+        fs::write(
+            state_env.legacy("slop_ledger").join("slop_ledger.json"),
+            b"legacy",
+        )
+        .expect("legacy file");
+        assert!(!state_env.primary("slop_ledger").exists());
+
+        let dir = ensure_state_dir("slop_ledger").expect("ensure_state_dir");
+        assert_eq!(dir, state_env.primary("slop_ledger"));
+        // Legacy contents relocated into primary.
+        assert_eq!(
+            fs::read_to_string(state_env.primary("slop_ledger").join("slop_ledger.json"))
+                .expect("migrated file"),
+            "legacy"
+        );
+        // The legacy subdir was relocated (moved), so .deepseek stops growing.
+        assert!(
+            !state_env.legacy("slop_ledger").exists(),
+            "legacy subdir should be removed after relocation"
+        );
+        // Idempotent: a second call is a no-op now that primary exists.
+        ensure_state_dir("slop_ledger").expect("idempotent ensure");
+        let _ = fs::remove_dir_all(&state_env.home);
+    }
+
+    #[test]
+    fn ensure_state_dir_writes_to_primary_when_both_exist() {
+        let _lock = env_lock();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let state_env = StateDirEnv::install(unique);
+        // Migrated user: primary already exists; a legacy orphan also remains.
+        fs::create_dir_all(state_env.primary("sessions")).expect("primary dir");
+        fs::write(state_env.primary("sessions").join("a.json"), b"primary").expect("primary file");
+        fs::create_dir_all(state_env.legacy("sessions")).expect("legacy dir");
+        fs::write(state_env.legacy("sessions").join("old.json"), b"legacy").expect("legacy file");
+
+        let dir = ensure_state_dir("sessions").expect("ensure_state_dir");
+        assert_eq!(dir, state_env.primary("sessions"));
+        // Primary untouched; legacy orphan left as-is (not migrated, not deleted).
+        assert_eq!(
+            fs::read_to_string(state_env.primary("sessions").join("a.json")).expect("primary"),
+            "primary"
+        );
+        assert!(
+            state_env.legacy("sessions").exists(),
+            "existing legacy orphan must not be deleted when primary exists"
+        );
+        let _ = fs::remove_dir_all(&state_env.home);
+    }
+
+    #[test]
+    fn resolve_state_dir_still_finds_legacy_for_backfill() {
+        let _lock = env_lock();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let state_env = StateDirEnv::install(unique);
+        // Only legacy exists -> read resolver returns legacy (backfill).
+        fs::create_dir_all(state_env.legacy("catalog")).expect("legacy dir");
+        assert_eq!(
+            resolve_state_dir("catalog").expect("resolve"),
+            state_env.legacy("catalog")
+        );
+        // After the primary is created (e.g. via a write), the read resolver
+        // returns primary — legacy is reachable only while primary is absent.
+        ensure_state_dir("catalog").expect("ensure");
+        assert_eq!(
+            resolve_state_dir("catalog").expect("resolve after migrate"),
+            state_env.primary("catalog")
+        );
+        let _ = fs::remove_dir_all(&state_env.home);
+    }
+
+    #[test]
+    fn state_resolvers_reject_path_traversal_subdirs() {
+        // Defense against path injection (#3240 hardening): the public state
+        // resolvers must refuse subdirs that could escape the state root.
+        for bad in ["..", "../secret", "/etc", "a/../../b"] {
+            let err = ensure_state_dir(bad)
+                .err()
+                .unwrap_or_else(|| panic!("expected {bad:?} to be rejected"));
+            assert!(
+                format!("{err:#}").contains("state subdir"),
+                "expected rejection of {bad:?}, got {err:#}"
+            );
+            assert!(
+                resolve_state_dir(bad).is_err(),
+                "read resolver must also reject {bad:?}"
+            );
+        }
+        // Safe values are accepted (including the root sentinel ".").
+        assert!(ensure_safe_state_subdir(".").is_ok());
+        assert!(ensure_safe_state_subdir("sessions").is_ok());
+        assert!(ensure_safe_state_subdir("a/b").is_ok());
+        assert!(ensure_safe_state_subdir("").is_err());
+    }
+
     #[test]
     fn normalize_config_file_path_rejects_traversal() {
         let err = normalize_config_file_path(PathBuf::from("../config.toml"))
@@ -6043,6 +6274,7 @@ unix_socket_path = "/tmp/cw-hooks.sock"
                 ..ConfigToml::default()
             },
             permissions: PermissionsToml::default(),
+            original_raw: None,
         };
         store.save().expect("save");
 
@@ -6079,6 +6311,7 @@ unix_socket_path = "/tmp/cw-hooks.sock"
             path: path.clone(),
             config,
             permissions: PermissionsToml::default(),
+            original_raw: None,
         };
         store.save().expect("identical save should not rewrite");
 
@@ -6117,6 +6350,7 @@ unix_socket_path = "/tmp/cw-hooks.sock"
                 ..ConfigToml::default()
             },
             permissions: PermissionsToml::default(),
+            original_raw: None,
         };
         store.save().expect("changed save");
 
@@ -6129,6 +6363,121 @@ unix_socket_path = "/tmp/cw-hooks.sock"
         assert!(updated.contains("model = \"deepseek-v4-pro\""));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_store_save_preserves_comments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join(CONFIG_FILE_NAME);
+        let original = "# my model\nmodel = \"deepseek-v4-flash\"\n# end comment\n";
+        fs::write(&config_path, original).expect("write config");
+
+        let mut store = ConfigStore::load(Some(config_path.clone())).expect("load config store");
+        store.config.model = Some("deepseek-v4-pro".to_string());
+        store.save().expect("save");
+
+        let body = fs::read_to_string(&config_path).expect("read config");
+        assert!(body.contains("# my model"), "prefix comment preserved");
+        assert!(body.contains("# end comment"), "suffix comment preserved");
+        assert!(body.contains("model = \"deepseek-v4-pro\""));
+    }
+
+    #[test]
+    fn config_store_save_preserves_disabled_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join(CONFIG_FILE_NAME);
+        fs::write(
+            &config_path,
+            "# my note\nmodel = \"deepseek-v4-flash\"\n# base_url = \"http://localhost:11434/v1\"\n",
+        )
+        .expect("write config");
+
+        let mut store = ConfigStore::load(Some(config_path.clone())).expect("load config store");
+        store.config.model = Some("deepseek-v4-pro".to_string());
+        store.save().expect("save");
+
+        let body = fs::read_to_string(&config_path).expect("read config");
+        assert!(
+            body.contains("# base_url = \"http://localhost:11434/v1\""),
+            "disabled key preserved as comment"
+        );
+        assert!(body.contains("model = \"deepseek-v4-pro\""));
+    }
+
+    #[test]
+    fn config_store_save_preserves_comments_with_other_keys() {
+        // Realistic scenario: user already has api_key + model, adds a comment,
+        // then changes model via `codewhale config set model`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join(CONFIG_FILE_NAME);
+        fs::write(
+            &config_path,
+            "# my deepseek key\napi_key = \"sk-1234\"\n\n# my current model\nmodel = \"deepseek-v4-flash\"\n",
+        )
+        .expect("write config");
+
+        let mut store = ConfigStore::load(Some(config_path.clone())).expect("load config store");
+        store.config.model = Some("deepseek-v4-pro".to_string());
+        store.save().expect("save");
+
+        let body = fs::read_to_string(&config_path).expect("read config");
+        assert!(body.contains("# my deepseek key"), "api_key comment lost");
+        assert!(body.contains("# my current model"), "model comment lost");
+        assert!(
+            body.contains("model = \"deepseek-v4-pro\""),
+            "new model not written"
+        );
+        assert!(body.contains("api_key = \"sk-1234\""), "api_key lost");
+    }
+
+    #[test]
+    fn merge_and_preserve_comments_returns_err_on_invalid_serialized() {
+        let err = merge_and_preserve_comments("{{{ not toml", "model = 1\n")
+            .expect_err("invalid serialized should fail");
+        assert!(
+            format!("{err:#}").contains("failed to parse serialized"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn merge_and_preserve_comments_returns_err_on_invalid_original() {
+        let err = merge_and_preserve_comments("model = 1\n", "{{{ not toml")
+            .expect_err("invalid original should fail");
+        assert!(
+            format!("{err:#}").contains("failed to parse original"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn config_store_save_falls_back_when_comment_merge_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join(CONFIG_FILE_NAME);
+        // Valid TOML so load succeeds, but the raw is corrupt so the merge
+        // will fail inside save() — save must still succeed and write the
+        // plain serialized config.
+        fs::write(&config_path, "model = \"deepseek-v4-flash\"\n").expect("write config");
+
+        // Bypass ConfigStore::load to inject a deliberately broken original_raw.
+        let store = ConfigStore {
+            path: config_path.clone(),
+            config: ConfigToml {
+                model: Some("deepseek-v4-pro".to_string()),
+                ..ConfigToml::default()
+            },
+            permissions: PermissionsToml::default(),
+            original_raw: Some("{ broken".to_string()),
+        };
+        store
+            .save()
+            .expect("save should succeed even when merge fails");
+
+        let body = fs::read_to_string(&config_path).expect("read config");
+        assert!(
+            body.contains("deepseek-v4-pro"),
+            "config should be written: {body}"
+        );
     }
 
     #[test]
@@ -6479,13 +6828,20 @@ mode = "token-plan-usa"
 
     #[test]
     fn zai_aliases_resolve_to_canonical_models() {
+        // GLM-5.2 is the default; the glm-5.1 alias must still resolve to 5.1
+        // (not to the default), and GLM-5-Turbo resolves to its own id.
         assert_eq!(
             normalize_model_for_provider(ProviderKind::Zai, "glm-5.1"),
-            DEFAULT_ZAI_MODEL
+            ZAI_GLM_5_1_MODEL
         );
         assert_eq!(
             normalize_model_for_provider(ProviderKind::Zai, "glm-5-2"),
-            ZAI_GLM_5_2_MODEL
+            DEFAULT_ZAI_MODEL
+        );
+        assert_eq!(DEFAULT_ZAI_MODEL, ZAI_GLM_5_2_MODEL);
+        assert_eq!(
+            normalize_model_for_provider(ProviderKind::Zai, "glm-5-turbo"),
+            ZAI_GLM_5_TURBO_MODEL
         );
         assert_eq!(
             normalize_model_for_provider(ProviderKind::Zai, "custom-glm-preview"),

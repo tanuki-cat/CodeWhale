@@ -16,7 +16,7 @@ mod renderable;
 pub mod tool_card;
 
 pub use footer::{
-    FooterProps, FooterToast, FooterWidget, footer_agents_chip, footer_shell_chip,
+    FooterProps, FooterToast, FooterWidget, footer_agents_chip, footer_shell_label_chip,
     footer_working_label,
 };
 pub use header::{HeaderData, HeaderWidget, header_status_indicator_frame};
@@ -454,6 +454,16 @@ impl Renderable for ChatWidget {
         let paragraph =
             Paragraph::new(self.lines.clone()).style(Style::default().bg(self.background));
         paragraph.render(area, buf);
+
+        // #3029: the transcript carries OSC 8 hyperlinks in-band inside span
+        // content. Scan the rendered buffer for those payloads, blank the
+        // payload cells (so no cell ever holds `\x1b`/`]8;;` — fixes the
+        // column-drift corruption), and publish the recovered link regions
+        // for ColorCompatBackend::draw to re-emit out-of-band. This is the
+        // main transcript surface; the live-transcript overlay appends its
+        // own regions separately. Replaces the frame buffer each render.
+        let regions = crate::tui::osc8::extract_buffer_link_regions(buf, area);
+        crate::tui::osc8::set_frame_links(regions);
 
         if let Some(scrollbar) = self.scrollbar {
             let scrollable_range = scrollbar.total.saturating_sub(scrollbar.visible);
@@ -1344,6 +1354,30 @@ impl Renderable for ApprovalWidget<'_> {
             }
         }
 
+        if let Some(preview) = self.request.ask_rule_preview() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    label_ask_rule_preview(locale),
+                    Style::default().fg(palette::TEXT_HINT),
+                ),
+            ]));
+            let max_width = card_area.width.saturating_sub(6) as usize;
+            for line in preview
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .take(4)
+            {
+                let truncated =
+                    crate::utils::truncate_with_ellipsis(line.trim(), max_width.max(20), "...");
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(truncated, Style::default().fg(palette::TEXT_SECONDARY)),
+                ]));
+            }
+        }
+
         lines.push(Line::from(""));
 
         let options = approval_options_for(risk, locale);
@@ -1389,6 +1423,14 @@ impl Renderable for ApprovalWidget<'_> {
                 footer_controls(locale),
                 Style::default().fg(palette::TEXT_HINT),
             ),
+            if self.request.can_save_ask_rule() {
+                Span::styled(
+                    save_ask_rule_hint(locale),
+                    Style::default().fg(palette_colors.shortcut),
+                )
+            } else {
+                Span::raw("")
+            },
         ]));
 
         let title = format!(
@@ -1590,6 +1632,20 @@ fn push_shell_command_lines(lines: &mut Vec<Line<'static>>, label: &str, command
 
 fn footer_controls(locale: Locale) -> &'static str {
     tr(locale, MessageId::ApprovalControlsHint)
+}
+
+fn save_ask_rule_hint(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "  s 批准并保存询问规则",
+        _ => "  s approve + save ask rule",
+    }
+}
+
+fn label_ask_rule_preview(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans => "询问规则预览：",
+        _ => "Ask rule preview:",
+    }
 }
 
 fn selection_hint_prefix(locale: Locale) -> &'static str {
@@ -2136,22 +2192,29 @@ fn build_empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     }
 
     let workspace = crate::utils::display_path(&app.workspace);
-    let body_width = usize::from(area.width.saturating_sub(8).clamp(24, 72));
-    let left_padding = usize::from(area.width.saturating_sub(body_width as u16) / 2);
+    let title = format!(">_ codewhale (v{})", env!("CARGO_PKG_VERSION"));
+    let model = format!("model: {}  /model to switch", app.model);
+    let directory = format!("directory: {workspace}");
+    let block_width = [&title, &model, &directory]
+        .into_iter()
+        .map(|line| UnicodeWidthStr::width(line.as_str()))
+        .max()
+        .unwrap_or(0);
+    let left_padding = usize::from(area.width).saturating_sub(block_width) / 2;
     let inset = " ".repeat(left_padding);
 
     let body = vec![
         Line::from(Span::styled(
-            format!("{inset}>_ codewhale (v{})", env!("CARGO_PKG_VERSION")),
+            format!("{inset}{title}"),
             Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!("{inset}model: {}  /model to switch", app.model),
+            format!("{inset}{model}"),
             Style::default().fg(palette::TEXT_MUTED),
         )),
         Line::from(Span::styled(
-            format!("{inset}directory: {workspace}"),
+            format!("{inset}{directory}"),
             Style::default().fg(palette::TEXT_MUTED),
         )),
     ];
@@ -2309,83 +2372,131 @@ pub(crate) fn slash_completion_hints(
         return Vec::new();
     }
     let mut entries: Vec<SlashMenuEntry> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let prefix_lower = prefix.to_ascii_lowercase();
-    let user_commands = if completing_skill_arg.is_none() {
-        commands::user_commands::load_user_commands(workspace)
-    } else {
-        Vec::new()
-    };
 
     // ── Phase 1: prefix (starts_with) matches ─────────────────────────
     // Highest priority — preserves existing exact-prefix completion.
     if completing_skill_arg.is_none() {
-        for name in all_command_names_matching_loaded(prefix, &user_commands) {
-            seen.insert(name.clone());
-            let command_key = name.trim_start_matches('/');
-            push_command_entry(
-                &mut entries,
-                &name,
-                command_key,
-                &prefix_lower,
-                locale,
-                &user_commands,
-            );
-        }
-    }
-
-    // ── Phase 2: contains (substring) matches ─────────────────────────
-    // Medium priority — broader catching.
-    if completing_skill_arg.is_none() {
-        for cmd in commands::command_infos() {
-            let name = format!("/{}", cmd.name);
-            if seen.contains(&name) {
-                continue;
-            }
-            let cmd_lower = cmd.name.to_ascii_lowercase();
-            let alias_match = cmd
-                .aliases
+        commands::user_registry::with_registry_for_workspace(workspace, |registry| {
+            let all_user_commands = registry.iter().collect::<Vec<_>>();
+            let user_commands = all_user_commands
                 .iter()
-                .any(|a| a.to_ascii_lowercase().contains(&prefix_lower));
-            if cmd_lower.contains(&prefix_lower) || alias_match {
+                .copied()
+                .filter(|cmd| !cmd.hidden)
+                .collect::<Vec<_>>();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            for name in
+                all_command_names_matching_loaded(prefix, &user_commands, &all_user_commands)
+            {
                 seen.insert(name.clone());
+                let command_key = name.trim_start_matches('/');
                 push_command_entry(
                     &mut entries,
                     &name,
-                    cmd.name,
+                    command_key,
                     &prefix_lower,
                     locale,
                     &user_commands,
                 );
             }
-        }
-    }
 
-    // ── Phase 3: fuzzy subsequence matches ────────────────────────────
-    // Lowest priority — characters in order, not necessarily consecutive.
-    if completing_skill_arg.is_none() {
-        for cmd in commands::command_infos() {
-            let name = format!("/{}", cmd.name);
-            if seen.contains(&name) {
-                continue;
+            // ── Phase 2: contains (substring) matches ─────────────────────────
+            // Medium priority — broader catching.
+            for cmd in commands::command_infos() {
+                let name = format!("/{}", cmd.name);
+                if seen.contains(&name) {
+                    continue;
+                }
+                let cmd_lower = cmd.name.to_ascii_lowercase();
+                let name_match = cmd_lower.contains(&prefix_lower);
+                let alias_matches =
+                    |alias: &str| alias.to_ascii_lowercase().contains(&prefix_lower);
+                if builtin_visible_for_completion_match(
+                    cmd,
+                    &all_user_commands,
+                    name_match,
+                    alias_matches,
+                ) {
+                    seen.insert(name.clone());
+                    push_command_entry(
+                        &mut entries,
+                        &name,
+                        cmd.name,
+                        &prefix_lower,
+                        locale,
+                        &user_commands,
+                    );
+                }
             }
-            let cmd_lower = cmd.name.to_ascii_lowercase();
-            let alias_match = cmd
-                .aliases
-                .iter()
-                .any(|a| fuzzy_chars_in_order(&prefix_lower, &a.to_ascii_lowercase()));
-            if fuzzy_chars_in_order(&prefix_lower, &cmd_lower) || alias_match {
-                seen.insert(name.clone());
-                push_command_entry(
-                    &mut entries,
-                    &name,
-                    cmd.name,
-                    &prefix_lower,
-                    locale,
-                    &user_commands,
-                );
+            for cmd in &user_commands {
+                let name = format!("/{}", cmd.name);
+                if seen.contains(&name) {
+                    continue;
+                }
+                let alias_match = cmd.aliases.iter().any(|a| a.contains(&prefix_lower));
+                if cmd.name.contains(&prefix_lower) || alias_match {
+                    seen.insert(name.clone());
+                    push_command_entry(
+                        &mut entries,
+                        &name,
+                        &cmd.name,
+                        &prefix_lower,
+                        locale,
+                        &user_commands,
+                    );
+                }
             }
-        }
+
+            // ── Phase 3: fuzzy subsequence matches ────────────────────────────
+            // Lowest priority — characters in order, not necessarily consecutive.
+            for cmd in commands::command_infos() {
+                let name = format!("/{}", cmd.name);
+                if seen.contains(&name) {
+                    continue;
+                }
+                let cmd_lower = cmd.name.to_ascii_lowercase();
+                let name_match = fuzzy_chars_in_order(&prefix_lower, &cmd_lower);
+                let alias_matches = |alias: &str| fuzzy_chars_in_order(&prefix_lower, alias);
+                if builtin_visible_for_completion_match(
+                    cmd,
+                    &all_user_commands,
+                    name_match,
+                    alias_matches,
+                ) {
+                    seen.insert(name.clone());
+                    push_command_entry(
+                        &mut entries,
+                        &name,
+                        cmd.name,
+                        &prefix_lower,
+                        locale,
+                        &user_commands,
+                    );
+                }
+            }
+            for cmd in &user_commands {
+                let name = format!("/{}", cmd.name);
+                if seen.contains(&name) {
+                    continue;
+                }
+                let alias_match = cmd
+                    .aliases
+                    .iter()
+                    .any(|a| fuzzy_chars_in_order(&prefix_lower, a));
+                if fuzzy_chars_in_order(&prefix_lower, &cmd.name) || alias_match {
+                    seen.insert(name.clone());
+                    push_command_entry(
+                        &mut entries,
+                        &name,
+                        &cmd.name,
+                        &prefix_lower,
+                        locale,
+                        &user_commands,
+                    );
+                }
+            }
+        });
     }
 
     // ── Skills (only after user has typed `/skill `) ──────────────────
@@ -2478,27 +2589,80 @@ pub(crate) fn slash_completion_hints(
 
 fn all_command_names_matching_loaded(
     prefix: &str,
-    user_commands: &[(String, String)],
+    user_commands: &[&commands::user_registry::UserCommandMetadata],
+    all_user_commands: &[&commands::user_registry::UserCommandMetadata],
 ) -> Vec<String> {
     let prefix = prefix.strip_prefix('/').unwrap_or(prefix).to_lowercase();
     let mut result: Vec<String> = commands::command_infos()
         .iter()
         .filter(|cmd| {
-            cmd.name.starts_with(&prefix) || cmd.aliases.iter().any(|a| a.starts_with(&prefix))
+            builtin_visible_for_completion_match(
+                cmd,
+                all_user_commands,
+                cmd.name.starts_with(&prefix),
+                |alias| alias.starts_with(&prefix),
+            )
         })
         .map(|cmd| format!("/{}", cmd.name))
         .collect();
 
-    result.extend(
-        user_commands
+    result.extend(user_commands.iter().filter_map(|command| {
+        let name_matches = command.name.starts_with(&prefix);
+        let alias_matches = command
+            .aliases
             .iter()
-            .filter(|(name, _)| name.starts_with(&prefix))
-            .map(|(name, _)| format!("/{name}")),
-    );
+            .any(|alias| alias.starts_with(&prefix));
+        (name_matches || alias_matches).then(|| format!("/{}", command.name))
+    }));
 
     result.sort();
     result.dedup();
     result
+}
+
+fn builtin_visible_for_completion_match(
+    builtin: &commands::CommandInfo,
+    user_commands: &[&commands::user_registry::UserCommandMetadata],
+    canonical_name_matches: bool,
+    alias_matches: impl Fn(&str) -> bool,
+) -> bool {
+    if user_command_shadows_builtin_canonical(builtin, user_commands) {
+        return false;
+    }
+
+    // Keep the canonical built-in visible when the typed text matches the
+    // canonical name, even if a user command shadows one of the built-in's
+    // aliases. Example: a user command with alias `/image` must not hide
+    // canonical `/attach` for `/att`.
+    if canonical_name_matches {
+        return true;
+    }
+
+    // If the built-in is visible only through an alias, hide it when that
+    // specific alias is shadowed by a user command. Example: `/image` should
+    // complete to the user command, not built-in `/attach` via its `/image`
+    // alias.
+    builtin.aliases.iter().any(|alias| {
+        alias_matches(alias) && !user_command_shadows_builtin_alias(alias, user_commands)
+    })
+}
+
+fn user_command_shadows_builtin_canonical(
+    builtin: &commands::CommandInfo,
+    user_commands: &[&commands::user_registry::UserCommandMetadata],
+) -> bool {
+    user_commands.iter().any(|user| {
+        user.name == builtin.name || user.aliases.iter().any(|alias| alias == builtin.name)
+    })
+}
+
+fn user_command_shadows_builtin_alias(
+    builtin_alias: &str,
+    user_commands: &[&commands::user_registry::UserCommandMetadata],
+) -> bool {
+    user_commands.iter().any(|user| {
+        user.name == builtin_alias || user.aliases.iter().any(|alias| alias == builtin_alias)
+    })
 }
 
 /// Push a built-in command entry to the slash menu, resolving description
@@ -2509,9 +2673,39 @@ fn push_command_entry(
     command_key: &str,
     prefix_lower: &str,
     locale: crate::localization::Locale,
-    user_commands: &[(String, String)],
+    user_commands: &[&commands::user_registry::UserCommandMetadata],
 ) {
-    let (description, alias_hint) = if let Some(info) = commands::get_command_info(command_key) {
+    let user_command = user_commands
+        .iter()
+        .find(|command| command.name == command_key);
+
+    let (description, alias_hint) = if let Some(command) = user_command {
+        // User command shadows any built-in — use user metadata.
+        let mut description = command
+            .description
+            .clone()
+            .unwrap_or_else(|| String::from("User-defined command"));
+        if let Some(hint) = &command.argument_hint
+            && !hint.trim().is_empty()
+        {
+            description.push_str("  ");
+            description.push_str(hint.trim());
+        }
+        let alias_hint = if !command_key.to_ascii_lowercase().starts_with(prefix_lower) {
+            command
+                .aliases
+                .iter()
+                .find(|alias| {
+                    alias.starts_with(prefix_lower)
+                        || alias.contains(prefix_lower)
+                        || fuzzy_chars_in_order(prefix_lower, alias)
+                })
+                .cloned()
+        } else {
+            None
+        };
+        (description, alias_hint)
+    } else if let Some(info) = commands::get_command_info(command_key) {
         let hint = if !command_key.to_ascii_lowercase().starts_with(prefix_lower) {
             info.aliases
                 .iter()
@@ -2539,25 +2733,7 @@ fn push_command_entry(
         };
         (desc, hint)
     } else {
-        let mut description = String::from("User-defined command");
-        let mut argument_hint = None;
-        if let Some((_, content)) = user_commands.iter().find(|(key, _)| key == command_key) {
-            let (metadata, _) = commands::user_commands::parse_frontmatter(content);
-            for (key, value) in metadata {
-                match key.as_str() {
-                    "description" => description = value,
-                    "argument-hint" => argument_hint = Some(value),
-                    _ => {}
-                }
-            }
-        }
-        if let Some(hint) = argument_hint
-            && !hint.trim().is_empty()
-        {
-            description.push_str("  ");
-            description.push_str(hint.trim());
-        }
-        (description, None)
+        (String::from("User-defined command"), None)
     };
     entries.push(SlashMenuEntry {
         name: name.to_string(),
@@ -2999,7 +3175,13 @@ mod tests {
         let rendered = buffer_text(&buf, area);
 
         assert_eq!(app.collapsed_cell_map, vec![0, 1, 2]);
-        assert!(rendered.contains("full output from list_dir"), "{rendered}");
+        assert!(rendered.contains("read_file.txt"), "{rendered}");
+        assert!(rendered.contains("list_dir.txt"), "{rendered}");
+        assert!(rendered.contains("web_search.txt"), "{rendered}");
+        assert!(
+            !rendered.contains("full output from list_dir"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -3280,11 +3462,132 @@ mod tests {
     }
 
     #[test]
+    fn slash_completion_hints_exclude_hidden_user_commands() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("secret.md"),
+            "---\ndescription: Internal command\nhidden: true\n---\nsecret",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/secret",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+
+        assert!(!hints.iter().any(|hint| hint.name == "/secret"));
+    }
+
+    #[test]
+    fn slash_completion_hints_match_user_command_aliases() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("deploy-target.md"),
+            "---\ndescription: Deploy target\nalias: ship\n---\ndeploy",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/ship",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+        let entry = hints
+            .iter()
+            .find(|hint| hint.name == "/deploy-target")
+            .expect("user command should be matched by alias");
+
+        assert_eq!(entry.alias_hint.as_deref(), Some("ship"));
+        assert_eq!(entry.description, "Deploy target");
+    }
+
+    #[test]
+    fn slash_completion_hints_keep_builtin_canonical_when_only_builtin_alias_is_shadowed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("attach-review.md"),
+            "---\ndescription: Review image\nalias: image\n---\nreview image",
+        )
+        .unwrap();
+
+        let canonical_hints = slash_completion_hints(
+            "/att",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+
+        assert!(
+            canonical_hints.iter().any(|hint| hint.name == "/attach"),
+            "canonical /attach should remain visible when only its /image alias is shadowed"
+        );
+
+        let alias_hints = slash_completion_hints(
+            "/image",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+
+        assert!(
+            alias_hints.iter().any(|hint| hint.name == "/attach-review"),
+            "user command should complete through its /image alias"
+        );
+        assert!(
+            !alias_hints.iter().any(|hint| hint.name == "/attach"),
+            "built-in /attach should not complete through shadowed /image alias"
+        );
+    }
+
+    #[test]
+    fn slash_completion_hints_prefer_user_metadata_for_shadowed_builtin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("help.md"),
+            "---\ndescription: Custom help workflow\nargument-hint: <topic>\n---\nhelp",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/help",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+        let help_entries: Vec<_> = hints.iter().filter(|hint| hint.name == "/help").collect();
+
+        assert_eq!(help_entries.len(), 1);
+        assert_eq!(help_entries[0].description, "Custom help workflow  <topic>");
+    }
+
+    #[test]
     fn review_regression_push_command_entry_uses_preloaded_user_command_frontmatter() {
-        let user_commands = vec![(
+        let registry = crate::commands::user_registry::UserCommandRegistry::from_loaded(vec![(
             "deploy".to_string(),
             "---\ndescription: Deploy target\nargument-hint: <env>\n---\ndeploy".to_string(),
-        )];
+        )]);
+        let user_commands: Vec<_> = registry.iter().collect();
         let mut entries = Vec::new();
 
         push_command_entry(
@@ -3747,6 +4050,39 @@ mod tests {
         assert!(rendered.contains(&format!(">_ codewhale (v{})", env!("CARGO_PKG_VERSION"))));
         assert!(rendered.contains("model: deepseek-v4-pro  /model to switch"));
         assert!(rendered.contains("directory: /tmp/codewhale-test-workspace"));
+    }
+
+    #[test]
+    fn empty_state_centers_startup_block_by_actual_text_width() {
+        let mut app = create_test_app();
+        app.workspace = PathBuf::from("/tmp/codewhale-test-workspace");
+        app.model = "deepseek-v4-pro".to_string();
+
+        let lines = build_empty_state_lines(&app, Rect::new(0, 0, 100, 20));
+        let text_lines = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let title = format!(">_ codewhale (v{})", env!("CARGO_PKG_VERSION"));
+        let model = "model: deepseek-v4-pro  /model to switch";
+        let directory = "directory: /tmp/codewhale-test-workspace";
+        let block_width = [title.as_str(), model, directory]
+            .into_iter()
+            .map(UnicodeWidthStr::width)
+            .max()
+            .expect("startup block has lines");
+        let expected_padding = (100usize - block_width) / 2;
+        let actual_padding = text_lines[2].chars().take_while(|ch| *ch == ' ').count();
+
+        assert_eq!(actual_padding, expected_padding);
+        assert_eq!(text_lines[2].trim_start(), title);
+        assert_eq!(text_lines[4].trim_start(), model);
+        assert_eq!(text_lines[5].trim_start(), directory);
     }
 
     /// Probe: confirm `cell.lines_with_motion` returns no Line whose total

@@ -10,14 +10,16 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
+use codewhale_execpolicy::{AskForApproval, ExecPolicyContext};
+use codewhale_protocol::runtime::DynamicToolSpec;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -45,8 +47,8 @@ use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
 use crate::tools::spec::RuntimeToolServices;
 use crate::tools::spec::{ApprovalRequirement, ToolError, ToolResult};
 use crate::tools::subagent::{
-    Mailbox, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext, SubAgentResult,
-    SubAgentRuntime, SubAgentStatus, SubAgentThinking, SubAgentType,
+    Mailbox, MailboxMessage, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext,
+    SubAgentResult, SubAgentRuntime, SubAgentStatus, SubAgentThinking, SubAgentType,
     new_shared_subagent_manager_with_timeout, resolve_subagent_assignment_route,
 };
 use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
@@ -58,7 +60,7 @@ use crate::worker_profile::ModelRoute;
 use crate::working_set::WorkingSet;
 
 use super::events::{Event, TurnOutcomeStatus};
-use super::ops::{Op, SessionSnapshot, USER_SHELL_TOOL_ID_PREFIX};
+use super::ops::{Op, SessionSnapshot, USER_SHELL_TOOL_ID_PREFIX, UserInputProvenance};
 use super::session::Session;
 use super::tool_parser;
 use super::turn::{TurnContext, post_turn_snapshot, pre_turn_snapshot};
@@ -250,6 +252,9 @@ pub struct EngineConfig {
     pub mcp_config_path: PathBuf,
     /// Directory containing discoverable skills.
     pub skills_dir: PathBuf,
+    /// Restrict skill discovery to CodeWhale-owned roots plus explicit
+    /// `skills_dir` configuration.
+    pub skills_scan_codewhale_only: bool,
     /// Sources injected as `<instructions source="…">` blocks in the system
     /// prompt (#454). Each entry is either a disk path (read at render time)
     /// or an inline string. Loaded in declared order from the user's
@@ -271,10 +276,15 @@ pub struct EngineConfig {
     pub max_steps: u32,
     /// Maximum number of concurrently active subagents.
     pub max_subagents: usize,
+    /// Maximum queued + running sub-agents admitted for this engine session.
+    pub max_admitted_subagents: usize,
     /// Number of direct (depth-1) sub-agents that may execute concurrently
     /// before further launches queue for a launch slot (#3095).
     /// Resolved from `[subagents] launch_concurrency`.
     pub launch_concurrency: usize,
+    /// Whether the model-facing `agent` tool is available after applying
+    /// feature flags and `[subagents]` opt-out controls.
+    pub subagents_enabled: bool,
     /// Feature flags controlling tool availability.
     pub features: Features,
     /// Auto-compaction settings for long conversations.
@@ -287,8 +297,12 @@ pub struct EngineConfig {
     pub goal_state: SharedGoalState,
     /// Maximum sub-agent recursion depth (default 3). See
     /// `SubAgentRuntime::max_spawn_depth`. Override via
-    /// `[runtime] max_spawn_depth = N` in `~/.deepseek/config.toml`.
+    /// `[subagents] max_depth = N` in `~/.codewhale/config.toml`.
     pub max_spawn_depth: u32,
+    /// Optional aggregate token budget for each root sub-agent run.
+    /// Descendant agents inherit the root pool unless a child starts a new
+    /// budget scope with an explicit per-call override.
+    pub subagent_token_budget: Option<u64>,
     /// Per-domain network policy decider (#135). Shared across the session so
     /// session-scoped approvals (`/network allow <host>`) persist for the
     /// remainder of the run.
@@ -370,6 +384,14 @@ pub struct EngineConfig {
     /// Applied to the per-turn tool registry after built-in tools are registered.
     /// When `None`, no overrides or plugin loading occurs.
     pub tools: Option<crate::config::ToolsConfig>,
+    /// Whether tools should follow symbolic links. When `true`, symlinked
+    /// directories are traversed by walk-based tools and symlinked paths
+    /// that resolve outside the workspace are still allowed (the symlink
+    /// itself must be inside the workspace). Mirrors the
+    /// `workspace_follow_symlinks` setting.
+    pub workspace_follow_symlinks: bool,
+    /// Ask-only permission rules loaded from sibling `permissions.toml`.
+    pub exec_policy_engine: codewhale_execpolicy::ExecPolicyEngine,
 }
 
 impl Default for EngineConfig {
@@ -382,19 +404,23 @@ impl Default for EngineConfig {
             notes_path: PathBuf::from("notes.txt"),
             mcp_config_path: PathBuf::from("mcp.json"),
             skills_dir: crate::skills::default_skills_dir(),
+            skills_scan_codewhale_only: false,
             instructions: Vec::new(),
             project_context_pack_enabled: true,
             translation_enabled: false,
             show_thinking: true,
             max_steps: 100,
             max_subagents: DEFAULT_MAX_SUBAGENTS,
+            max_admitted_subagents: DEFAULT_MAX_SUBAGENTS,
             launch_concurrency: DEFAULT_MAX_SUBAGENTS,
+            subagents_enabled: true,
             features: Features::with_defaults(),
             compaction: CompactionConfig::default(),
             todos: new_shared_todo_list(),
             plan_state: new_shared_plan_state(),
             goal_state: new_shared_goal_state(),
             max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
+            subagent_token_budget: None,
             network_policy: None,
             snapshots_enabled: true,
             snapshots_max_workspace_bytes:
@@ -431,6 +457,8 @@ impl Default for EngineConfig {
             prefer_bwrap: false,
             verbosity: None,
             tools: None,
+            workspace_follow_symlinks: false,
+            exec_policy_engine: codewhale_execpolicy::ExecPolicyEngine::new(Vec::new(), Vec::new()),
         }
     }
 }
@@ -510,6 +538,9 @@ pub struct Engine {
     mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
     api_provider: ApiProvider,
     rx_op: mpsc::Receiver<Op>,
+    /// Clone of the op-channel sender, so the engine can self-dispatch ops
+    /// (e.g. a goal-continuation `SendMessage` after a turn completes).
+    tx_op: mpsc::Sender<Op>,
     rx_approval: mpsc::Receiver<ApprovalDecision>,
     rx_user_input: mpsc::Receiver<UserInputDecision>,
     rx_steer: mpsc::Receiver<String>,
@@ -522,6 +553,11 @@ pub struct Engine {
     /// turn-loop's empty-tool_uses branch to surface `<codewhale:subagent.done>`
     /// sentinels into the parent's transcript before deciding to end the turn.
     pub(super) rx_subagent_completion: mpsc::UnboundedReceiver<SubAgentCompletion>,
+    /// Sub-agent completions already injected into the parent transcript.
+    /// Channel delivery and watchdog reconciliation both mark this set so a
+    /// dropped event can be synthesized once without duplicating a later
+    /// delivery.
+    delivered_subagent_completion_ids: HashSet<String>,
     cancel_token: CancellationToken,
     shared_cancel_token: Arc<StdMutex<CancellationToken>>,
     /// Latched reason for the current cancellation, mirrored to
@@ -568,6 +604,15 @@ pub struct Engine {
 }
 
 // === Internal tool helpers ===
+
+fn subagent_mailbox_message_is_best_effort(message: &MailboxMessage) -> bool {
+    matches!(
+        message,
+        MailboxMessage::Progress { .. }
+            | MailboxMessage::ToolCallStarted { .. }
+            | MailboxMessage::ToolCallCompleted { .. }
+    )
+}
 
 impl Engine {
     pub(super) async fn emit_compaction_started(
@@ -639,32 +684,7 @@ impl Engine {
         }
 
         let provider = api_config.api_provider();
-        let env_var = match provider {
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN => "DEEPSEEK_API_KEY",
-            ApiProvider::NvidiaNim => "NVIDIA_API_KEY/NVIDIA_NIM_API_KEY",
-            ApiProvider::Openai => "OPENAI_API_KEY",
-            ApiProvider::Zai => "ZAI_API_KEY/Z_AI_API_KEY",
-            ApiProvider::Stepfun => "STEPFUN_API_KEY/STEP_API_KEY",
-            ApiProvider::Anthropic => "ANTHROPIC_API_KEY",
-            ApiProvider::Atlascloud => "ATLASCLOUD_API_KEY",
-            ApiProvider::WanjieArk => "WANJIE_ARK_API_KEY/WANJIE_API_KEY/WANJIE_MAAS_API_KEY",
-            ApiProvider::Volcengine => "VOLCENGINE_API_KEY/VOLCENGINE_ARK_API_KEY/ARK_API_KEY",
-            ApiProvider::Openrouter => "OPENROUTER_API_KEY",
-            ApiProvider::XiaomiMimo => "XIAOMI_MIMO_API_KEY/XIAOMI_API_KEY/MIMO_API_KEY",
-            ApiProvider::Novita => "NOVITA_API_KEY",
-            ApiProvider::Fireworks => "FIREWORKS_API_KEY",
-            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => "SILICONFLOW_API_KEY",
-            ApiProvider::Arcee => "ARCEE_API_KEY",
-            ApiProvider::Moonshot => "MOONSHOT_API_KEY/KIMI_API_KEY",
-            ApiProvider::Sglang => "SGLANG_API_KEY",
-            ApiProvider::Vllm => "VLLM_API_KEY",
-            ApiProvider::Ollama => "OLLAMA_API_KEY",
-            ApiProvider::Huggingface => "HUGGINGFACE_API_KEY/HF_TOKEN",
-            ApiProvider::Deepinfra => "DEEPINFRA_API_KEY/DEEPINFRA_TOKEN",
-            ApiProvider::Together => "TOGETHER_API_KEY",
-            ApiProvider::OpenaiCodex => "OPENAI_CODEX_ACCESS_TOKEN/CODEX_ACCESS_TOKEN",
-            ApiProvider::Minimax => "MINIMAX_API_KEY",
-        };
+        let env_var = provider.env_vars_label();
 
         Some(format!(
             "The rejected key came from {env_var}; no saved config key is present.\n\
@@ -798,6 +818,7 @@ impl Engine {
                     ),
                     show_thinking: config.show_thinking,
                     verbosity: config.verbosity.as_deref(),
+                    skills_scan_codewhale_only: config.skills_scan_codewhale_only,
                 },
             );
         let stable_prompt = Some(system_prompt);
@@ -819,8 +840,10 @@ impl Engine {
         let subagent_manager = new_shared_subagent_manager_with_timeout(
             config.workspace.clone(),
             config.max_subagents,
+            config.max_admitted_subagents,
             config.subagent_heartbeat_timeout,
             config.launch_concurrency,
+            config.subagent_token_budget,
         );
         let shell_manager = config
             .runtime_services
@@ -900,12 +923,14 @@ impl Engine {
             mcp_pool: None,
             api_provider,
             rx_op,
+            tx_op: tx_op.clone(),
             rx_approval,
             rx_user_input,
             rx_steer,
             tx_event,
             tx_subagent_completion,
             rx_subagent_completion,
+            delivered_subagent_completion_ids: HashSet::new(),
             cancel_token: cancel_token.clone(),
             shared_cancel_token: shared_cancel_token.clone(),
             cancel_reason: cancel_reason.clone(),
@@ -1010,9 +1035,25 @@ impl Engine {
                 "Tool 'exec_shell' is disabled by feature flag".to_string(),
             ))
         } else if let Some(spec) = registry.get(&tool_name) {
-            let approval_required = spec.approval_requirement() != ApprovalRequirement::Auto
+            let mut approval_required = spec.approval_requirement() != ApprovalRequirement::Auto
                 && !registry.context().auto_approve;
-            if approval_required {
+            let mut approval_description = spec.description().to_string();
+            let mut approval_force_prompt = false;
+            let ask_rule_decision = exec_shell_ask_rule_decision(
+                &self.config,
+                &tool_name,
+                &tool_input,
+                &self.session.workspace,
+                self.session.approval_mode,
+            );
+            if let Some(ExecShellAskRuleDecision::Prompt(reason)) = ask_rule_decision.as_ref() {
+                approval_required = true;
+                approval_description = reason.clone();
+                approval_force_prompt = true;
+            }
+            if let Some(ExecShellAskRuleDecision::Block(reason)) = ask_rule_decision {
+                Err(ToolError::permission_denied(reason))
+            } else if approval_required {
                 emit_tool_audit(json!({
                     "event": "tool.approval_required",
                     "tool_id": tool_id.clone(),
@@ -1033,10 +1074,11 @@ impl Engine {
                         id: tool_id.clone(),
                         tool_name: tool_name.clone(),
                         input: tool_input.clone(),
-                        description: spec.description().to_string(),
+                        description: approval_description,
                         approval_key,
                         approval_grouping_key,
                         intent_summary: None,
+                        approval_force_prompt,
                     })
                     .await;
 
@@ -1219,8 +1261,10 @@ impl Engine {
                         translation_enabled,
                         show_thinking,
                         allowed_tools,
+                        dynamic_tools,
                         hook_executor,
                         verbosity,
+                        provenance,
                     } => {
                         self.handle_send_message(
                             content,
@@ -1240,8 +1284,10 @@ impl Engine {
                             translation_enabled,
                             show_thinking,
                             allowed_tools,
+                            dynamic_tools,
                             hook_executor,
                             verbosity,
+                            provenance,
                         )
                         .await;
                     }
@@ -1260,6 +1306,9 @@ impl Engine {
                             approval_mode,
                         )
                         .await;
+                    }
+                    Op::SetGoalStatus { status, clear } => {
+                        self.handle_set_goal_status(status, clear).await;
                     }
                     Op::CancelRequest => {
                         self.cancel_token.cancel();
@@ -1320,6 +1369,7 @@ impl Engine {
                         .with_step_api_timeout(self.config.subagent_api_timeout)
                         .with_speech_output_dir(self.config.speech_output_dir.clone())
                         .with_mcp_pool(mcp_pool)
+                        .with_todos(self.config.todos.clone())
                         .background_runtime();
                         let route = resolve_subagent_assignment_route(
                             &runtime,
@@ -1415,6 +1465,50 @@ impl Engine {
                             .tx_event
                             .send(Event::status(format!(
                                 "Stream chunk timeout set to {timeout_secs}s"
+                            )))
+                            .await;
+                    }
+                    Op::SetSubagentRuntimeConfig {
+                        enabled,
+                        max_subagents,
+                        launch_concurrency,
+                        max_spawn_depth,
+                        api_timeout_secs,
+                        heartbeat_timeout_secs,
+                    } => {
+                        self.config.subagents_enabled = enabled;
+                        self.config.max_subagents =
+                            max_subagents.clamp(1, crate::config::MAX_SUBAGENTS);
+                        self.config.launch_concurrency =
+                            launch_concurrency.clamp(1, self.config.max_subagents);
+                        self.config.max_spawn_depth =
+                            max_spawn_depth.min(codewhale_config::MAX_SPAWN_DEPTH_CEILING);
+                        self.config.subagent_api_timeout = Duration::from_secs(api_timeout_secs);
+                        self.config.subagent_heartbeat_timeout =
+                            Duration::from_secs(heartbeat_timeout_secs);
+                        let launch_gate_applied = {
+                            let mut manager = self.subagent_manager.write().await;
+                            manager.update_runtime_limits(
+                                self.config.max_subagents,
+                                self.config.max_admitted_subagents,
+                                self.config.subagent_heartbeat_timeout,
+                                self.config.launch_concurrency,
+                                self.config.subagent_token_budget,
+                            )
+                        };
+                        let launch_note = if launch_gate_applied {
+                            ""
+                        } else {
+                            "; launch_concurrency takes full effect after active sub-agents finish or the session restarts"
+                        };
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "Sub-agent runtime updated: enabled={enabled}, max_subagents={}, launch_concurrency={}, max_depth={}{}",
+                                self.config.max_subagents,
+                                self.config.launch_concurrency,
+                                self.config.max_spawn_depth,
+                                launch_note
                             )))
                             .await;
                     }
@@ -1519,8 +1613,10 @@ impl Engine {
                             self.config.translation_enabled,
                             self.config.show_thinking,
                             self.config.allowed_tools.clone(),
+                            Vec::new(),
                             self.config.hook_executor.clone(),
                             self.config.verbosity.clone(),
+                            UserInputProvenance::ExternalUser,
                         )
                         .await;
                     }
@@ -1605,6 +1701,7 @@ impl Engine {
         auto_model: bool,
         reasoning_effort: Option<&str>,
         reasoning_effort_auto: bool,
+        provenance: UserInputProvenance,
     ) -> ContentBlock {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let working_set_summary = self
@@ -1616,7 +1713,20 @@ impl Engine {
 
         let mut lines = vec![
             format!("Current local date: {today}"),
+            // Workspace path moved here from the static `## Environment` block so
+            // the static system prefix stays byte-stable across sessions (see
+            // `render_environment_block` for the prefix-cache rationale).
+            format!("Current workspace: {}", self.config.workspace.display()),
             format!("Current model: {routed_model}"),
+            format!("Input provenance: {}", provenance.as_str()),
+            format!(
+                "Input authority: {}",
+                if provenance.can_authorize_work() {
+                    "external_current_turn"
+                } else {
+                    "non_authoritative"
+                }
+            ),
         ];
         if auto_model {
             lines.push(format!("Auto model route: {routed_model}"));
@@ -1653,6 +1763,40 @@ impl Engine {
         reasoning_effort: Option<&str>,
         reasoning_effort_auto: bool,
     ) -> Message {
+        self.user_text_message_with_turn_metadata_for_route_and_provenance(
+            text,
+            routed_model,
+            auto_model,
+            reasoning_effort,
+            reasoning_effort_auto,
+            UserInputProvenance::ExternalUser,
+        )
+    }
+
+    fn runtime_text_message_with_turn_metadata(
+        &self,
+        text: String,
+        provenance: UserInputProvenance,
+    ) -> Message {
+        self.user_text_message_with_turn_metadata_for_route_and_provenance(
+            text,
+            &self.session.model,
+            self.session.auto_model,
+            self.session.reasoning_effort.as_deref(),
+            self.session.reasoning_effort_auto,
+            provenance,
+        )
+    }
+
+    fn user_text_message_with_turn_metadata_for_route_and_provenance(
+        &self,
+        text: String,
+        routed_model: &str,
+        auto_model: bool,
+        reasoning_effort: Option<&str>,
+        reasoning_effort_auto: bool,
+        provenance: UserInputProvenance,
+    ) -> Message {
         // Place the user text first and turn_meta last so that the leading
         // bytes of each user message stay stable across date / model-route /
         // working-set changes. DeepSeek's KV prefix cache matches byte
@@ -1673,6 +1817,7 @@ impl Engine {
                     auto_model,
                     reasoning_effort,
                     reasoning_effort_auto,
+                    provenance,
                 ),
             ],
         }
@@ -1716,13 +1861,107 @@ impl Engine {
             self.config.translation_enabled,
             self.config.show_thinking,
             self.config.allowed_tools.clone(),
+            Vec::new(),
             self.config.hook_executor.clone(),
             self.config.verbosity.clone(),
+            UserInputProvenance::SubAgentHandoff,
         )
         .await;
     }
 
     /// Handle a send message operation
+    #[allow(clippy::too_many_arguments)]
+    /// After a turn completes, check whether an active goal should keep going.
+    /// Returns a continuation message to re-dispatch as a new turn, or `None`
+    /// if the goal is complete, blocked, paused, or over an optional budget.
+    ///
+    /// There is no continuation cap — a goal runs until the model self-reports
+    /// done/blocked, the user pauses or clears, or an optional token/time
+    /// budget is exhausted. The loop is "until done," not "until N turns."
+    fn goal_continuation_if_active(&self) -> Option<String> {
+        let snapshot = self.config.goal_state.lock().ok()?.snapshot();
+        if !snapshot.is_active() {
+            return None;
+        }
+
+        // The snapshot status is a string ("active", "paused", "complete",
+        // "blocked"). Map it to the goal-loop decision core's status enum.
+        let status = match snapshot.status.as_str() {
+            "active" => crate::goal_loop::GoalRunStatus::Active,
+            "complete" => crate::goal_loop::GoalRunStatus::Completed,
+            // Paused / Blocked / unknown → no continuation.
+            _ => return None,
+        };
+
+        let decision = crate::goal_loop::decide_continuation(
+            status,
+            crate::goal_loop::GoalProgress {
+                tokens_used: snapshot.tokens_used,
+                time_used_seconds: snapshot.time_used_seconds,
+                continuations: snapshot.continuation_count,
+            },
+            crate::goal_loop::GoalBudget {
+                token_budget: snapshot.token_budget.map(u64::from),
+                time_budget_seconds: None,
+            },
+        );
+
+        match decision {
+            crate::goal_loop::ContinuationDecision::Continue => {
+                Some(crate::tools::goal::render_continuation_prompt(
+                    &snapshot,
+                    snapshot.continuation_count,
+                ))
+            }
+            // All stop reasons → no continuation. The caller (the async turn
+            // completion path) emits a status message for budget-exhaustion.
+            crate::goal_loop::ContinuationDecision::Stop(reason) => {
+                tracing::info!(?reason, "goal continuation stopped");
+                None
+            }
+        }
+    }
+
+    /// Handle `/goal pause|resume|clear|complete|blocked` by writing the new
+    /// status to `SharedGoalState` so the cross-turn continuation loop respects
+    /// it. This does NOT dispatch a model turn — it's a control-plane update.
+    async fn handle_set_goal_status(&mut self, status: GoalStatus, clear: bool) {
+        match self.config.goal_state.lock() {
+            Ok(mut state) => {
+                if clear {
+                    // `/goal clear` — wipe the objective entirely.
+                    state.sync_from_host_status(None, None, GoalStatus::Active);
+                } else {
+                    // Update only the status; keep the objective and budget.
+                    // `sync_from_host_status` resets usage when the objective
+                    // changes, but here we pass the existing objective so usage
+                    // is preserved (pause/resume shouldn't reset the counter).
+                    let objective = state.objective().map(str::to_string);
+                    let budget = state.token_budget();
+                    state.sync_from_host_status(objective.as_deref(), budget, status);
+                }
+            }
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned during SetGoalStatus: {err}");
+            }
+        }
+        let label = if clear {
+            "cleared"
+        } else {
+            match status {
+                GoalStatus::Active => "resumed",
+                GoalStatus::Paused => "paused",
+                GoalStatus::Complete => "complete",
+                GoalStatus::Blocked => "blocked",
+            }
+        };
+        let _ = self
+            .tx_event
+            .send(Event::status(format!("Goal {label}.")))
+            .await;
+        self.emit_goal_updated().await;
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn handle_send_message(
         &mut self,
@@ -1743,14 +1982,28 @@ impl Engine {
         translation_enabled: bool,
         show_thinking: bool,
         allowed_tools: Option<Vec<String>>,
+        dynamic_tools: Vec<DynamicToolSpec>,
         hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
         verbosity: Option<String>,
+        provenance: UserInputProvenance,
     ) {
+        let input_policy = effective_input_policy(
+            provenance,
+            mode,
+            &content,
+            allow_shell,
+            trust_mode,
+            auto_approve,
+            approval_mode,
+        );
+        if let Some(status) = input_policy.status.clone() {
+            let _ = self.tx_event.send(Event::status(status)).await;
+        }
         // Reset cancel token for fresh turn (in case previous was cancelled)
         self.reset_cancel_token();
 
         // Track current mode so mid-turn messages include the right mode in turn metadata.
-        self.current_mode = mode;
+        self.current_mode = input_policy.mode;
 
         // Drain stale steer messages from previous turns.
         while self.rx_steer.try_recv().is_ok() {}
@@ -1846,23 +2099,25 @@ impl Engine {
         self.session
             .working_set
             .observe_user_message(&content, &self.session.workspace);
-        let force_update_plan_first = should_force_update_plan_first(mode, &content);
+        let force_update_plan_first = should_force_update_plan_first(input_policy.mode, &content);
 
-        let agent_approval_mode = agent_approval_mode_for_turn(auto_approve, approval_mode);
-        self.session.auto_approve = auto_approve;
+        let agent_approval_mode =
+            agent_approval_mode_for_turn(input_policy.auto_approve, input_policy.approval_mode);
+        self.session.auto_approve = input_policy.auto_approve;
         // Only track the Agent-mode approval — Yolo/Plan have fixed
         // approval policies that are derived from the mode itself.
-        if mode == AppMode::Agent {
+        if input_policy.mode == AppMode::Agent {
             self.session.approval_mode = agent_approval_mode;
         }
 
         // Add user message to session
-        let user_msg = self.user_text_message_with_turn_metadata_for_route(
+        let user_msg = self.user_text_message_with_turn_metadata_for_route_and_provenance(
             content,
             &model,
             auto_model,
             reasoning_effort.as_deref(),
             reasoning_effort_auto,
+            provenance,
         );
         self.session.add_message(user_msg);
 
@@ -1892,10 +2147,10 @@ impl Engine {
         self.session.reasoning_effort = reasoning_effort;
         self.session.reasoning_effort_auto = reasoning_effort_auto;
         self.session.auto_model = auto_model;
-        self.session.allow_shell = allow_shell;
-        self.config.allow_shell = allow_shell;
-        self.session.trust_mode = trust_mode;
-        self.config.trust_mode = trust_mode;
+        self.session.allow_shell = input_policy.allow_shell;
+        self.config.allow_shell = input_policy.allow_shell;
+        self.session.trust_mode = input_policy.trust_mode;
+        self.config.trust_mode = input_policy.trust_mode;
         self.config.translation_enabled = translation_enabled;
         self.config.show_thinking = show_thinking;
         self.config.verbosity = verbosity;
@@ -1908,12 +2163,17 @@ impl Engine {
         let todo_list = self.config.todos.clone();
         let plan_state = self.config.plan_state.clone();
 
-        let tool_context = self.build_tool_context(mode, auto_approve);
-        let builder = self.build_turn_tool_registry_builder(mode, todo_list, plan_state);
+        let tool_context = self.build_tool_context(input_policy.mode, input_policy.auto_approve);
+        let builder = self
+            .build_turn_tool_registry_builder(input_policy.mode, todo_list, plan_state)
+            .with_dynamic_tools(&dynamic_tools);
 
-        let fork_context_for_runtime = if self.config.features.enabled(Feature::Subagents) {
+        let subagents_available =
+            self.config.subagents_enabled && self.config.features.enabled(Feature::Subagents);
+
+        let fork_context_for_runtime = if subagents_available {
             let state = StructuredState::capture(
-                mode.label(),
+                input_policy.mode.label(),
                 self.config.workspace.clone(),
                 std::env::current_dir().ok(),
                 &self.session.working_set,
@@ -1936,7 +2196,7 @@ impl Engine {
         // envelopes into `Event::SubAgentMailbox` so the UI can route them
         // to the matching in-transcript card. The drainer exits naturally
         // when every cloned sender is dropped at turn-end.
-        let mailbox_for_runtime = if self.config.features.enabled(Feature::Subagents) {
+        let mailbox_for_runtime = if subagents_available {
             let cancel_token = self.cancel_token.child_token();
             let (mailbox, mut receiver) = Mailbox::new(cancel_token.clone());
             let tx_event_clone = self.tx_event.clone();
@@ -1945,14 +2205,20 @@ impl Engine {
                 std::panic::Location::caller(),
                 async move {
                     while let Some(envelope) = receiver.recv().await {
-                        if tx_event_clone
-                            .send(Event::SubAgentMailbox {
-                                seq: envelope.seq,
-                                message: envelope.message,
-                            })
-                            .await
-                            .is_err()
+                        let event = Event::SubAgentMailbox {
+                            seq: envelope.seq,
+                            message: envelope.message,
+                        };
+                        if let Event::SubAgentMailbox { message, .. } = &event
+                            && subagent_mailbox_message_is_best_effort(message)
                         {
+                            match tx_event_clone.try_send(event) {
+                                Ok(()) => continue,
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => continue,
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                            }
+                        }
+                        if tx_event_clone.send(event).await.is_err() {
                             break;
                         }
                     }
@@ -1969,9 +2235,9 @@ impl Engine {
             None
         };
 
-        let mut tool_registry = match mode {
+        let mut tool_registry = match input_policy.mode {
             AppMode::Agent | AppMode::Yolo => {
-                if self.config.features.enabled(Feature::Subagents) {
+                if subagents_available {
                     let runtime = if let Some(client) = self.deepseek_client.clone() {
                         let mut rt = SubAgentRuntime::new(
                             client,
@@ -1991,6 +2257,7 @@ impl Engine {
                         .with_step_api_timeout(self.config.subagent_api_timeout)
                         .with_speech_output_dir(self.config.speech_output_dir.clone())
                         .with_mcp_pool(mcp_pool.clone())
+                        .with_todos(self.config.todos.clone())
                         .with_parent_completion_tx(self.tx_subagent_completion.clone());
                         if let Some(context) = fork_context_for_runtime.clone() {
                             rt = rt.with_fork_context(context);
@@ -2044,7 +2311,7 @@ impl Engine {
             let mut catalog = build_model_tool_catalog(
                 registry.to_api_tools_with_cache(true),
                 mcp_tools,
-                mode,
+                input_policy.mode,
                 &self.config.tools_always_load,
             );
             for tool in &mut catalog {
@@ -2074,7 +2341,7 @@ impl Engine {
             &mut turn,
             tool_registry.as_ref(),
             tools,
-            mode,
+            input_policy.mode,
             force_update_plan_first,
         ))
         .catch_unwind()
@@ -2131,6 +2398,49 @@ impl Engine {
                     Some(&snapshot_prompt_post),
                 );
             });
+        }
+
+        // ── Cross-turn goal continuation ───────────────────────────────────
+        // If the turn completed successfully and a goal is still Active (and
+        // under any optional budget), re-dispatch a synthetic continuation
+        // message back into the engine's own op channel. This makes `/goal` a
+        // persistent loop that runs until the model self-reports complete or
+        // blocked, the user pauses/clears, or an optional budget is exhausted.
+        // There is no continuation cap. A Failed or Interrupted turn does NOT
+        // continue — Esc cancels the loop by interrupting the turn.
+        if status == TurnOutcomeStatus::Completed {
+            if let Some(continuation) = self.goal_continuation_if_active() {
+                // Re-dispatch with the same route/mode/approval settings as
+                // the prior turn. The non-Copy values were moved into
+                // `self.config` / `self.session` earlier in this function, so
+                // we clone them back out here.
+                let _ = self
+                    .tx_op
+                    .send(Op::SendMessage {
+                        content: continuation,
+                        mode,
+                        provider,
+                        model: self.session.model.clone(),
+                        goal_objective: None,
+                        goal_token_budget: None,
+                        goal_status: GoalStatus::Active,
+                        reasoning_effort: self.session.reasoning_effort.clone(),
+                        reasoning_effort_auto,
+                        auto_model,
+                        allow_shell,
+                        trust_mode,
+                        auto_approve,
+                        approval_mode,
+                        translation_enabled,
+                        show_thinking,
+                        allowed_tools: self.config.allowed_tools.clone(),
+                        dynamic_tools: dynamic_tools.clone(),
+                        hook_executor: self.config.hook_executor.clone(),
+                        verbosity: self.config.verbosity.clone(),
+                        provenance: UserInputProvenance::Runtime,
+                    })
+                    .await;
+            }
         }
     }
 
@@ -2466,6 +2776,10 @@ impl Engine {
         .with_features(self.config.features.clone())
         .with_shell_manager(self.shell_manager.clone())
         .with_runtime_services(self.config.runtime_services.clone())
+        .with_skills_config(
+            self.config.skills_dir.clone(),
+            self.config.skills_scan_codewhale_only,
+        )
         .with_session_objects(crate::rlm::session::SessionObjectSnapshot::new(
             self.session.id.clone(),
             self.session.model.clone(),
@@ -2475,7 +2789,8 @@ impl Engine {
         ))
         .with_cancel_token(self.cancel_token.clone())
         .with_shell_policy(shell_policy_for_mode(mode, self.session.allow_shell))
-        .with_trusted_external_paths(trusted_external_paths);
+        .with_trusted_external_paths(trusted_external_paths)
+        .with_follow_symlinks(self.config.workspace_follow_symlinks);
 
         // Hand the user-memory path to tools so the model-callable
         // `remember` tool can append entries (#489). `None` when the
@@ -2696,6 +3011,7 @@ impl Engine {
                 ),
                 show_thinking: self.config.show_thinking,
                 verbosity: self.config.verbosity.as_deref(),
+                skills_scan_codewhale_only: self.config.skills_scan_codewhale_only,
             },
         );
         let mut stable_prompt =
@@ -2881,6 +3197,112 @@ fn goal_objective_for_prompt(
 // byte-stable, and strict chat-template providers never see a system message
 // outside messages[0].
 
+#[derive(Debug, Clone)]
+struct EffectiveInputPolicy {
+    mode: AppMode,
+    allow_shell: bool,
+    trust_mode: bool,
+    auto_approve: bool,
+    approval_mode: crate::tui::approval::ApprovalMode,
+    status: Option<String>,
+}
+
+fn effective_input_policy(
+    provenance: UserInputProvenance,
+    requested_mode: AppMode,
+    content: &str,
+    allow_shell: bool,
+    trust_mode: bool,
+    auto_approve: bool,
+    approval_mode: crate::tui::approval::ApprovalMode,
+) -> EffectiveInputPolicy {
+    let mut mode = requested_mode;
+    let mut trust_mode = trust_mode;
+    let mut auto_approve = auto_approve;
+    let mut approval_mode = approval_mode;
+    let mut status = None;
+
+    if !provenance.can_authorize_work() {
+        let had_auto_authority = matches!(mode, AppMode::Yolo)
+            || trust_mode
+            || auto_approve
+            || matches!(approval_mode, crate::tui::approval::ApprovalMode::Auto);
+        if matches!(mode, AppMode::Yolo) {
+            mode = AppMode::Agent;
+        }
+        trust_mode = false;
+        auto_approve = false;
+        if matches!(approval_mode, crate::tui::approval::ApprovalMode::Auto) {
+            approval_mode = crate::tui::approval::ApprovalMode::Suggest;
+        }
+        if had_auto_authority {
+            status = Some(format!(
+                "Input provenance '{}' is not external user input; continuing with approvals required.",
+                provenance.as_str()
+            ));
+        }
+    } else if is_review_only_user_intent(content) {
+        // Advisory only: never silently override an explicitly chosen mode
+        // (Yolo/Agent) or strip its tools. Surface the signal so the user can
+        // opt into read-only Plan mode themselves with `/mode plan`.
+        status = Some(
+            "This looks like a review or inspection request. Keeping your current mode and tools — run `/mode plan` for strict read-only tools.".to_string(),
+        );
+    }
+
+    EffectiveInputPolicy {
+        mode,
+        allow_shell,
+        trust_mode,
+        auto_approve,
+        approval_mode,
+        status,
+    }
+}
+
+fn is_review_only_user_intent(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    let asks_to_inspect = [
+        "look",
+        "check",
+        "review",
+        "inspect",
+        "scan",
+        "audit",
+        "看看",
+        "看一下",
+        "检查",
+        "审查",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if !asks_to_inspect {
+        return false;
+    }
+
+    let explicit_write = [
+        "fix",
+        "change",
+        "update",
+        "implement",
+        "apply",
+        "patch",
+        "modify",
+        "edit",
+        "write",
+        "commit",
+        "修",
+        "改",
+        "补",
+        "提交",
+        "写",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    !explicit_write
+}
+
 fn agent_approval_mode_for_turn(
     auto_approve: bool,
     approval_mode: crate::tui::approval::ApprovalMode,
@@ -2889,6 +3311,54 @@ fn agent_approval_mode_for_turn(
         crate::tui::approval::ApprovalMode::Auto
     } else {
         approval_mode
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ExecShellAskRuleDecision {
+    Prompt(String),
+    Block(String),
+}
+
+pub(super) fn exec_shell_ask_rule_decision(
+    config: &EngineConfig,
+    tool_name: &str,
+    tool_input: &Value,
+    workspace: &Path,
+    approval_mode: crate::tui::approval::ApprovalMode,
+) -> Option<ExecShellAskRuleDecision> {
+    if tool_name != "exec_shell" {
+        return None;
+    }
+    let command = tool_input.get("command").and_then(Value::as_str)?;
+    let cwd = workspace.to_string_lossy();
+    let ask_for_approval = match approval_mode {
+        crate::tui::approval::ApprovalMode::Never => AskForApproval::Never,
+        crate::tui::approval::ApprovalMode::Auto | crate::tui::approval::ApprovalMode::Suggest => {
+            AskForApproval::OnFailure
+        }
+    };
+    let decision = config
+        .exec_policy_engine
+        .check(ExecPolicyContext {
+            command,
+            cwd: cwd.as_ref(),
+            tool: Some(tool_name),
+            path: None,
+            ask_for_approval,
+            sandbox_mode: None,
+        })
+        .ok()?;
+    if !decision.allow {
+        Some(ExecShellAskRuleDecision::Block(
+            decision.reason().to_string(),
+        ))
+    } else if decision.requires_approval {
+        Some(ExecShellAskRuleDecision::Prompt(
+            decision.reason().to_string(),
+        ))
+    } else {
+        None
     }
 }
 
@@ -3028,7 +3498,7 @@ use self::dispatch::{
     mcp_tool_is_read_only, parse_parallel_tool_calls, parse_tool_input,
     plan_tool_execution_batches, should_force_update_plan_first, should_stop_after_plan_tool,
 };
-use self::loop_guard::{AttemptDecision, LoopGuard, OutcomeDecision};
+use self::loop_guard::{AttemptBlockKind, AttemptDecision, LoopGuard, OutcomeDecision};
 #[cfg(test)]
 use self::lsp_hooks::edited_paths_for_tool;
 #[cfg(test)]
@@ -3037,14 +3507,14 @@ use self::streaming::{
     ContentBlockKind, FAKE_WRAPPER_NOTICE, MAX_STREAM_ERRORS_BEFORE_FAIL, MAX_STREAM_RETRIES,
     MAX_TRANSPARENT_STREAM_RETRIES, STREAM_MAX_CONTENT_BYTES, STREAM_MAX_DURATION_SECS,
     ToolUseState, contains_fake_tool_wrapper, filter_tool_call_delta, should_resume_after_sleep,
-    should_transparently_retry_stream, sleep_gap_detected,
+    should_transparently_retry_stream, sleep_gap_detected, stream_read_error_user_message,
 };
 use self::tool_catalog::{
     CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
-    REQUEST_USER_INPUT_NAME, active_tools_for_step, apply_provider_tool_policy,
-    build_model_tool_catalog, ensure_advanced_tooling, execute_code_execution_tool,
-    execute_tool_search, initial_active_tools, is_tool_search_tool,
-    maybe_hydrate_requested_deferred_tool, missing_tool_error_message,
+    REQUEST_USER_INPUT_NAME, active_tools_for_step, build_model_tool_catalog,
+    ensure_advanced_tooling, execute_code_execution_tool, execute_tool_search,
+    initial_active_tools, is_tool_search_tool, maybe_hydrate_requested_deferred_tool,
+    missing_tool_error_message, tool_catalog_consistency_issues,
 };
 #[cfg(test)]
 use self::tool_catalog::{

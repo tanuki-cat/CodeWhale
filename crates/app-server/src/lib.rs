@@ -16,7 +16,7 @@ use codewhale_hooks::{HookDispatcher, JsonlHookSink, StdoutHookSink, UnixSocketH
 use codewhale_mcp::McpManager;
 use codewhale_protocol::{
     AppRequest, AppResponse, PromptRequest, PromptResponse, ThreadGoalClearParams,
-    ThreadGoalGetParams, ThreadGoalSetParams, ThreadRequest, ThreadResponse,
+    ThreadGoalGetParams, ThreadGoalSetParams, ThreadRequest, ThreadResponse, UserInputAnswerEvent,
 };
 use codewhale_state::StateStore;
 use codewhale_tools::{ToolCall, ToolRegistry};
@@ -27,6 +27,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
+
+/// Answers submitted for a pending `request_user_input` clarification.
+///
+/// The headless runtime emits [`codewhale_protocol::EventFrame::UserInputRequest`]
+/// fire-and-return (it has no resume channel, mirroring headless approval).
+/// Clients POST answers back via [`AppRequest::SubmitUserInput`]; we record
+/// them here keyed by `request_id` so a driver can retrieve and feed them into
+/// the next turn as structured context. True in-flight resume would require an
+/// awaiter in `invoke_tool` and is left as a follow-up.
+type PendingUserInputAnswers = Vec<UserInputAnswerEvent>;
 
 mod chat_completions;
 
@@ -71,6 +81,10 @@ struct AppState {
     runtime: Arc<Mutex<Runtime>>,
     registry: ModelRegistry,
     auth_token: Option<String>,
+    /// Answers submitted via `AppRequest::SubmitUserInput`, keyed by
+    /// `request_id`. A driver polls this to resolve clarification questions
+    /// raised by the model during a headless run.
+    pending_user_input: Arc<Mutex<std::collections::HashMap<String, PendingUserInputAnswers>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +381,7 @@ fn build_state(config_path: Option<PathBuf>, auth_token: Option<String>) -> Resu
         runtime: Arc::new(Mutex::new(runtime)),
         registry,
         auth_token,
+        pending_user_input: Arc::new(Mutex::new(std::collections::HashMap::new())),
     })
 }
 
@@ -377,6 +392,7 @@ fn resolve_auth_token(options: &AppServerOptions) -> Result<Option<String>> {
     {
         bail!("app-server auth token cannot be empty");
     }
+    let has_explicit_token = configured.is_some();
 
     if options.insecure_no_auth {
         if !options.listen.ip().is_loopback() {
@@ -386,10 +402,16 @@ fn resolve_auth_token(options: &AppServerOptions) -> Result<Option<String>> {
         return Ok(None);
     }
 
+    if !has_explicit_token && !options.listen.ip().is_loopback() {
+        bail!(
+            "refusing non-loopback app-server bind without explicit auth token; pass --auth-token or set CODEWHALE_APP_SERVER_TOKEN"
+        );
+    }
+
     let token = configured
         .map(str::to_string)
         .unwrap_or_else(|| format!("cwapp_{}", Uuid::new_v4().simple()));
-    if options.auth_token.is_some() {
+    if has_explicit_token {
         eprintln!("app-server auth: bearer token required for HTTP routes.");
     } else {
         eprintln!("app-server auth: generated bearer token for this process.");
@@ -992,6 +1014,33 @@ async fn process_app_request(
                 },
             }
         }
+        AppRequest::SubmitUserInput {
+            request_id,
+            answers,
+        } => {
+            // Record the user's answers against the pending clarification
+            // request so a driver can retrieve them. The headless runtime does
+            // not block on `request_user_input` (fire-and-return, like
+            // approval), so there is no in-flight turn to resume here — the
+            // caller is expected to feed these answers into the next turn.
+            let mut pending = state.pending_user_input.lock().await;
+            if pending.contains_key(&request_id) {
+                return AppResponse {
+                    ok: false,
+                    data: json!({
+                        "error": "request_id already resolved",
+                        "request_id": request_id,
+                    }),
+                    events: Vec::new(),
+                };
+            }
+            pending.insert(request_id.clone(), answers);
+            AppResponse {
+                ok: true,
+                data: json!({ "request_id": request_id, "resolved": true }),
+                events: Vec::new(),
+            }
+        }
     }
 }
 
@@ -1147,15 +1196,13 @@ mod tests {
             listen: "0.0.0.0:8787".parse().expect("socket addr"),
             config_path: None,
             auth_token: None,
-            insecure_no_auth: true,
+            insecure_no_auth: false,
             cors_origins: Vec::new(),
         };
 
-        let err = resolve_auth_token(&options).expect_err("non-loopback unauth should fail");
-        assert!(
-            err.to_string()
-                .contains("refusing unauthenticated app-server bind")
-        );
+        let err =
+            resolve_auth_token(&options).expect_err("non-loopback generated auth should fail");
+        assert!(err.to_string().contains("without explicit auth token"));
     }
 
     #[tokio::test]
@@ -1372,6 +1419,19 @@ mod tests {
     }
 
     #[test]
+    fn auth_token_explicit_allows_non_loopback_bind() {
+        let options = AppServerOptions {
+            listen: "0.0.0.0:8787".parse().expect("socket addr"),
+            config_path: None,
+            auth_token: Some("my-secret".to_string()),
+            insecure_no_auth: false,
+            cors_origins: Vec::new(),
+        };
+        let token = resolve_auth_token(&options).unwrap();
+        assert_eq!(token.as_deref(), Some("my-secret"));
+    }
+
+    #[test]
     fn insecure_no_auth_on_loopback_returns_none() {
         let options = AppServerOptions {
             listen: "127.0.0.1:0".parse().expect("addr"),
@@ -1382,6 +1442,23 @@ mod tests {
         };
         let token = resolve_auth_token(&options).unwrap();
         assert!(token.is_none());
+    }
+
+    #[test]
+    fn insecure_no_auth_on_non_loopback_fails_fast() {
+        let options = AppServerOptions {
+            listen: "0.0.0.0:8787".parse().expect("socket addr"),
+            config_path: None,
+            auth_token: None,
+            insecure_no_auth: true,
+            cors_origins: Vec::new(),
+        };
+
+        let err = resolve_auth_token(&options).expect_err("non-loopback unauth should fail");
+        assert!(
+            err.to_string()
+                .contains("refusing unauthenticated app-server bind")
+        );
     }
 
     // ── cors_layer ─────────────────────────────────────────────────────

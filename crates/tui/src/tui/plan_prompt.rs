@@ -10,6 +10,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::palette;
 use crate::tools::plan::{PlanSnapshot, StepStatus};
+use crate::tools::todo::{TodoListSnapshot, TodoStatus};
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 
 struct PlanOption {
@@ -130,6 +131,10 @@ pub struct PlanPromptView {
     confirming_exit: bool,
     /// The plan snapshot to display (if update_plan was called).
     plan: Option<PlanSnapshot>,
+    /// The checklist/todo snapshot to display (if `checklist_write` was used).
+    /// Kept separate from the plan so the most actionable view of progress is
+    /// visible inside the plan confirmation modal.
+    todos: Option<TodoListSnapshot>,
 }
 
 impl PlanPromptView {
@@ -141,7 +146,17 @@ impl PlanPromptView {
             last_max_scroll: Cell::new(0),
             confirming_exit: false,
             plan,
+            todos: None,
         }
+    }
+
+    /// Attach the current checklist/todo snapshot so it renders inside the plan
+    /// confirmation modal alongside the plan steps. Existing callers default to
+    /// `None`, so this is opt-in at the production construction site only.
+    #[must_use]
+    pub fn with_todos(mut self, todos: Option<TodoListSnapshot>) -> Self {
+        self.todos = todos;
+        self
     }
 
     fn max_index(&self) -> usize {
@@ -374,6 +389,12 @@ impl ModalView for PlanPromptView {
             push_plan_snapshot_lines(&mut lines, plan, content_width);
         }
 
+        // v0.8.62: render the active checklist so the most actionable view of
+        // progress is visible inside the plan confirmation modal.
+        if let Some(ref todos) = self.todos {
+            push_todo_snapshot_lines(&mut lines, todos, content_width);
+        }
+
         for (idx, option) in PLAN_OPTIONS.iter().enumerate() {
             let number = idx + 1;
             push_option_lines(
@@ -568,6 +589,42 @@ fn push_plan_snapshot_lines(
         )));
         lines.push(Line::from(""));
     }
+}
+
+/// Render the active checklist/todo snapshot beneath the plan details.
+///
+/// Mirrors the plan-step glyph language (`·` pending, `▶` in progress, `✓`
+/// completed) so the two read as one surface. Completed items are dimmed so
+/// attention lands on what remains.
+fn push_todo_snapshot_lines(
+    lines: &mut Vec<Line<'static>>,
+    todos: &TodoListSnapshot,
+    content_width: usize,
+) {
+    if todos.items.is_empty() {
+        return;
+    }
+    lines.push(Line::from(Span::styled(
+        format!("Checklist ({}% complete):", todos.completion_pct),
+        Style::default().fg(palette::DEEPSEEK_SKY).bold(),
+    )));
+    for (i, item) in todos.items.iter().enumerate() {
+        let status_mark = match item.status {
+            TodoStatus::Pending => "\u{b7}",
+            TodoStatus::InProgress => "\u{25b6}",
+            TodoStatus::Completed => "\u{2713}",
+        };
+        let item_text = format!("  {status_mark} {}. {}", i + 1, &item.content);
+        let style = if matches!(item.status, TodoStatus::Completed) {
+            Style::default().fg(palette::TEXT_MUTED)
+        } else {
+            Style::default().fg(palette::TEXT_PRIMARY)
+        };
+        for line in wrap_text(&item_text, content_width) {
+            lines.push(Line::from(Span::styled(line, style)));
+        }
+    }
+    lines.push(Line::from(""));
 }
 
 fn plan_uses_rich_artifact_shape(plan: &PlanSnapshot) -> bool {
@@ -802,6 +859,55 @@ mod tests {
         assert!(rendered.contains("Verification plan:"));
         assert!(rendered.contains("Handoff packet:"));
         assert!(rendered.contains("Render rich sections"));
+    }
+
+    #[test]
+    fn plan_prompt_renders_active_checklist_when_provided() {
+        use crate::tools::todo::{TodoItem, TodoListSnapshot, TodoStatus};
+
+        let todos = TodoListSnapshot {
+            items: vec![
+                TodoItem {
+                    id: 1,
+                    content: "Read the brief".to_string(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    id: 2,
+                    content: "Render the checklist".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    id: 3,
+                    content: "Ship the PR".to_string(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+            completion_pct: 33,
+            in_progress_id: Some(2),
+        };
+        let view = PlanPromptView::new(None).with_todos(Some(todos));
+        let rendered = render_view(&view, 160, 120);
+
+        assert!(rendered.contains("Checklist (33% complete):"));
+        assert!(rendered.contains("Read the brief"));
+        assert!(rendered.contains("Render the checklist"));
+        assert!(rendered.contains("Ship the PR"));
+    }
+
+    #[test]
+    fn plan_prompt_omits_checklist_section_when_empty() {
+        use crate::tools::todo::TodoListSnapshot;
+
+        let todos = TodoListSnapshot {
+            items: vec![],
+            completion_pct: 0,
+            in_progress_id: None,
+        };
+        let view = PlanPromptView::new(None).with_todos(Some(todos));
+        let rendered = render_view(&view, 160, 120);
+
+        assert!(!rendered.contains("Checklist"));
     }
 
     #[test]

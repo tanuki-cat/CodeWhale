@@ -115,6 +115,10 @@ pub struct ShellJobSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_since_output_ms: Option<u64>,
     pub linked_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_name: Option<String>,
 }
 
 /// Once-only completion event for a tracked background shell job.
@@ -128,6 +132,17 @@ pub struct ShellCompletionEvent {
     pub stdout_tail: String,
     pub stderr_tail: String,
     pub linked_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_name: Option<String>,
+}
+
+/// Optional owner attribution for background shell work.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellJobOwner {
+    pub agent_id: String,
+    pub agent_name: String,
 }
 
 /// Full output view used by `/jobs show <id>`.
@@ -501,6 +516,7 @@ pub struct BackgroundShell {
     last_observed_output_len: usize,
     pub sandbox_type: SandboxType,
     pub linked_task_id: Option<String>,
+    pub owner_agent: Option<ShellJobOwner>,
     stdout_buffer: Arc<Mutex<Vec<u8>>>,
     stderr_buffer: Option<Arc<Mutex<Vec<u8>>>>,
     stdout_cursor: usize,
@@ -772,6 +788,14 @@ impl BackgroundShell {
             stale,
             elapsed_since_output_ms,
             linked_task_id: self.linked_task_id.clone(),
+            owner_agent_id: self
+                .owner_agent
+                .as_ref()
+                .map(|owner| owner.agent_id.clone()),
+            owner_agent_name: self
+                .owner_agent
+                .as_ref()
+                .map(|owner| owner.agent_name.clone()),
         }
     }
 
@@ -786,6 +810,8 @@ impl BackgroundShell {
             stdout_tail: snapshot.stdout_tail,
             stderr_tail: snapshot.stderr_tail,
             linked_task_id: snapshot.linked_task_id,
+            owner_agent_id: snapshot.owner_agent_id,
+            owner_agent_name: snapshot.owner_agent_name,
         }
     }
 
@@ -993,6 +1019,34 @@ impl ShellManager {
         policy_override: Option<ExecutionSandboxPolicy>,
         extra_env: HashMap<String, String>,
     ) -> Result<ShellResult> {
+        self.execute_with_options_env_for_owner(
+            command,
+            working_dir,
+            timeout_ms,
+            background,
+            stdin_data,
+            tty,
+            policy_override,
+            extra_env,
+            None,
+        )
+    }
+
+    /// Same as `execute_with_options_env`, with optional background-job owner
+    /// attribution for sub-agent launched jobs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_with_options_env_for_owner(
+        &mut self,
+        command: &str,
+        working_dir: Option<&str>,
+        timeout_ms: u64,
+        background: bool,
+        stdin_data: Option<&str>,
+        tty: bool,
+        policy_override: Option<ExecutionSandboxPolicy>,
+        extra_env: HashMap<String, String>,
+        owner_agent: Option<ShellJobOwner>,
+    ) -> Result<ShellResult> {
         // Log execution via ShellDispatcher when SHELL_DISPATCHER_LOG is set.
         crate::shell_dispatcher::ShellDispatcher::log_exec(command);
 
@@ -1011,7 +1065,14 @@ impl ShellManager {
         let exec_env = self.sandbox_manager.prepare(&spec);
 
         if background {
-            self.spawn_background_sandboxed(command, &work_dir, &exec_env, stdin_data, tty)
+            self.spawn_background_sandboxed(
+                command,
+                &work_dir,
+                &exec_env,
+                stdin_data,
+                tty,
+                owner_agent,
+            )
         } else {
             if tty {
                 return Err(anyhow!(
@@ -1358,6 +1419,7 @@ impl ShellManager {
         exec_env: &ExecEnv,
         stdin_data: Option<&str>,
         tty: bool,
+        owner_agent: Option<ShellJobOwner>,
     ) -> Result<ShellResult> {
         let task_id = format!("shell_{}", &Uuid::new_v4().to_string()[..8]);
         let started = Instant::now();
@@ -1484,6 +1546,7 @@ impl ShellManager {
             last_observed_output_len: 0,
             sandbox_type,
             linked_task_id: None,
+            owner_agent,
             stdout_buffer,
             stderr_buffer,
             stdout_cursor: 0,
@@ -1726,7 +1789,7 @@ impl ShellManager {
     }
 
     /// Drain finished background shell jobs that have not yet been reported to
-    /// the model/runtime transcript.
+    /// runtime status.
     pub fn drain_finished_jobs(&mut self) -> Vec<ShellCompletionEvent> {
         let mut events = Vec::new();
         for shell in self.processes.values_mut() {
@@ -1768,6 +1831,8 @@ impl ShellManager {
                 stale: true,
                 elapsed_since_output_ms: None,
                 linked_task_id,
+                owner_agent_id: None,
+                owner_agent_name: None,
             },
         );
     }
@@ -1879,6 +1944,10 @@ shell sandbox). Workarounds: (1) run the Docker build from a regular terminal ou
 TUI, or (2) disable BuildKit with DOCKER_BUILDKIT=0 (only works if your Dockerfiles do not \
 use RUN --mount directives).";
 
+const PYTHON_BUILD_DEPENDENCY_HINT: &str = "Python build dependency missing: setuptools is not \
+available in the active environment. Install the declared build requirements first, for example \
+`python -m pip install -U pip setuptools wheel build`, then rerun the build command.";
+
 fn attach_cargo_failure_summary(
     metadata: &mut serde_json::Value,
     command: &str,
@@ -1888,6 +1957,19 @@ fn attach_cargo_failure_summary(
         summarize_cargo_failure(command, &result.stdout, &result.stderr, result.exit_code)
     {
         metadata["cargo_failure_summary"] = summary.to_metadata_value();
+    }
+}
+
+fn attach_python_build_dependency_hint(
+    metadata: &mut serde_json::Value,
+    hint: Option<&'static str>,
+) {
+    if let Some(hint) = hint {
+        metadata["python_build_dependency_hint"] = json!({
+            "kind": "missing_setuptools",
+            "hint": hint,
+            "recommended_first_step": "python -m pip install -U pip setuptools wheel build",
+        });
     }
 }
 
@@ -1904,6 +1986,58 @@ pub(crate) fn looks_like_macos_provenance_failure(result: &ShellResult) -> bool 
 fn macos_provenance_hint(result: &ShellResult) -> Option<&'static str> {
     if looks_like_macos_provenance_failure(result) {
         Some(MACOS_PROVENANCE_HINT)
+    } else {
+        None
+    }
+}
+
+fn python_build_dependency_hint(command: &str, result: &ShellResult) -> Option<&'static str> {
+    if matches!(result.status, ShellStatus::Completed) && result.exit_code == Some(0) {
+        return None;
+    }
+
+    let command = command.to_ascii_lowercase();
+    let combined = format!("{}\n{}", result.stdout, result.stderr).to_ascii_lowercase();
+    let mentions_missing_setuptools = [
+        "no module named 'setuptools'",
+        "no module named \"setuptools\"",
+        "setuptools is not available",
+        "cannot import 'setuptools",
+        "cannot import \"setuptools",
+        "missing dependencies",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle))
+        && combined.contains("setuptools");
+    if !mentions_missing_setuptools {
+        return None;
+    }
+
+    let pythonish_command = [
+        "python",
+        "pip",
+        "pytest",
+        "tox",
+        "nox",
+        "cython",
+        "setup.py",
+        "build_ext",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle));
+    let pythonish_output = [
+        "setup.py",
+        "pyproject.toml",
+        "build_meta",
+        "build_ext",
+        "pep 517",
+        "cython",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle));
+
+    if pythonish_command || pythonish_output {
+        Some(PYTHON_BUILD_DEPENDENCY_HINT)
     } else {
         None
     }
@@ -2000,6 +2134,32 @@ fn shell_network_restricted_hint<'a>(
     } else {
         None
     }
+}
+
+fn shell_job_owner_from_context(context: &ToolContext) -> Option<ShellJobOwner> {
+    let agent_id = context
+        .owner_agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let agent_name = context
+        .owner_agent_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(agent_id);
+    Some(ShellJobOwner {
+        agent_id: agent_id.to_string(),
+        agent_name: agent_name.to_string(),
+    })
+}
+
+fn attach_shell_owner_metadata(metadata: &mut serde_json::Value, context: &ToolContext) {
+    let Some(owner) = shell_job_owner_from_context(context) else {
+        return;
+    };
+    metadata["owner_agent_id"] = json!(owner.agent_id);
+    metadata["owner_agent_name"] = json!(owner.agent_name);
 }
 
 fn exec_shell_input_is_parallel_readonly(input: &serde_json::Value) -> bool {
@@ -2127,7 +2287,7 @@ impl ToolSpec for ExecShellTool {
     }
 
     fn description(&self) -> &'static str {
-        "Execute a shell command in the workspace directory. Foreground mode is for bounded commands; use background=true or task_shell_start for work expected to take >5 seconds. Background jobs return immediately and notify the transcript on completion."
+        "Execute a shell command in the workspace directory. Foreground mode is for bounded commands; use background=true or task_shell_start for work expected to take >5 seconds. Background jobs return immediately and report completion through task/status state instead of resuming the model."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -2144,7 +2304,7 @@ impl ToolSpec for ExecShellTool {
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Run in background and return task_id (default: false). Returns immediately and notifies on completion; prefer this for commands expected to take >5 seconds, including builds, test suites, servers, CI polling, sleep, or other long-running work. Use exec_shell_wait only when you need early output, and set wait=true only at a true dependency."
+                    "description": "Run in background and return task_id (default: false). Returns immediately; completion is tracked in task/status state. Prefer this for commands expected to take >5 seconds, including builds, test suites, servers, CI polling, sleep, or other long-running work. Use exec_shell_wait only when you need early output, final output, or a true dependency barrier."
                 },
                 "interactive": {
                     "type": "boolean",
@@ -2391,13 +2551,17 @@ impl ToolSpec for ExecShellTool {
             } else {
                 stdout_summary.clone()
             };
-            let output = if result.stdout.is_empty() && result.stderr.is_empty() {
+            let python_dependency_hint = python_build_dependency_hint(command, &result);
+            let mut output = if result.stdout.is_empty() && result.stderr.is_empty() {
                 "(no output)".to_string()
             } else if result.stderr.is_empty() {
                 result.stdout.clone()
             } else {
                 format!("{}\n\nSTDERR:\n{}", result.stdout, result.stderr)
             };
+            if let Some(hint) = python_dependency_hint {
+                output = format!("{hint}\n\n{output}");
+            }
 
             let mut metadata = json!({
                 "exit_code": result.exit_code,
@@ -2421,7 +2585,9 @@ impl ToolSpec for ExecShellTool {
                 "canceled": false,
                 "sandbox_backend": "opensandbox",
             });
+            attach_shell_owner_metadata(&mut metadata, context);
             attach_cargo_failure_summary(&mut metadata, command, &result);
+            attach_python_build_dependency_hint(&mut metadata, python_dependency_hint);
 
             return Ok(ToolResult {
                 content: output,
@@ -2447,7 +2613,7 @@ impl ToolSpec for ExecShellTool {
                 .shell_manager
                 .lock()
                 .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
-            manager.execute_with_options_env(
+            manager.execute_with_options_env_for_owner(
                 command,
                 working_dir.as_deref(),
                 timeout_ms,
@@ -2456,6 +2622,7 @@ impl ToolSpec for ExecShellTool {
                 tty,
                 policy_override,
                 extra_env,
+                shell_job_owner_from_context(context),
             )
         } else {
             execute_foreground_via_background(
@@ -2499,6 +2666,7 @@ impl ToolSpec for ExecShellTool {
                 let network_restricted_hint =
                     shell_network_restricted_hint(context, command, &result).map(str::to_string);
                 let provenance_hint = macos_provenance_hint(&result);
+                let python_dependency_hint = python_build_dependency_hint(command, &result);
                 let mut output = if interactive {
                     format!(
                         "Interactive command completed (exit code: {:?})",
@@ -2515,11 +2683,11 @@ impl ToolSpec for ExecShellTool {
                 } else if result.status == ShellStatus::Running {
                     if backgrounded_foreground {
                         format!(
-                            "Command moved to background: {task_id_str}\n\nReturns immediately; you will be notified in the transcript when it finishes. Keep working; call exec_shell_wait only if you need early output, or with wait=true at a true dependency."
+                            "Command moved to background: {task_id_str}\n\nReturns immediately; completion is tracked in task/status state. Keep working; call exec_shell_wait only if you need early output, final output, or wait=true at a true dependency."
                         )
                     } else {
                         format!(
-                            "Background task started: {task_id_str}\n\nReturns immediately; you will be notified in the transcript when it finishes. Keep working; call exec_shell_wait only if you need early output, or with wait=true at a true dependency."
+                            "Background task started: {task_id_str}\n\nReturns immediately; completion is tracked in task/status state. Keep working; call exec_shell_wait only if you need early output, final output, or wait=true at a true dependency."
                         )
                     }
                 } else if result.status == ShellStatus::Killed && was_cancelled {
@@ -2542,6 +2710,9 @@ impl ToolSpec for ExecShellTool {
                     output = format!("{hint}\n\n{output}");
                 }
                 if let Some(hint) = provenance_hint {
+                    output = format!("{hint}\n\n{output}");
+                }
+                if let Some(hint) = python_dependency_hint {
                     output = format!("{hint}\n\n{output}");
                 }
 
@@ -2582,7 +2753,8 @@ impl ToolSpec for ExecShellTool {
                 });
                 metadata["backgrounded"] = json!(background || backgrounded_foreground);
                 if background || backgrounded_foreground {
-                    metadata["auto_notify_on_completion"] = json!(true);
+                    metadata["auto_resume_on_completion"] = json!(false);
+                    metadata["completion_surface"] = json!("task_status");
                     metadata["background_policy"] = json!("nonblocking");
                 }
                 if result.status == ShellStatus::TimedOut && !background && !interactive {
@@ -2606,7 +2778,9 @@ impl ToolSpec for ExecShellTool {
                 if provenance_hint.is_some() {
                     metadata["macos_provenance_restricted"] = json!(true);
                 }
+                attach_shell_owner_metadata(&mut metadata, context);
                 attach_cargo_failure_summary(&mut metadata, command, &result);
+                attach_python_build_dependency_hint(&mut metadata, python_dependency_hint);
 
                 Ok(ToolResult {
                     content: output,
@@ -2653,6 +2827,7 @@ fn build_shell_delta_tool_result(delta: ShellDeltaResult, context: &ToolContext)
     let network_restricted_hint =
         shell_network_restricted_hint(context, &delta.command, &result).map(str::to_string);
     let provenance_hint = macos_provenance_hint(&result);
+    let python_dependency_hint = python_build_dependency_hint(&delta.command, &result);
     let stdout_summary = summarize_output(&result.stdout);
     let stderr_summary = summarize_output(&result.stderr);
     let summary = if !stderr_summary.is_empty() {
@@ -2680,6 +2855,9 @@ fn build_shell_delta_tool_result(delta: ShellDeltaResult, context: &ToolContext)
     if let Some(hint) = provenance_hint {
         output = format!("{hint}\n\n{output}");
     }
+    if let Some(hint) = python_dependency_hint {
+        output = format!("{hint}\n\n{output}");
+    }
 
     let mut metadata = json!({
         "exit_code": result.exit_code,
@@ -2703,7 +2881,9 @@ fn build_shell_delta_tool_result(delta: ShellDeltaResult, context: &ToolContext)
         "command": delta.command,
         "stream_delta": true,
     });
+    attach_shell_owner_metadata(&mut metadata, context);
     attach_cargo_failure_summary(&mut metadata, &delta.command, &result);
+    attach_python_build_dependency_hint(&mut metadata, python_dependency_hint);
 
     let mut tool_result = ToolResult {
         content: output,
@@ -2977,7 +3157,7 @@ impl ToolSpec for ShellWaitTool {
                 "wait": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Snapshot the latest background output and return immediately (default). Background jobs notify the transcript automatically on completion, so normally do not wait. Set wait=true only for a deliberate barrier at a true dependency or final gate."
+                    "description": "Snapshot the latest background output and return immediately (default). Background job completions are tracked in task/status state, so normally do not wait. Set wait=true only for a deliberate barrier at a true dependency or final gate."
                 }
             },
             "required": ["task_id"]

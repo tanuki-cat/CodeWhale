@@ -21,7 +21,7 @@ bằng `/restore` cho mọi lượt.
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.61
+codewhale --version   # 0.8.63
 ```
 
 Wrapper npm (Node 18+) tải binary đã xác minh SHA-256 từ GitHub Releases và
@@ -50,8 +50,8 @@ nix run github:Hmbown/CodeWhale
 scoop install codewhale        # hoặc trình cài NSIS từ GitHub Releases
 
 # CNB mirror cho người dùng khó truy cập GitHub ổn định
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.61 codewhale-cli --locked --force
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.61 codewhale-tui --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.63 codewhale-cli --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.63 codewhale-tui --locked --force
 
 # Homebrew legacy trong lúc formula đang được đổi tên
 brew tap Hmbown/deepseek-tui
@@ -107,25 +107,23 @@ toàn là cơ chế runtime, không phải lời dặn mà model phải tự nh�
   sandbox (bwrap, Landlock, Seatbelt, seccomp).
 - **Rollback đáng tin cậy.** Snapshot side-git và `/restore`, giữ bên ngoài
   `.git` của repo — hoàn tác một lượt không bao giờ chạm vào lịch sử của bạn.
-- **Hooks v2** *(0.8.58)*. Hook `tool_call_before` trả về quyết định JSON
+- **Hooks v2**. Hook `tool_call_before` trả về quyết định JSON
   `allow`/`deny`/`ask` với quy tắc deny thắng, matcher dạng glob, và
   `.codewhale/hooks.toml` riêng cho từng dự án.
-- **Sub-agent chạy song song với định tuyến theo provider** *(0.8.58)*. Điều
-  tra và triển khai song song, với các tier model lớn/rẻ được phân giải theo
-  từng provider — không hardcode model id.
+- **Sub-agent chạy song song với định tuyến theo provider**. Điều tra và triển
+  khai song song, với các tier model lớn/rẻ được phân giải theo từng provider —
+  không hardcode model id.
 - **Session bền.** Fork, relay handoff, và prompt cache lưu trên đĩa dùng
   chung giữa các session, ổn định từng byte khi chuyển qua lại giữa chế độ
-  Plan/Agent/YOLO *(0.8.56)*. Lượt chạy sống sót qua sleep hệ thống
-  *(0.8.57)*: máy ngủ giữa stream, thức dậy, request được âm thầm gửi lại
-  thay vì làm hỏng lượt.
+  Plan/Agent/YOLO. Lượt chạy sống sót qua sleep hệ thống: máy ngủ giữa stream,
+  thức dậy, request được âm thầm gửi lại thay vì làm hỏng lượt.
 - **Chế độ headless.** `codewhale exec` với `--allowed-tools`,
-  `--disallowed-tools` (deny thắng), `--max-turns` và
-  `--append-system-prompt` *(0.8.58)* cho script và CI.
+  `--disallowed-tools` (deny thắng), `--max-turns` và `--append-system-prompt`
+  cho script và CI.
 - **Nhúng được ở mọi nơi.** Runtime API HTTP/SSE và ACP, extension VS Code
   (Phase 0), và cầu nối Telegram/Feishu (cầu nối Weixin đang thử nghiệm).
 - **Độ hoàn thiện để dùng hằng ngày.** Vừa là MCP client *vừa* là MCP server,
-  skill tái sử dụng, bản địa hóa 7 ngôn ngữ (gồm cả hộp thoại phê duyệt từ
-  0.8.56), và speech/TTS qua Xiaomi MiMo.
+  skill tái sử dụng, bản địa hóa 7 ngôn ngữ, và speech/TTS qua Xiaomi MiMo.
 
 ### Mọi model, ưu tiên model mở
 
@@ -141,16 +139,23 @@ một bộ công cụ:
 - **Model mở, tự host:** `vllm`, `sglang` và `ollama` trỏ vào endpoint
   localhost của riêng bạn — không cần key.
 - **Provider đóng, hỗ trợ native:** `anthropic` qua adapter `/v1/messages`
-  chuyên dụng *(0.8.58)* với adaptive thinking, breakpoint prompt-cache và
-  phát lại signed-thinking — không phải shim giả giọng OpenAI — và
-  `openai-codex`, tái sử dụng phiên đăng nhập ChatGPT/Codex CLI sẵn có.
+  chuyên dụng với adaptive thinking, breakpoint prompt-cache và phát lại
+  signed-thinking — không phải shim giả giọng OpenAI — và `openai-codex`, tái
+  sử dụng phiên đăng nhập ChatGPT/Codex CLI sẵn có.
 
 Định tuyến không chỉ là đổi base URL: mức effort của `/reasoning` được dịch
 sang phương ngữ wire của từng provider, tier sub-agent phân giải theo
 provider, và phần facts về model trong system prompt được template theo từng
-model thay vì hardcode *(0.8.58)*. Đổi giữa session bằng `/provider` và
+model thay vì hardcode. Đổi giữa session bằng `/provider` và
 `/model`. Danh mục đầy đủ — credentials, base URL, ranh giới năng lực — nằm
 trong [docs/PROVIDERS.md](docs/PROVIDERS.md).
+
+Fanout của sub-agent ưu tiên cấu hình. Đặt mặc định trong `[subagents]`, rồi
+thêm `[subagents.providers.deepseek]`, `[subagents.providers.glm]`,
+`[subagents.providers.openrouter]` hoặc profile provider khác để khớp API bạn
+đang dùng. Direct DeepSeek có thể mở rộng; route subscription hoặc dễ bị rate
+limit có thể giữ ở 3–5 agent song song mà không đổi prompt hay code. Xem
+[docs/SUBAGENTS.md](docs/SUBAGENTS.md#concurrency-cap).
 
 Các nhãn phiên bản ở trên đánh dấu những gì đã hạ cánh trong ba bản phát hành
 gần nhất (0.8.56 → 0.8.58). Chi tiết đầy đủ trong [CHANGELOG.md](CHANGELOG.md).

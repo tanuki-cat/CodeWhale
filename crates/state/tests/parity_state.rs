@@ -176,8 +176,8 @@ fn init_schema_migration() {
     assert_eq!(messages.len(), 3);
     for (i, message) in messages.iter().enumerate() {
         assert_eq!(message.thread_id, "thread-test-1");
-        assert_eq!(message.role, format!("foo{}", i));
-        assert_eq!(message.content, format!("bar{}", i));
+        assert_eq!(message.role, format!("foo{i}"));
+        assert_eq!(message.content, format!("bar{i}"));
         assert_eq!(message.created_at, i as i64);
     }
 
@@ -341,8 +341,8 @@ fn init_schema_migration_same_second_messages() {
     assert_eq!(messages.len(), 4);
     for (i, message) in messages.iter().enumerate() {
         assert_eq!(message.thread_id, "thread-test-2");
-        assert_eq!(message.role, format!("foo{}", i));
-        assert_eq!(message.content, format!("bar{}", i));
+        assert_eq!(message.role, format!("foo{i}"));
+        assert_eq!(message.content, format!("bar{i}"));
         assert_eq!(message.created_at, 123);
     }
     assert_eq!(messages[0].parent_entry_id, None);
@@ -410,8 +410,8 @@ fn test_fork() {
         .enumerate()
         .map(|(i, message)| {
             assert_eq!(message.thread_id, "thread-test-1");
-            assert_eq!(message.role, format!("foo{}", i));
-            assert_eq!(message.content, format!("bar{}", i));
+            assert_eq!(message.role, format!("foo{i}"));
+            assert_eq!(message.content, format!("bar{i}"));
             message.id.to_string()
         })
         .collect::<Vec<_>>();
@@ -431,8 +431,8 @@ fn test_fork() {
         .zip(LIST_1.iter())
         .for_each(|(message, &i)| {
             assert_eq!(message.thread_id, "thread-test-1");
-            assert_eq!(message.role, format!("foo{}", i));
-            assert_eq!(message.content, format!("bar{}", i));
+            assert_eq!(message.role, format!("foo{i}"));
+            assert_eq!(message.content, format!("bar{i}"));
         });
     let leaves = store
         .list_leaf_messages("thread-test-1")
@@ -455,8 +455,8 @@ fn test_fork() {
         .zip(LIST_2.iter())
         .for_each(|(message, &i)| {
             assert_eq!(message.thread_id, "thread-test-1");
-            assert_eq!(message.role, format!("foo{}", i));
-            assert_eq!(message.content, format!("bar{}", i));
+            assert_eq!(message.role, format!("foo{i}"));
+            assert_eq!(message.content, format!("bar{i}"));
         });
 
     let leaves = store

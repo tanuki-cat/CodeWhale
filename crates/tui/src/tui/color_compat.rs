@@ -708,4 +708,64 @@ mod tests {
         let z_at = out.find('Z').expect("unlinked glyph");
         assert!(first_close_at < z_at && z_at < second_at, "{out:?}");
     }
+
+    /// #3029 end-to-end: the in-band `wrap_link` payload rendered into a Buffer
+    /// by `Paragraph` must (a) be cleaned out of the cells by the extractor and
+    /// (b) re-emitted out-of-band by the backend around the label glyph. This
+    /// proves producer (`extract_buffer_link_regions` + `set_frame_links`) and
+    /// consumer (`ColorCompatBackend::draw`) compose.
+    #[test]
+    fn osc8_extractor_feeds_backend_out_of_band() {
+        use crate::tui::osc8;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Paragraph, Widget};
+
+        // 1. Render an in-band link payload into a buffer, exactly as the
+        //    transcript render seam would.
+        let target = "https://example.test/e2e";
+        let label = "open";
+        let wrapped = osc8::wrap_link(target, label);
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buf = Buffer::empty(area);
+        Paragraph::new(vec![Line::from(vec![Span::raw(wrapped)])]).render(area, &mut buf);
+
+        // 2. The extractor recovers the region AND blanks the payload cells.
+        //    Capture the region once — re-running would find nothing because
+        //    the payload is now gone (that's the point).
+        let regions = osc8::extract_buffer_link_regions(&mut buf, area);
+        assert_eq!(regions.len(), 1, "one link recovered: {regions:?}");
+        osc8::set_frame_links(regions);
+
+        // 3. Hand the cleaned cells to the backend and capture the byte stream.
+        let writer = SharedWriter::default();
+        let capture = writer.0.clone();
+        let mut backend = ColorCompatBackend::new(writer, ColorDepth::TrueColor, PaletteMode::Dark);
+        let cells: Vec<(u16, u16, ratatui::buffer::Cell)> = (0..area.width)
+            .map(|x| {
+                let cell = buf[(x, 0)].clone();
+                (x, 0u16, cell)
+            })
+            .collect();
+        backend
+            .draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))
+            .unwrap();
+        let out = String::from_utf8_lossy(&capture.borrow()).to_string();
+
+        // 4. The backend re-emitted the link out-of-band around the label.
+        let open = format!("\x1b]8;;{target}\x1b\\");
+        let close = "\x1b]8;;\x1b\\";
+        assert_eq!(
+            out.matches(open.as_str()).count(),
+            1,
+            "open emitted once: {out:?}"
+        );
+        assert_eq!(out.matches(close).count(), 1, "close emitted once: {out:?}");
+        let open_at = out.find(open.as_str()).expect("open");
+        let close_at = out.find(close).expect("close");
+        let label_at = out.find(label).expect("label glyph");
+        assert!(open_at < label_at, "open precedes label: {out:?}");
+        assert!(label_at < close_at, "close follows label: {out:?}");
+    }
 }

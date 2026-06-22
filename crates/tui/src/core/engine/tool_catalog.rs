@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::config::ApiProvider;
+use crate::mcp::McpPool;
 use crate::models::Tool;
 use crate::tools::spec::{ToolError, ToolResult, optional_u64, required_str};
 use crate::tui::app::AppMode;
@@ -65,6 +65,36 @@ pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     "write_file",
 ];
 
+const CORE_ACTION_TOOL_FALLBACKS: &[CoreActionToolFallback] = &[
+    CoreActionToolFallback {
+        name: "exec_shell",
+        description: "Run shell commands in the workspace.",
+        unavailable_reason: "Not present in the current model-visible catalog. Shell requires Agent or Yolo mode with allow_shell = true and no command tool allow/deny gate blocking it.",
+    },
+    CoreActionToolFallback {
+        name: "write_file",
+        description: "Create or overwrite files in the workspace.",
+        unavailable_reason: "Not present in the current model-visible catalog. File writes require Agent or Yolo mode and no command tool allow/deny gate blocking write_file.",
+    },
+    CoreActionToolFallback {
+        name: "edit_file",
+        description: "Edit existing files by replacing text.",
+        unavailable_reason: "Not present in the current model-visible catalog. File edits require Agent or Yolo mode and no command tool allow/deny gate blocking edit_file.",
+    },
+    CoreActionToolFallback {
+        name: "apply_patch",
+        description: "Apply a patch to one or more workspace files.",
+        unavailable_reason: "Not present in the current model-visible catalog. Patches require Agent or Yolo mode, the apply_patch feature, and no command tool allow/deny gate blocking apply_patch.",
+    },
+];
+
+#[derive(Debug, Clone, Copy)]
+struct CoreActionToolFallback {
+    name: &'static str,
+    description: &'static str,
+    unavailable_reason: &'static str,
+}
+
 pub(super) fn should_default_defer_tool(name: &str, always_load: &HashSet<String>) -> bool {
     if always_load.contains(name) {
         return false;
@@ -82,63 +112,6 @@ pub(super) fn should_default_defer_tool(name: &str, always_load: &HashSet<String
 pub(super) fn apply_native_tool_deferral(catalog: &mut [Tool], always_load: &HashSet<String>) {
     for tool in catalog {
         tool.defer_loading = Some(should_default_defer_tool(&tool.name, always_load));
-    }
-}
-
-/// First-turn native tool surface for Arcee (Trinity).
-///
-/// Arcee's hosted API is fronted by Cloudflare, whose managed WAF returns
-/// HTTP 403 "Access Denied" when a request body contains injection-like text.
-/// CodeWhale's full agent catalog trips it: shell/patch/code-execution tool
-/// descriptions and schemas carry example payloads (`rm -rf`, `../../`,
-/// `<script>`, `DROP TABLE`, `eval(base64_decode(...))`) that match the
-/// ruleset. Keeping only this benign, read-only set active on the first turn
-/// lets the request clear the gateway; every other tool stays deferred in the
-/// catalog and remains discoverable through tool-search. Live-verified: a
-/// benign `list_dir` tool returns 200 while a risky shell description returns
-/// 403 from `api.arcee.ai`.
-pub(super) const ARCEE_FIRST_TURN_NATIVE_TOOLS: &[&str] = &[
-    "checklist_write",
-    "file_search",
-    "git_diff",
-    "git_status",
-    "grep_files",
-    "list_dir",
-    "read_file",
-    "update_plan",
-];
-
-/// Returns the provider-specific first-turn allow-list, or `None` when the
-/// provider should use the default deferral policy.
-fn provider_first_turn_native_tools(provider: ApiProvider) -> Option<&'static [&'static str]> {
-    match provider {
-        ApiProvider::Arcee => Some(ARCEE_FIRST_TURN_NATIVE_TOOLS),
-        _ => None,
-    }
-}
-
-/// Narrow the *active* tool surface for WAF-fronted providers on top of the
-/// default deferral flags. The full catalog is preserved (deferred tools stay
-/// present and discoverable via tool-search); only the first-turn `active`
-/// partition is reduced so the opening request clears the provider gateway.
-///
-/// Tool-search tools and any user-pinned `always_load` tools stay active so the
-/// model can still hydrate the deferred tail when it needs a tool outside the
-/// reduced set.
-pub(super) fn apply_provider_tool_policy(
-    catalog: &mut [Tool],
-    provider: ApiProvider,
-    always_load: &HashSet<String>,
-) {
-    let Some(active) = provider_first_turn_native_tools(provider) else {
-        return;
-    };
-    for tool in catalog {
-        if is_tool_search_tool(&tool.name) || always_load.contains(&tool.name) {
-            tool.defer_loading = Some(false);
-            continue;
-        }
-        tool.defer_loading = Some(!active.contains(&tool.name.as_str()));
     }
 }
 
@@ -365,6 +338,83 @@ fn tool_search_haystack(tool: &Tool) -> String {
     )
 }
 
+fn tool_search_fallback_haystack(fallback: CoreActionToolFallback) -> String {
+    format!(
+        "{}\n{}\n{}",
+        fallback.name.to_lowercase(),
+        fallback.description.to_lowercase(),
+        fallback.unavailable_reason.to_lowercase()
+    )
+}
+
+fn catalog_contains_tool(catalog: &[Tool], name: &str) -> bool {
+    catalog.iter().any(|tool| tool.name == name)
+}
+
+fn unavailable_core_action_tools_with_regex(
+    catalog: &[Tool],
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<CoreActionToolFallback>, ToolError> {
+    if max_results == 0 {
+        return Ok(Vec::new());
+    }
+    let regex = regex::Regex::new(query)
+        .map_err(|err| ToolError::invalid_input(format!("Invalid regex query: {err}")))?;
+    Ok(CORE_ACTION_TOOL_FALLBACKS
+        .iter()
+        .copied()
+        .filter(|fallback| !catalog_contains_tool(catalog, fallback.name))
+        .filter(|fallback| regex.is_match(&tool_search_fallback_haystack(*fallback)))
+        .take(max_results)
+        .collect())
+}
+
+fn unavailable_core_action_tools_with_bm25_like(
+    catalog: &[Tool],
+    query: &str,
+    max_results: usize,
+) -> Vec<CoreActionToolFallback> {
+    if max_results == 0 {
+        return Vec::new();
+    }
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<(i64, CoreActionToolFallback)> = Vec::new();
+    for fallback in CORE_ACTION_TOOL_FALLBACKS {
+        if catalog_contains_tool(catalog, fallback.name) {
+            continue;
+        }
+        let hay = tool_search_fallback_haystack(*fallback);
+        let name = fallback.name.to_lowercase();
+        let mut score = 0i64;
+        for term in &terms {
+            if hay.contains(term) {
+                score += 1;
+            }
+            if name.contains(term) {
+                score += 2;
+            }
+        }
+        if score > 0 {
+            scored.push((score, *fallback));
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(b.1.name)));
+    scored
+        .into_iter()
+        .take(max_results)
+        .map(|(_, fallback)| fallback)
+        .collect()
+}
+
 fn discover_tools_with_regex(
     catalog: &[Tool],
     query: &str,
@@ -495,6 +545,51 @@ fn suggest_tool_names(catalog: &[Tool], requested: &str, limit: usize) -> Vec<St
         .take(limit)
         .map(|(_, _, name)| name)
         .collect()
+}
+
+fn is_synthetic_catalog_tool(name: &str) -> bool {
+    is_tool_search_tool(name)
+        || matches!(name, CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME)
+        || McpPool::is_mcp_tool(name)
+}
+
+pub(super) fn tool_catalog_consistency_issues(
+    catalog: &[Tool],
+    registry: &crate::tools::ToolRegistry,
+) -> Vec<String> {
+    let catalog_names = catalog
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+    let registry_api_tools = registry.to_api_tools();
+    let registry_model_visible_names = registry_api_tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut issues = Vec::new();
+
+    for tool in catalog {
+        if is_synthetic_catalog_tool(&tool.name) {
+            continue;
+        }
+        if !registry.contains(&tool.name) {
+            issues.push(format!(
+                "catalog advertises '{}' but no registered handler exists",
+                tool.name
+            ));
+        }
+    }
+
+    for name in DEFAULT_ACTIVE_NATIVE_TOOLS {
+        if registry_model_visible_names.contains(name) && !catalog_names.contains(name) {
+            issues.push(format!(
+                "registered core tool '{name}' is missing from the model/search catalog"
+            ));
+        }
+    }
+
+    issues.sort();
+    issues
 }
 
 pub(super) fn missing_tool_error_message(tool_name: &str, catalog: &[Tool]) -> String {
@@ -810,6 +905,12 @@ pub(super) fn execute_tool_search(
     } else {
         discover_tools_with_bm25_like(catalog, query, max_results)
     };
+    let remaining_results = max_results.saturating_sub(discovered.len());
+    let unavailable = if tool_name == TOOL_SEARCH_REGEX_NAME {
+        unavailable_core_action_tools_with_regex(catalog, query, remaining_results)?
+    } else {
+        unavailable_core_action_tools_with_bm25_like(catalog, query, remaining_results)
+    };
 
     for name in &discovered {
         active_tools.insert(name.clone());
@@ -819,10 +920,21 @@ pub(super) fn execute_tool_search(
         .iter()
         .map(|name| json!({"type": "tool_reference", "tool_name": name}))
         .collect::<Vec<_>>();
+    let unavailable_references = unavailable
+        .iter()
+        .map(|fallback| {
+            json!({
+                "type": "unavailable_tool_reference",
+                "tool_name": fallback.name,
+                "reason": fallback.unavailable_reason,
+            })
+        })
+        .collect::<Vec<_>>();
 
     let payload = json!({
         "type": "tool_search_tool_search_result",
         "tool_references": references,
+        "unavailable_tool_references": unavailable_references.clone(),
     });
 
     Ok(ToolResult {
@@ -830,6 +942,7 @@ pub(super) fn execute_tool_search(
         success: true,
         metadata: Some(json!({
             "tool_references": discovered,
+            "unavailable_tool_references": unavailable_references,
         })),
     })
 }

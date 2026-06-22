@@ -153,15 +153,13 @@ pub fn footer_working_label(frame: u64, locale: Locale) -> String {
     out
 }
 
-/// Build a "⏳ shell running" chip span when a foreground shell command is
-/// active. Empty when no shell is running, which hides the chip entirely.
 #[must_use]
-pub fn footer_shell_chip(active: bool) -> Vec<Span<'static>> {
-    if !active {
+pub fn footer_shell_label_chip(label: String) -> Vec<Span<'static>> {
+    if label.trim().is_empty() {
         return Vec::new();
     }
     vec![Span::styled(
-        "\u{23F3} shell running".to_string(),
+        format!("\u{23F3} {label}"),
         Style::default().fg(palette::STATUS_WARNING),
     )]
 }

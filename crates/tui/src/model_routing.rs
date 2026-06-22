@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::client::DeepSeekClient;
 use crate::config::{ApiProvider, Config, normalize_model_name_for_provider};
@@ -44,10 +44,10 @@ impl RouterCandidates {
 ///
 /// DeepSeek providers route between the canonical pro/flash pair. Hosted
 /// routes with known wire ids for that pair (NVIDIA NIM, OpenRouter, Novita,
-/// SiliconFlow, SGLang, vLLM) use their provider-prefixed spellings. Every
-/// other provider has no known cheap tier: `big` is the session model and
-/// `cheap` is `None`, so auto mode never fabricates a DeepSeek id for a
-/// provider that cannot serve it.
+/// SiliconFlow, SGLang, vLLM, Wanjie Ark, Volcengine) use their provider
+/// spellings. Every other provider has no known cheap tier: `big` is the
+/// session model and `cheap` is `None`, so auto mode never fabricates a
+/// DeepSeek id for a provider that cannot serve it.
 pub(crate) fn provider_router_candidates(
     provider: crate::config::ApiProvider,
     current_model: &str,
@@ -57,8 +57,11 @@ pub(crate) fn provider_router_candidates(
         let normalized = crate::config::normalize_model_name_for_provider(provider, current_model)
             .unwrap_or_else(|| current_model.to_string());
         return RouterCandidates {
+            // GLM-5.2 (the default) routes faster/explore children to GLM-5-Turbo,
+            // the same-family fast sibling. GLM-5.1 and GLM-5-Turbo itself have no
+            // cheaper tier and keep children on the parent model.
             cheap: if normalized == crate::config::ZAI_GLM_5_2_MODEL {
-                Some(crate::config::DEFAULT_ZAI_MODEL.to_string())
+                Some(crate::config::ZAI_GLM_5_TURBO_MODEL.to_string())
             } else {
                 None
             },
@@ -71,12 +74,16 @@ pub(crate) fn provider_router_candidates(
             crate::config::normalize_model_name_for_provider(provider, current_model)
         && matches!(
             normalized.as_str(),
-            crate::config::OPENROUTER_GLM_5_1_MODEL | crate::config::OPENROUTER_GLM_5_2_MODEL
+            crate::config::OPENROUTER_GLM_5_1_MODEL
+                | crate::config::OPENROUTER_GLM_5_2_MODEL
+                | crate::config::OPENROUTER_GLM_5_TURBO_MODEL
         )
     {
         return RouterCandidates {
+            // z-ai/glm-5.2 routes faster children to z-ai/glm-5-turbo; the 5.1
+            // and turbo ids have no cheaper tier and keep children on parent.
             cheap: if normalized == crate::config::OPENROUTER_GLM_5_2_MODEL {
-                Some(crate::config::OPENROUTER_GLM_5_1_MODEL.to_string())
+                Some(crate::config::OPENROUTER_GLM_5_TURBO_MODEL.to_string())
             } else {
                 None
             },
@@ -92,12 +99,17 @@ pub(crate) fn provider_router_candidates(
         | ApiProvider::Siliconflow
         | ApiProvider::SiliconflowCn
         | ApiProvider::Sglang
-        | ApiProvider::Vllm => RouterCandidates {
+        | ApiProvider::Vllm
+        | ApiProvider::WanjieArk => RouterCandidates {
             big: crate::config::wire_model_for_provider(provider, "deepseek-v4-pro"),
             cheap: Some(crate::config::wire_model_for_provider(
                 provider,
                 "deepseek-v4-flash",
             )),
+        },
+        ApiProvider::Volcengine => RouterCandidates {
+            big: crate::config::DEFAULT_VOLCENGINE_MODEL.to_string(),
+            cheap: Some(crate::config::DEFAULT_VOLCENGINE_FLASH_MODEL.to_string()),
         },
         _ => RouterCandidates {
             big: current_model.to_string(),
@@ -457,9 +469,13 @@ pub(crate) async fn resolve_auto_route_with_inventory(
 ) -> Result<AutoRouteSelection> {
     let inventory = ModelInventory::from_config(config);
     if !inventory.router_available {
-        bail!(
-            "model auto requires a DeepSeek API key so codewhale can use deepseek-v4-flash as the non-thinking router. Run `codewhale auth set --provider deepseek` or choose an explicit model."
-        );
+        // Fall back to heuristic-only auto routing when the flash router
+        // is unavailable (e.g. non-DeepSeek providers like wanjie-ark).
+        return Ok(auto_route_from_inventory_heuristic(
+            config,
+            latest_request,
+            &inventory,
+        ));
     }
 
     let heuristic = auto_route_from_inventory_heuristic(config, latest_request, &inventory);
@@ -565,10 +581,7 @@ fn auto_route_from_inventory_heuristic(
     latest_request: &str,
     inventory: &ModelInventory,
 ) -> AutoRouteSelection {
-    let fallback = inventory
-        .active_default()
-        .or_else(|| inventory.candidates.first());
-    let Some(candidate) = fallback else {
+    let Some(active) = inventory.active_default() else {
         return AutoRouteSelection {
             provider: config.api_provider(),
             model: config.default_model(),
@@ -576,9 +589,16 @@ fn auto_route_from_inventory_heuristic(
             source: AutoRouteSource::Heuristic,
         };
     };
+    // Use the candidates' cheap/big info for complexity-based routing.
+    let router_candidates = provider_router_candidates(config.api_provider(), &active.model);
+    let chosen = if router_candidates.cheap.is_some() {
+        auto_model_heuristic_for_candidates(latest_request, &active.model, &router_candidates)
+    } else {
+        active.model.clone()
+    };
     AutoRouteSelection {
-        provider: candidate.provider,
-        model: candidate.model.clone(),
+        provider: active.provider,
+        model: chosen,
         reasoning_effort: Some(crate::auto_reasoning::select(false, latest_request)),
         source: AutoRouteSource::Heuristic,
     }
@@ -994,6 +1014,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inventory_auto_route_recommendation_accepts_wanjie_v4_ids() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _deepseek = crate::test_support::EnvVarGuard::set("DEEPSEEK_API_KEY", "ds-key");
+        let _wanjie = crate::test_support::EnvVarGuard::set("WANJIE_ARK_API_KEY", "wanjie-key");
+        let config = Config {
+            provider: Some("wanjie-ark".to_string()),
+            ..Default::default()
+        };
+        let inventory = ModelInventory::from_config(&config);
+
+        let route = parse_inventory_auto_route_recommendation(
+            r#"{"provider":"wanjie-ark","model":"deepseek-v4-pro","thinking":"max"}"#,
+            &inventory,
+        )
+        .expect("Wanjie V4 Pro inventory route should parse");
+        assert_eq!(route.provider, ApiProvider::WanjieArk);
+        assert_eq!(route.model, "deepseek-v4-pro");
+        assert_eq!(route.reasoning_effort, Some(ReasoningEffort::Max));
+
+        let route = parse_inventory_auto_route_recommendation(
+            r#"{"provider":"wanjie-ark","model":"deepseek-v4-flash","thinking":"off"}"#,
+            &inventory,
+        )
+        .expect("Wanjie V4 Flash inventory route should parse");
+        assert_eq!(route.provider, ApiProvider::WanjieArk);
+        assert_eq!(route.model, "deepseek-v4-flash");
+        assert_eq!(route.reasoning_effort, Some(ReasoningEffort::Off));
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn inventory_auto_route_resolves_active_authenticated_provider() {
@@ -1011,7 +1061,76 @@ mod tests {
                 .expect("inventory route should resolve with authenticated active provider");
 
         assert_eq!(route.provider, ApiProvider::Zai);
-        assert_eq!(route.model, config.default_model());
+        assert_eq!(route.model, crate::config::ZAI_GLM_5_TURBO_MODEL);
+        assert_eq!(route.source, AutoRouteSource::Heuristic);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn inventory_auto_route_uses_wanjie_v4_pair_without_deepseek_router() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _wanjie = crate::test_support::EnvVarGuard::set("WANJIE_ARK_API_KEY", "wanjie-key");
+        let config = Config {
+            provider: Some("wanjie-ark".to_string()),
+            default_text_model: Some("auto".to_string()),
+            ..Default::default()
+        };
+
+        let route =
+            resolve_auto_route_with_inventory(&config, "quick status check", "", "auto", "auto")
+                .await
+                .expect("heuristic-only Wanjie route should resolve");
+        assert_eq!(route.provider, ApiProvider::WanjieArk);
+        assert_eq!(route.model, "deepseek-v4-flash");
+        assert_eq!(route.source, AutoRouteSource::Heuristic);
+
+        let route = resolve_auto_route_with_inventory(
+            &config,
+            "please refactor this architecture",
+            "",
+            "auto",
+            "auto",
+        )
+        .await
+        .expect("complex Wanjie route should resolve");
+        assert_eq!(route.provider, ApiProvider::WanjieArk);
+        assert_eq!(route.model, "deepseek-v4-pro");
+        assert_eq!(route.source, AutoRouteSource::Heuristic);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn inventory_auto_route_uses_volcengine_v4_pair_without_deepseek_router() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _volcengine =
+            crate::test_support::EnvVarGuard::set("VOLCENGINE_API_KEY", "volcengine-key");
+        let config = Config {
+            provider: Some("volcengine".to_string()),
+            default_text_model: Some("auto".to_string()),
+            ..Default::default()
+        };
+
+        let route =
+            resolve_auto_route_with_inventory(&config, "quick status check", "", "auto", "auto")
+                .await
+                .expect("heuristic-only Volcengine route should resolve");
+        assert_eq!(route.provider, ApiProvider::Volcengine);
+        assert_eq!(route.model, "DeepSeek-V4-Flash");
+        assert_eq!(route.source, AutoRouteSource::Heuristic);
+
+        let route = resolve_auto_route_with_inventory(
+            &config,
+            "please refactor this architecture",
+            "",
+            "auto",
+            "auto",
+        )
+        .await
+        .expect("complex Volcengine route should resolve");
+        assert_eq!(route.provider, ApiProvider::Volcengine);
+        assert_eq!(route.model, "DeepSeek-V4-Pro");
         assert_eq!(route.source, AutoRouteSource::Heuristic);
     }
 
@@ -1087,17 +1206,33 @@ mod tests {
             Some("deepseek/deepseek-v4-flash")
         );
 
+        let wanjie = provider_router_candidates(ApiProvider::WanjieArk, "deepseek-reasoner");
+        assert_eq!(wanjie.big, "deepseek-v4-pro");
+        assert_eq!(wanjie.cheap.as_deref(), Some("deepseek-v4-flash"));
+
+        let volcengine = provider_router_candidates(ApiProvider::Volcengine, "DeepSeek-V4-Pro");
+        assert_eq!(volcengine.big, "DeepSeek-V4-Pro");
+        assert_eq!(volcengine.cheap.as_deref(), Some("DeepSeek-V4-Flash"));
+
         let zai = provider_router_candidates(ApiProvider::Zai, "GLM-5.2");
         assert_eq!(zai.big, "GLM-5.2");
-        assert_eq!(zai.cheap.as_deref(), Some("GLM-5.1"));
+        // GLM-5.2 faster/explore children route to GLM-5-Turbo (same-family fast
+        // sibling), not back down to GLM-5.1.
+        assert_eq!(zai.cheap.as_deref(), Some("GLM-5-Turbo"));
 
         let openrouter_glm = provider_router_candidates(ApiProvider::Openrouter, "z-ai/glm-5.2");
         assert_eq!(openrouter_glm.big, "z-ai/glm-5.2");
-        assert_eq!(openrouter_glm.cheap.as_deref(), Some("z-ai/glm-5.1"));
+        assert_eq!(openrouter_glm.cheap.as_deref(), Some("z-ai/glm-5-turbo"));
 
-        let zai_default = provider_router_candidates(ApiProvider::Zai, "GLM-5.1");
-        assert_eq!(zai_default.big, "GLM-5.1");
-        assert_eq!(zai_default.cheap, None);
+        // GLM-5.1 has no cheaper tier; faster children stay on the parent.
+        let zai_51 = provider_router_candidates(ApiProvider::Zai, "GLM-5.1");
+        assert_eq!(zai_51.big, "GLM-5.1");
+        assert_eq!(zai_51.cheap, None);
+
+        // GLM-5-Turbo is itself the cheap tier; no further downgrade.
+        let zai_turbo = provider_router_candidates(ApiProvider::Zai, "GLM-5-Turbo");
+        assert_eq!(zai_turbo.big, "GLM-5-Turbo");
+        assert_eq!(zai_turbo.cheap, None);
 
         // Providers without a known cheap tier: big = session model, no cheap.
         let ollama = provider_router_candidates(ApiProvider::Ollama, "qwen3:32b");

@@ -73,7 +73,9 @@ checked before trusted prefixes and block matching commands regardless of layer.
 Trusted prefixes only skip approval in modes that permit trust shortcuts. Typed
 ask records are currently a narrow foundation: when one matches under
 `AskForApproval::Never`, the command is rejected because the runtime cannot ask
-the user; existing allow/deny behavior is otherwise unchanged.
+the user; existing allow/deny behavior is otherwise unchanged. The TUI runtime
+loads ask-only records from the sibling `permissions.toml` file and applies
+matching `exec_shell` command ask-rules before Auto/session approval shortcuts.
 
 ### MCP manager and palette discovery
 
@@ -267,7 +269,7 @@ reflect very different cost classes:
 
 | Tool | What each child does | Wall-clock | Token cost | Cap |
 |---|---|---|---|---|
-| `agent` | Full sub-agent loop (planning, tool calls, multi-turn streaming) | minutes | thousands of tokens | 10 in flight by default (`[subagents].max_concurrent`, hard ceiling 20) |
+| `agent` | Full sub-agent loop (planning, tool calls, multi-turn streaming) | minutes | thousands of tokens | 20 running by default (`[subagents].max_concurrent`, hard ceiling 20), with up to 200 running + queued admitted by default |
 | `rlm_eval` helper `sub_query_batch` | One-shot non-streaming Chat Completions calls pinned to `deepseek-v4-flash` inside a live RLM session | seconds | ~hundreds of tokens | 16 per call |
 
 The caps appear in each tool's description and error messages so the model

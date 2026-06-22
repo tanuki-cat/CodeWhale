@@ -151,11 +151,20 @@ if grep -qF "hmbown.dev@gmail.com" SECURITY.md; then
   fail=1
 fi
 
-# 8) Generated web facts carry the workspace version.
+# 8) Generated web facts carry the workspace version. The file is ignored and
+# generated during web builds, so a clean CI checkout must derive it before this
+# release guard can inspect it.
+if [[ ! -f web/lib/facts.generated.ts ]]; then
+  node web/scripts/derive-facts.mjs
+fi
 facts_version="$(grep -oE '"version": "[0-9]+\.[0-9]+\.[0-9]+"' web/lib/facts.generated.ts | head -n1 | sed -E 's/.*"([0-9.]+)".*/\1/')"
 if [[ "${facts_version}" != "${workspace_version}" ]]; then
-  echo "::error::web/lib/facts.generated.ts version (${facts_version}) does not match workspace (${workspace_version}). Run: node web/scripts/derive-facts.mjs" >&2
-  fail=1
+  node web/scripts/derive-facts.mjs
+  facts_version="$(grep -oE '"version": "[0-9]+\.[0-9]+\.[0-9]+"' web/lib/facts.generated.ts | head -n1 | sed -E 's/.*"([0-9.]+)".*/\1/')"
+  if [[ "${facts_version}" != "${workspace_version}" ]]; then
+    echo "::error::web/lib/facts.generated.ts version (${facts_version}) does not match workspace (${workspace_version}). Run: node web/scripts/derive-facts.mjs" >&2
+    fail=1
+  fi
 fi
 
 # 9) README install-tag examples point at the current release.

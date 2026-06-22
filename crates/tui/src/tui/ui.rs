@@ -1,5 +1,6 @@
 //! TUI event loop and rendering logic for `DeepSeek` CLI.
 
+use std::cell::Cell;
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
@@ -177,7 +178,7 @@ const TOOL_HANG_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(900);
 // the per-tool spinner pulse — keep this fast enough that the spout reads as
 // motion (~12 fps) instead of teleport-frames.
 const UI_STATUS_ANIMATION_MS: u64 = 80;
-const SIDEBAR_VISIBLE_MIN_WIDTH: u16 = 100;
+pub(crate) const SIDEBAR_VISIBLE_MIN_WIDTH: u16 = 100;
 const DEFAULT_TERMINAL_PROBE_TIMEOUT_MS: u64 = 500;
 const PERIODIC_FULL_REPAINT_EVERY_N: u64 = 50;
 const TURN_META_PREFIX: &str = "<turn_meta>";
@@ -211,6 +212,62 @@ fn is_session_approved_for_tool(app: &App, tool_name: &str, grouping_key: &str) 
 
 fn is_session_denied_for_key(app: &App, approval_key: &str) -> bool {
     app.approval_session_denied.contains(approval_key)
+}
+
+fn should_auto_approve_approval_request(
+    app: &App,
+    tool_name: &str,
+    grouping_key: &str,
+    approval_force_prompt: bool,
+) -> bool {
+    !approval_force_prompt
+        && (is_session_approved_for_tool(app, tool_name, grouping_key)
+            || app.approval_mode == ApprovalMode::Auto)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidebarRenderState {
+    Hidden,
+    SuppressedByWidth {
+        available_width: u16,
+        min_width: u16,
+    },
+    AutoCollapsed,
+    Visible,
+}
+
+pub(crate) fn sidebar_render_state(app: &mut App) -> SidebarRenderState {
+    if app.sidebar_focus == SidebarFocus::Hidden {
+        return SidebarRenderState::Hidden;
+    }
+
+    if let Some(available_width) = sidebar_host_width_hint(app)
+        && available_width < SIDEBAR_VISIBLE_MIN_WIDTH
+    {
+        return SidebarRenderState::SuppressedByWidth {
+            available_width,
+            min_width: SIDEBAR_VISIBLE_MIN_WIDTH,
+        };
+    }
+
+    if crate::tui::sidebar::sidebar_auto_idle(app) {
+        return SidebarRenderState::AutoCollapsed;
+    }
+
+    SidebarRenderState::Visible
+}
+
+fn sidebar_host_width_hint(app: &App) -> Option<u16> {
+    app.last_sidebar_host_width.or_else(|| {
+        let transcript_width = app.viewport.last_transcript_area.map(|area| area.width)?;
+        let sidebar_width = app
+            .viewport
+            .last_sidebar_area
+            .or(app.last_sidebar_area)
+            .map(|area| area.width)
+            .unwrap_or(0);
+        Some(transcript_width.saturating_add(sidebar_width))
+    })
 }
 
 fn sidebar_width_for_chat_area(app: &App, chat_width: u16) -> Option<u16> {
@@ -253,6 +310,12 @@ enum TranslationEvent {
 // TurnComplete / focus-gain / resize. The alt-screen buffer's double-buffering
 // plus ratatui's `terminal.clear()` are sufficient to repaint cleanly.
 const TERMINAL_ORIGIN_RESET: &[u8] = b"\x1b[r\x1b[?6l\x1b[H";
+// Xterm alternate-scroll mode keeps wheel events inside the alternate-screen
+// viewport. Crossterm's mouse-capture command does not enable this DEC private
+// mode, so terminals can still scroll the host scrollback if mouse capture is
+// disabled, dropped during focus changes, or unavailable in the host.
+const ENABLE_ALT_SCROLL_MODE: &[u8] = b"\x1b[?1007h";
+const DISABLE_ALT_SCROLL_MODE: &[u8] = b"\x1b[?1007l";
 /// Begin synchronized update (DEC 2026): tell the terminal to defer
 /// rendering until END_SYNC_UPDATE is received. Best-effort —
 /// terminals that don't support this silently ignore the sequence.
@@ -264,69 +327,150 @@ const BEGIN_SYNC_UPDATE: &[u8] = b"\x1b[?2026h";
 /// the complete frame now.
 const END_SYNC_UPDATE: &[u8] = b"\x1b[?2026l";
 const TERMINAL_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const MAX_ENGINE_EVENTS_PER_DRAIN: usize = 512;
+const TERMINAL_INPUT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+const TERMINAL_INPUT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+const TERMINAL_INPUT_RECOVERY_COOLDOWN: Duration = Duration::from_secs(10);
+const MAX_ENGINE_EVENTS_PER_DRAIN: usize = 128;
+
+enum TerminalInputMessage {
+    Event(Event),
+    Heartbeat,
+    Error(io::Error),
+}
 
 struct TerminalInputPump {
-    rx: std::sync::mpsc::Receiver<io::Result<Event>>,
+    rx: std::sync::mpsc::Receiver<TerminalInputMessage>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    last_alive_at: Cell<Instant>,
 }
 
 impl TerminalInputPump {
     fn spawn() -> io::Result<Self> {
+        let (rx, stop, handle) = Self::spawn_parts()?;
+        Ok(Self {
+            rx,
+            stop,
+            handle: Some(handle),
+            last_alive_at: Cell::new(Instant::now()),
+        })
+    }
+
+    fn spawn_parts() -> io::Result<(
+        std::sync::mpsc::Receiver<TerminalInputMessage>,
+        Arc<AtomicBool>,
+        JoinHandle<()>,
+    )> {
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let handle = thread::Builder::new()
             .name("codewhale-terminal-input".to_string())
             .spawn(move || {
+                let mut last_heartbeat = Instant::now();
                 while !thread_stop.load(Ordering::Acquire) {
                     match event::poll(TERMINAL_INPUT_POLL_INTERVAL) {
                         Ok(true) => match event::read() {
                             Ok(event) => {
-                                if tx.send(Ok(event)).is_err() {
+                                last_heartbeat = Instant::now();
+                                if tx.send(TerminalInputMessage::Event(event)).is_err() {
                                     break;
                                 }
                             }
                             Err(err) => {
-                                let _ = tx.send(Err(err));
+                                let _ = tx.send(TerminalInputMessage::Error(err));
                                 break;
                             }
                         },
-                        Ok(false) => {}
+                        Ok(false) => {
+                            let now = Instant::now();
+                            if now.duration_since(last_heartbeat)
+                                >= TERMINAL_INPUT_HEARTBEAT_INTERVAL
+                            {
+                                last_heartbeat = now;
+                                if tx.send(TerminalInputMessage::Heartbeat).is_err() {
+                                    break;
+                                }
+                            }
+                        }
                         Err(err) => {
-                            let _ = tx.send(Err(err));
+                            let _ = tx.send(TerminalInputMessage::Error(err));
                             break;
                         }
                     }
                 }
             })?;
-        Ok(Self {
-            rx,
-            stop,
-            handle: Some(handle),
-        })
+        Ok((rx, stop, handle))
     }
 
     fn recv_timeout(&self, timeout: Duration) -> io::Result<Option<Event>> {
-        match self.rx.recv_timeout(timeout) {
-            Ok(Ok(event)) => Ok(Some(event)),
-            Ok(Err(err)) => Err(err),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "terminal input pump disconnected",
-            )),
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(remaining) {
+                Ok(TerminalInputMessage::Event(event)) => {
+                    self.mark_alive();
+                    return Ok(Some(event));
+                }
+                Ok(TerminalInputMessage::Heartbeat) => {
+                    self.mark_alive();
+                    if remaining.is_zero() {
+                        return Ok(None);
+                    }
+                }
+                Ok(TerminalInputMessage::Error(err)) => {
+                    self.mark_alive();
+                    return Err(err);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "terminal input pump disconnected",
+                    ));
+                }
+            }
         }
     }
 
     fn try_recv(&self) -> io::Result<Option<Event>> {
-        match self.rx.try_recv() {
-            Ok(Ok(event)) => Ok(Some(event)),
-            Ok(Err(err)) => Err(err),
-            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => Ok(None),
+        loop {
+            match self.rx.try_recv() {
+                Ok(TerminalInputMessage::Event(event)) => {
+                    self.mark_alive();
+                    return Ok(Some(event));
+                }
+                Ok(TerminalInputMessage::Heartbeat) => {
+                    self.mark_alive();
+                }
+                Ok(TerminalInputMessage::Error(err)) => {
+                    self.mark_alive();
+                    return Err(err);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(None),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(None),
+            }
         }
+    }
+
+    fn mark_alive(&self) {
+        self.last_alive_at.set(Instant::now());
+    }
+
+    fn stalled_for(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last_alive_at.get())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn restart_detached(&mut self) -> io::Result<()> {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.handle.take();
+        let (rx, stop, handle) = Self::spawn_parts()?;
+        self.rx = rx;
+        self.stop = stop;
+        self.handle = Some(handle);
+        self.last_alive_at.set(Instant::now());
+        Ok(())
     }
 }
 
@@ -334,6 +478,11 @@ impl Drop for TerminalInputPump {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.handle.take() {
+            #[cfg(target_os = "windows")]
+            {
+                drop(handle);
+            }
+            #[cfg(not(target_os = "windows"))]
             let _ = handle.join();
         }
     }
@@ -378,21 +527,19 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
 
     // Apply OSC 8 hyperlink toggle from config.
     //
-    // Default-off on Windows because legacy `cmd.exe` and pre-Win11
-    // PowerShell consoles don't always honor the OSC 8 string
-    // terminator (`ESC \`) cleanly — emitting the escape can leave
-    // stray bytes that eat the leading column of the next line and
-    // duplicate the composer panel during scroll. Reported on a
-    // Windows session (issue forthcoming, screenshot showed
-    // "eepseek-v4-flash" with the leading `d` consumed and three
-    // overlapping composer panels). v0.8.8 also surfaced macOS
-    // corruption ("526sOPEN" instead of "526   OPEN") because OSC 8
-    // wrappers are emitted inside ratatui `Span` content; ratatui's
-    // grapheme filter drops the bare ESC byte but paints every other
-    // byte of the wrapper into a buffer cell, drifting columns. Until
-    // OSC 8 is emitted out-of-band of the buffer pipeline, default off
-    // on every platform; opt back in via `[ui] osc8_links = true`.
-    let osc8_default_on = false;
+    // #3029: OSC 8 hyperlinks are now emitted out-of-band. The transcript
+    // carries the link payloads in-band inside `Span` content, but each render
+    // seam calls `osc8::extract_buffer_link_regions`, which blanks the payload
+    // cells (so no buffer cell ever holds `\x1b` or `]8;;` — the old column-
+    // drift corruption is gone by construction) and publishes `LinkRegion`s.
+    // `ColorCompatBackend::draw` then re-emits the OSC 8 escapes through the
+    // backend's `Write` impl, interleaved with the cell stream — never inside a
+    // buffer cell. So the corruption that previously forced this default off is
+    // fixed, and hyperlinks are on by default for terminals that handle the OSC
+    // terminator (`ESC \`) cleanly. Windows legacy consoles (conhost) still
+    // mishandle the terminator, so the default stays off there; opt in via
+    // `[tui] osc8_links = true` on any platform.
+    let osc8_default_on = !cfg!(target_os = "windows");
     crate::tui::osc8::set_enabled(
         config
             .tui
@@ -631,6 +778,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
         task_data_dir: Some(task_manager.data_dir()),
         active_task_id: None,
         active_thread_id: None,
+        dynamic_tool_executor: None,
         // #456: plumb the App's HookExecutor so `exec_shell` can surface
         // the configured `shell_env` hooks. Clone the shared Arc.
         hook_executor: app.runtime_services.hook_executor.clone(),
@@ -711,6 +859,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
 
     cleanup_guard.defused = true;
     pop_keyboard_enhancement_flags(terminal.backend_mut());
+    disable_alternate_scroll_mode(terminal.backend_mut());
     execute!(terminal.backend_mut(), DisableFocusChange)?;
     disable_raw_mode()?;
     if use_alt_screen {
@@ -901,6 +1050,7 @@ impl Drop for TerminalCleanupGuard {
 
         let mut stdout = io::stdout();
         pop_keyboard_enhancement_flags(&mut stdout);
+        disable_alternate_scroll_mode(&mut stdout);
         let _ = execute!(stdout, DisableFocusChange);
         let _ = disable_raw_mode();
         if self.use_alt_screen {
@@ -962,6 +1112,8 @@ fn handle_memory_quick_add(app: &mut App, input: &str, config: &Config) {
 }
 
 fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
+    let provider = app.api_provider;
+    let max_subagents = app.max_subagents.clamp(1, crate::config::MAX_SUBAGENTS);
     EngineConfig {
         model: app.model.clone(),
         workspace: app.workspace.clone(),
@@ -970,6 +1122,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         notes_path: config.notes_path(),
         mcp_config_path: config.mcp_config_path(),
         skills_dir: app.skills_dir.clone(),
+        skills_scan_codewhale_only: app.skills_scan_codewhale_only,
         instructions: config
             .instructions_paths()
             .into_iter()
@@ -988,8 +1141,12 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         // model stops emitting tool calls. A real runaway is rare and
         // human-noticeable; we trust the operator over a hard step cap.
         max_steps: u32::MAX,
-        max_subagents: app.max_subagents,
-        launch_concurrency: config.launch_concurrency(),
+        max_subagents,
+        max_admitted_subagents: config
+            .max_admitted_subagents_for_provider(provider)
+            .max(max_subagents),
+        launch_concurrency: config.launch_concurrency_for_provider(provider),
+        subagents_enabled: config.subagents_enabled_for_provider(provider),
         features: config.features(),
         compaction: app.compaction_config(),
         todos: app.todos.clone(),
@@ -999,7 +1156,8 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             app.hunt.token_budget,
             app.hunt.verdict.goal_status(),
         ),
-        max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
+        max_spawn_depth: config.subagent_max_spawn_depth_for_provider(provider),
+        subagent_token_budget: config.subagent_token_budget_for_provider(provider),
         allowed_tools: app.active_allowed_tools.clone(),
         disallowed_tools: None,
         hook_executor: app.runtime_services.hook_executor.clone(),
@@ -1017,9 +1175,13 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             .map(crate::config::LspConfigToml::into_runtime),
         runtime_services: app.runtime_services.clone(),
         subagent_model_overrides: config.subagent_model_overrides(),
-        subagent_api_timeout: Duration::from_secs(config.subagent_api_timeout_secs()),
+        subagent_api_timeout: Duration::from_secs(
+            config.subagent_api_timeout_secs_for_provider(provider),
+        ),
         stream_chunk_timeout: Duration::from_secs(app.stream_chunk_timeout_secs),
-        subagent_heartbeat_timeout: Duration::from_secs(config.subagent_heartbeat_timeout_secs()),
+        subagent_heartbeat_timeout: Duration::from_secs(
+            config.subagent_heartbeat_timeout_secs_for_provider(provider),
+        ),
         prefer_bwrap: config.prefer_bwrap.unwrap_or(false),
         memory_enabled: config.memory_enabled(),
         memory_path: config.memory_path(),
@@ -1036,6 +1198,8 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         search_base_url: config.search.as_ref().and_then(|s| s.base_url.clone()),
         tools_always_load: config.tools_always_load(),
         tools: config.tools.clone(),
+        workspace_follow_symlinks: app.workspace_follow_symlinks,
+        exec_policy_engine: config.exec_policy_engine.clone(),
     }
 }
 
@@ -1121,6 +1285,8 @@ async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManag
                 kind: TaskPanelEntryKind::Background,
                 stale: job.stale,
                 elapsed_since_output_ms: job.elapsed_since_output_ms,
+                owner_agent_id: job.owner_agent_id,
+                owner_agent_name: job.owner_agent_name,
             });
         }
     }
@@ -1234,6 +1400,8 @@ fn active_reasoning_task_entries(app: &App) -> Vec<TaskPanelEntry> {
                 kind: TaskPanelEntryKind::ModelReasoning,
                 stale: false,
                 elapsed_since_output_ms: None,
+                owner_agent_id: None,
+                owner_agent_name: None,
             }),
             _ => None,
         })
@@ -1275,6 +1443,8 @@ fn active_rlm_task_entries(app: &App) -> Vec<TaskPanelEntry> {
                 kind: TaskPanelEntryKind::Background,
                 stale: false,
                 elapsed_since_output_ms: None,
+                owner_agent_id: None,
+                owner_agent_name: None,
             })
         })
         .collect()
@@ -1345,8 +1515,14 @@ async fn run_event_loop(
     let mut last_focus_recovery = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
+    #[cfg(target_os = "windows")]
+    let mut terminal_input = TerminalInputPump::spawn()?;
+    #[cfg(not(target_os = "windows"))]
     let terminal_input = TerminalInputPump::spawn()?;
     let mut pending_terminal_events: VecDeque<Event> = VecDeque::new();
+    let mut last_terminal_input_recovery = Instant::now()
+        .checked_sub(TERMINAL_INPUT_RECOVERY_COOLDOWN)
+        .unwrap_or_else(Instant::now);
 
     // Fire-and-forget version check — runs once per session in the
     // background. On success, a short status toast advertises the update
@@ -2202,7 +2378,9 @@ async fn run_event_loop(
                             });
                             if app.view_stack.top_kind() != Some(ModalKind::PlanPrompt) {
                                 let plan = Some(app.plan_state.lock().await.snapshot());
-                                app.view_stack.push(PlanPromptView::new(plan));
+                                let todos = Some(app.todos.lock().await.snapshot());
+                                app.view_stack
+                                    .push(PlanPromptView::new(plan).with_todos(todos));
                             }
                         }
                         app.plan_tool_used_in_turn = false;
@@ -2374,7 +2552,12 @@ async fn run_event_loop(
                             terminal_paused_at = None;
                         }
                     }
-                    EngineEvent::AgentSpawned { id, prompt } => {
+                    EngineEvent::AgentSpawned {
+                        id,
+                        prompt,
+                        parent_run_id,
+                        spawn_depth,
+                    } => {
                         let prompt_summary = summarize_tool_output(&prompt);
                         execute_subagent_observer_hook(
                             app,
@@ -2385,6 +2568,13 @@ async fn run_event_loop(
                         );
                         app.agent_progress
                             .insert(id.clone(), format!("starting: {prompt_summary}"));
+                        app.agent_progress_meta.insert(
+                            id.clone(),
+                            crate::tui::app::AgentProgressMeta {
+                                parent_run_id,
+                                spawn_depth,
+                            },
+                        );
                         if app.agent_activity_started_at.is_none() {
                             app.agent_activity_started_at = Some(Instant::now());
                         }
@@ -2394,7 +2584,12 @@ async fn run_event_loop(
                         app.status_message = Some(format!("{label} starting: {prompt_summary}"));
                         subagent_list_refresh_requested = true;
                     }
-                    EngineEvent::AgentProgress { id, status } => {
+                    EngineEvent::AgentProgress {
+                        id,
+                        status,
+                        parent_run_id,
+                        spawn_depth,
+                    } => {
                         let display = friendly_subagent_progress(app, &id, &status);
                         if is_noisy_subagent_progress(&status) {
                             app.agent_progress
@@ -2403,6 +2598,13 @@ async fn run_event_loop(
                         } else {
                             app.agent_progress.insert(id.clone(), display.clone());
                         }
+                        app.agent_progress_meta.insert(
+                            id.clone(),
+                            crate::tui::app::AgentProgressMeta {
+                                parent_run_id,
+                                spawn_depth,
+                            },
+                        );
                         if app.agent_activity_started_at.is_none() {
                             app.agent_activity_started_at = Some(Instant::now());
                         }
@@ -2450,6 +2652,7 @@ async fn run_event_loop(
                                         && matches!(agent.status, SubAgentStatus::Running)
                                 });
                         app.agent_progress.remove(&id);
+                        app.agent_progress_meta.remove(&id);
                         // #3030: stable label with raw-id fallback.
                         let label = app.agent_display_label(&id);
                         app.status_message = Some(format!(
@@ -2536,9 +2739,8 @@ async fn run_event_loop(
                         approval_key,
                         approval_grouping_key,
                         intent_summary,
+                        approval_force_prompt,
                     } => {
-                        let session_approved =
-                            is_session_approved_for_tool(app, &tool_name, &approval_grouping_key);
                         let session_denied = is_session_denied_for_key(app, &approval_key);
                         if session_denied {
                             // The user already said no to this exact tool /
@@ -2554,7 +2756,12 @@ async fn run_event_loop(
                                 }),
                             );
                             let _ = engine_handle.deny_tool_call(id.clone()).await;
-                        } else if session_approved || app.approval_mode == ApprovalMode::Auto {
+                        } else if should_auto_approve_approval_request(
+                            app,
+                            &tool_name,
+                            &approval_grouping_key,
+                            approval_force_prompt,
+                        ) {
                             log_sensitive_event(
                                 "tool.approval.auto_approve",
                                 serde_json::json!({
@@ -2934,9 +3141,59 @@ async fn run_event_loop(
         // `TerminalInputPump`, so engine floods cannot pin the OS input read.
         tokio::task::yield_now().await;
 
-        if let Some(evt) =
-            next_terminal_event(&terminal_input, &mut pending_terminal_events, poll_timeout)?
-        {
+        let maybe_terminal_event =
+            next_terminal_event(&terminal_input, &mut pending_terminal_events, poll_timeout)?;
+        if maybe_terminal_event.is_none() {
+            let now = Instant::now();
+            let input_stalled_for = terminal_input.stalled_for(now);
+            if terminal_input_recovery_relevant(app, has_running_agents)
+                && input_stalled_for >= TERMINAL_INPUT_STALL_TIMEOUT
+                && now.duration_since(last_terminal_input_recovery)
+                    >= TERMINAL_INPUT_RECOVERY_COOLDOWN
+            {
+                tracing::warn!(
+                    stalled_ms = input_stalled_for.as_millis(),
+                    "terminal input pump heartbeat stalled; attempting terminal input recovery"
+                );
+                recover_terminal_modes(
+                    terminal.backend_mut(),
+                    app.use_mouse_capture,
+                    app.use_bracketed_paste,
+                );
+                #[cfg(target_os = "windows")]
+                match terminal_input.restart_detached() {
+                    Ok(()) => {
+                        app.push_status_toast(
+                            "Recovered terminal input after a stalled Windows console poll.",
+                            StatusToastLevel::Warning,
+                            None,
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to restart terminal input pump");
+                        app.push_status_toast(
+                            "Terminal input stalled; recovery failed. Restart CodeWhale if keys stop responding.",
+                            StatusToastLevel::Error,
+                            None,
+                        );
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    app.push_status_toast(
+                        "Terminal input heartbeat stalled; terminal modes were refreshed.",
+                        StatusToastLevel::Warning,
+                        None,
+                    );
+                }
+                terminal_input.mark_alive();
+                last_terminal_input_recovery = now;
+                force_terminal_repaint = true;
+                app.needs_redraw = true;
+            }
+        }
+
+        if let Some(evt) = maybe_terminal_event {
             app.needs_redraw = true;
 
             // Handle bracketed paste events
@@ -3372,20 +3629,14 @@ async fn run_event_loop(
                 continue;
             }
 
+            if key.code == KeyCode::Char('x')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && prefill_jobs_cancel_all_if_tasks_sidebar(app)
+            {
+                continue;
+            }
+
             if key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                if app.view_stack.is_empty()
-                    && app.sidebar_focus == SidebarFocus::Tasks
-                    && app
-                        .task_panel
-                        .iter()
-                        .any(|task| task.id.starts_with("shell_") && task.status == "running")
-                {
-                    app.input = "/jobs cancel-all".to_string();
-                    app.cursor_position = app.input.len();
-                    app.status_message =
-                        Some("Press Enter to cancel all running commands".to_string());
-                    continue;
-                }
                 // When the composer is the active input target (no modal/pager
                 // intercepting keys), Ctrl+K performs an emacs-style kill to
                 // end-of-line. If the kill is a no-op (cursor at end of empty
@@ -3397,6 +3648,7 @@ async fn run_event_loop(
                     .push(CommandPaletteView::new(build_command_palette_entries(
                         app.ui_locale,
                         &app.skills_dir,
+                        app.skills_scan_codewhale_only,
                         &app.workspace,
                         &app.mcp_config_path,
                         app.mcp_snapshot.as_ref(),
@@ -3709,8 +3961,8 @@ async fn run_event_loop(
                     if key.modifiers.contains(KeyModifiers::ALT)
                         && key_shortcuts::has_control_like_modifier(key.modifiers) =>
                 {
-                    app.set_sidebar_focus(SidebarFocus::Work);
-                    app.status_message = Some("Sidebar focus: work".to_string());
+                    app.set_sidebar_focus(SidebarFocus::Pinned);
+                    app.status_message = Some("Sidebar focus: pinned".to_string());
                     continue;
                 }
                 KeyCode::Char('2')
@@ -3746,8 +3998,8 @@ async fn run_event_loop(
                     if key.modifiers.contains(KeyModifiers::ALT)
                         && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    app.set_sidebar_focus(SidebarFocus::Work);
-                    app.status_message = Some("Sidebar focus: work".to_string());
+                    app.set_sidebar_focus(SidebarFocus::Pinned);
+                    app.status_message = Some("Sidebar focus: pinned".to_string());
                     continue;
                 }
                 KeyCode::Char('@')
@@ -4196,7 +4448,9 @@ async fn run_event_loop(
                     }
                 }
                 // Input handling
-                _ if is_composer_newline_key(key) => {
+                _ if is_composer_newline_key(key)
+                    && !(app.is_loading && is_forced_submit_key(key)) =>
+                {
                     app.insert_char('\n');
                 }
                 KeyCode::Enter
@@ -4209,7 +4463,12 @@ async fn run_event_loop(
                     continue;
                 }
                 // #382: Ctrl+Enter forces a steer into the current turn.
-                KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Some terminals report Ctrl/Cmd+Enter as Ctrl+J; while a
+                // turn is running, accept that encoding here instead of
+                // inserting a newline.
+                _ if is_forced_submit_key(key)
+                    && (matches!(key.code, KeyCode::Enter) || app.is_loading) =>
+                {
                     if let Some(input) = app.submit_input() {
                         if handle_bang_shell_input(app, &engine_handle, &input).await? {
                             continue;
@@ -4556,13 +4815,6 @@ async fn run_event_loop(
                         } else {
                             app.push_status_toast("Cut failed", StatusToastLevel::Error, None);
                         }
-                    } else {
-                        let new_mode = match app.mode {
-                            AppMode::Plan => AppMode::Agent,
-                            AppMode::Agent => AppMode::Yolo,
-                            AppMode::Yolo => AppMode::Plan,
-                        };
-                        apply_mode_update(app, &engine_handle, new_mode).await;
                     }
                 }
                 _ if key_shortcuts::is_paste_shortcut(&key) => {
@@ -4716,8 +4968,8 @@ fn persist_sidebar_settings_if_dirty(app: &mut App) {
 fn apply_alt_0_shortcut(app: &mut App, modifiers: KeyModifiers) {
     if modifiers.contains(KeyModifiers::CONTROL) {
         if app.sidebar_focus == SidebarFocus::Hidden {
-            app.set_sidebar_focus(SidebarFocus::Auto);
-            app.status_message = Some("Sidebar focus: auto".to_string());
+            app.set_sidebar_focus(SidebarFocus::Pinned);
+            app.status_message = Some("Sidebar focus: pinned".to_string());
         } else {
             app.set_sidebar_focus(SidebarFocus::Hidden);
             app.status_message = Some("Sidebar hidden".to_string());
@@ -4843,6 +5095,11 @@ fn reconcile_turn_liveness(app: &mut App, now: Instant, has_running_agents: bool
             now.saturating_duration_since(started) > DISPATCH_WATCHDOG_TIMEOUT
         })
     {
+        // #2739: the user's prompt was already appended to api_messages
+        // before dispatch, but the turn never reached `in_progress`. Persist
+        // it before clearing turn state so `--continue` keeps the prompt
+        // instead of loading the previous save.
+        persist_recovery_snapshot(app);
         app.is_loading = false;
         app.dispatch_started_at = None;
         app.turn_started_at = None;
@@ -4922,6 +5179,21 @@ fn reconcile_turn_liveness(app: &mut App, now: Instant, has_running_agents: bool
     false
 }
 
+/// #2739: persist the current in-memory session state before a recovery or
+/// cancellation path clears turn bookkeeping. Without this snapshot, the
+/// just-finalised partial turn lives only in `app.api_messages` and is never
+/// written to disk, so `--continue` loads the *previous* save — effectively
+/// losing the entire in-progress turn.
+fn persist_recovery_snapshot(app: &mut App) {
+    if let Ok(manager) = SessionManager::default_location() {
+        let session = build_session_snapshot(app, &manager);
+        if app.current_session_id.is_none() {
+            app.current_session_id = Some(session.metadata.id.clone());
+        }
+        persistence_actor::persist(PersistRequest::SessionSnapshot(session));
+    }
+}
+
 fn recover_stalled_runtime_turn(app: &mut App, message: &str, level: StatusToastLevel) {
     // Finalize in-flight thinking / assistant / tool cells so the
     // transcript doesn't show permanent spinners after recovery.
@@ -4931,6 +5203,12 @@ fn recover_stalled_runtime_turn(app: &mut App, message: &str, level: StatusToast
     app.streaming_state.reset();
     app.streaming_message_index = None;
     app.streaming_thinking_active_entry = None;
+
+    // #2739: persist the partial turn's api_messages before clearing
+    // turn state. Without this snapshot the stalled/cancelled turn's
+    // messages are held only in memory and --continue sees the
+    // *previous* save, losing the entire in-progress turn.
+    persist_recovery_snapshot(app);
 
     app.is_loading = false;
     app.turn_started_at = None;
@@ -4992,6 +5270,10 @@ fn recover_engine_event_disconnect(app: &mut App) -> bool {
     app.streaming_state.reset();
     app.streaming_message_index = None;
     app.streaming_thinking_active_entry = None;
+
+    // #2739: persist partial turn before clearing state.
+    persist_recovery_snapshot(app);
+
     app.is_loading = false;
     app.is_compacting = false;
     app.is_purging = false;
@@ -5037,6 +5319,15 @@ fn active_turn_has_running_tool(app: &App) -> bool {
             _ => false,
         })
     })
+}
+
+fn terminal_input_recovery_relevant(app: &App, has_running_agents: bool) -> bool {
+    app.is_loading
+        || has_running_agents
+        || app.is_compacting
+        || app.is_purging
+        || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
+        || active_turn_has_running_tool(app)
 }
 
 fn tool_cell_is_running(tool: &ToolCell) -> bool {
@@ -5832,6 +6123,7 @@ async fn dispatch_user_message(
                 ),
                 show_thinking: app.show_thinking,
                 verbosity: app.verbosity.as_deref(),
+                skills_scan_codewhale_only: app.skills_scan_codewhale_only,
             },
         ),
     );
@@ -5939,8 +6231,10 @@ async fn dispatch_user_message(
             translation_enabled: app.translation_enabled,
             show_thinking: app.show_thinking,
             allowed_tools: app.active_allowed_tools.clone(),
+            dynamic_tools: Vec::new(),
             hook_executor: app.runtime_services.hook_executor.clone(),
             verbosity: app.verbosity.clone(),
+            provenance: crate::core::ops::UserInputProvenance::ExternalUser,
         })
         .await
     {
@@ -6412,6 +6706,9 @@ async fn switch_provider(
     let new_endpoint = display_base_url_host(&new_base_url);
     let cache_scope_changed = previous_provider != target || previous_model != new_model;
     app.api_provider = target;
+    app.max_subagents = config
+        .max_subagents_for_provider(target)
+        .clamp(1, crate::config::MAX_SUBAGENTS);
     app.provider_chain = target
         .kind()
         .map(|kind| codewhale_config::ProviderChain::new(kind, &config.fallback_providers))
@@ -6742,6 +7039,11 @@ async fn apply_command_result(
                 let queued = build_queued_message(app, content);
                 submit_or_steer_message(app, config, engine_handle, queued).await?;
             }
+            AppAction::SetGoalStatus { status, clear } => {
+                let _ = engine_handle
+                    .send(Op::SetGoalStatus { status, clear })
+                    .await;
+            }
             AppAction::VoiceCapture => {
                 use commands::voice::VoiceCaptureOutcome;
                 match commands::voice::capture_and_transcribe(app, config).await {
@@ -6901,6 +7203,25 @@ async fn apply_command_result(
             AppAction::UpdateStreamChunkTimeout(timeout_secs) => {
                 let _ = engine_handle
                     .send(Op::SetStreamChunkTimeout { timeout_secs })
+                    .await;
+            }
+            AppAction::UpdateSubagentRuntimeConfig {
+                enabled,
+                max_subagents,
+                launch_concurrency,
+                max_spawn_depth,
+                api_timeout_secs,
+                heartbeat_timeout_secs,
+            } => {
+                let _ = engine_handle
+                    .send(Op::SetSubagentRuntimeConfig {
+                        enabled,
+                        max_subagents,
+                        launch_concurrency,
+                        max_spawn_depth,
+                        api_timeout_secs,
+                        heartbeat_timeout_secs,
+                    })
                     .await;
             }
             AppAction::OpenConfigEditor(mode) => match mode {
@@ -7214,6 +7535,7 @@ fn apply_workspace_runtime_state(app: &mut App, config: &Config, workspace: Path
         workspace.clone(),
     );
     app.skills_dir = crate::tui::app::resolve_skills_dir(&workspace, &config.skills_dir(), config);
+    app.skills_scan_codewhale_only = config.skills_config().scan_codewhale_only();
     app.refresh_skill_cache();
     app.workspace_context = None;
     if let Ok(mut cell) = app.workspace_context_cell.lock() {
@@ -7774,7 +8096,13 @@ async fn apply_plan_choice(
         PlanChoice::ExitPlan => {
             apply_mode_update(app, engine_handle, AppMode::Agent).await;
             app.add_message(HistoryCell::System {
-                content: "Exited Plan mode. Switched to Agent mode.".to_string(),
+                content: concat!(
+                    "Exited Plan mode. Switched to Agent mode.\n\n",
+                    "The plan above is for reference only. ",
+                    "Do NOT execute it until the user explicitly asks you to. ",
+                    "Wait for the user's next instruction before taking any action.",
+                )
+                .to_string(),
             });
         }
     }
@@ -8045,6 +8373,7 @@ fn render(f: &mut Frame, app: &mut App) {
         // Auto-reveal: in Auto focus mode, collapse the sidebar to a
         // full-width transcript when nothing is active; bring it back the
         // moment there is a To-do, a live fleet, or background jobs.
+        app.last_sidebar_host_width = Some(chat_area.width);
         let sidebar_auto_collapsed = crate::tui::sidebar::sidebar_auto_idle(app);
         if !sidebar_auto_collapsed
             && let Some(sidebar_width) = sidebar_width_for_chat_area(app, chat_area.width)
@@ -8433,10 +8762,12 @@ async fn handle_view_events(
                 timed_out,
                 approval_key,
                 approval_grouping_key,
+                persistent_ask_rules,
             } => {
                 apply_approval_decision(
                     app,
                     engine_handle,
+                    config,
                     ApprovalDecisionEvent {
                         tool_id,
                         tool_name,
@@ -8444,6 +8775,7 @@ async fn handle_view_events(
                         timed_out,
                         approval_key,
                         approval_grouping_key,
+                        persistent_ask_rules,
                     },
                 )
                 .await;
@@ -8601,6 +8933,25 @@ async fn handle_view_events(
                         AppAction::UpdateStreamChunkTimeout(timeout_secs) => {
                             let _ = engine_handle
                                 .send(Op::SetStreamChunkTimeout { timeout_secs })
+                                .await;
+                        }
+                        AppAction::UpdateSubagentRuntimeConfig {
+                            enabled,
+                            max_subagents,
+                            launch_concurrency,
+                            max_spawn_depth,
+                            api_timeout_secs,
+                            heartbeat_timeout_secs,
+                        } => {
+                            let _ = engine_handle
+                                .send(Op::SetSubagentRuntimeConfig {
+                                    enabled,
+                                    max_subagents,
+                                    launch_concurrency,
+                                    max_spawn_depth,
+                                    api_timeout_secs,
+                                    heartbeat_timeout_secs,
+                                })
                                 .await;
                         }
                         AppAction::OpenConfigView => {}
@@ -8783,11 +9134,13 @@ struct ApprovalDecisionEvent {
     timed_out: bool,
     approval_key: String,
     approval_grouping_key: String,
+    persistent_ask_rules: Vec<codewhale_config::ToolAskRule>,
 }
 
 async fn apply_approval_decision(
     app: &mut App,
     engine_handle: &mut EngineHandle,
+    config: &mut Config,
     event: ApprovalDecisionEvent,
 ) {
     if event.decision == ReviewDecision::ApprovedForSession {
@@ -8798,6 +9151,15 @@ async fn apply_approval_decision(
             .insert(event.tool_name.clone());
         app.approval_session_approved
             .insert(event.approval_grouping_key.clone());
+    }
+
+    if matches!(
+        event.decision,
+        ReviewDecision::Approved | ReviewDecision::ApprovedForSession
+    ) && !event.persistent_ask_rules.is_empty()
+        && !event.timed_out
+    {
+        persist_ask_rules_from_approval(app, config, &event.persistent_ask_rules);
     }
 
     match event.decision {
@@ -8822,17 +9184,50 @@ async fn apply_approval_decision(
     }
 }
 
+fn persist_ask_rules_from_approval(
+    app: &mut App,
+    config: &mut Config,
+    rules: &[codewhale_config::ToolAskRule],
+) {
+    match codewhale_config::ConfigStore::load(app.config_path.clone()).and_then(|mut store| {
+        let added = store.append_ask_rules(rules)?;
+        let permissions_path = store.permissions_path();
+        config.exec_policy_engine = store.exec_policy_engine();
+        Ok((added, permissions_path))
+    }) {
+        Ok((added, path)) if added > 0 => {
+            app.status_message = Some(format!(
+                "Saved {added} ask permission rule(s) to {}",
+                path.display()
+            ));
+        }
+        Ok((_added, path)) => {
+            app.status_message = Some(format!(
+                "Ask permission rule already saved in {}",
+                path.display()
+            ));
+        }
+        Err(err) => {
+            app.status_message = Some(format!("Failed to save ask permission rule: {err:#}"));
+        }
+    }
+}
+
 fn mark_active_turn_cancelled_locally(app: &mut App) {
+    // #2739: every local cancel surface (Esc, Ctrl+C, approval abort, paused
+    // command abort) must snapshot before it clears turn state. Otherwise
+    // --continue reloads the previous save and the interrupted turn vanishes.
+    app.streaming_state.reset();
+    app.finalize_active_cell_as_interrupted();
+    app.finalize_streaming_assistant_as_interrupted();
+    persist_recovery_snapshot(app);
     app.is_loading = false;
     app.dispatch_started_at = None;
     app.turn_started_at = None;
     app.turn_last_activity_at = None;
-    app.streaming_state.reset();
     app.runtime_turn_id = None;
     app.runtime_turn_status = None;
     app.suppress_stream_events_until_turn_complete = true;
-    app.finalize_active_cell_as_interrupted();
-    app.finalize_streaming_assistant_as_interrupted();
     crate::retry_status::clear();
     crate::tui::notifications::clear_taskbar_progress();
     crate::tui::notifications::stop_title_animation_quietly();
@@ -9305,6 +9700,7 @@ fn pause_terminal(
     // mode. Best-effort — terminals that didn't accept the flags
     // silently ignore the pop. Matches the shutdown and panic paths.
     pop_keyboard_enhancement_flags(terminal.backend_mut());
+    disable_alternate_scroll_mode(terminal.backend_mut());
     execute!(terminal.backend_mut(), DisableFocusChange)?;
     disable_raw_mode()?;
     if use_alt_screen {
@@ -9443,6 +9839,29 @@ pub(crate) fn pop_keyboard_enhancement_flags<W: Write>(writer: &mut W) {
     let _ = execute!(writer, PopKeyboardEnhancementFlags);
 }
 
+fn set_alternate_scroll_mode<W: Write>(writer: &mut W, enabled: bool) {
+    let sequence = if enabled {
+        ENABLE_ALT_SCROLL_MODE
+    } else {
+        DISABLE_ALT_SCROLL_MODE
+    };
+    if let Err(err) = writer.write_all(sequence).and_then(|()| writer.flush()) {
+        tracing::debug!(
+            ?err,
+            enabled,
+            "alternate-scroll terminal mode change ignored"
+        );
+    }
+}
+
+fn enable_alternate_scroll_mode<W: Write>(writer: &mut W) {
+    set_alternate_scroll_mode(writer, true);
+}
+
+fn disable_alternate_scroll_mode<W: Write>(writer: &mut W) {
+    set_alternate_scroll_mode(writer, false);
+}
+
 /// Best-effort terminal restoration for emergency exit paths
 /// (panic hook, signal handlers). Mirrors the normal teardown in
 /// `run_event_loop` but tolerates any subset of modes not actually being
@@ -9453,6 +9872,7 @@ pub(crate) fn pop_keyboard_enhancement_flags<W: Write>(writer: &mut W) {
 pub fn emergency_restore_terminal() {
     let mut stdout = std::io::stdout();
     pop_keyboard_enhancement_flags(&mut stdout);
+    disable_alternate_scroll_mode(&mut stdout);
     let _ = execute!(stdout, DisableFocusChange);
     let _ = execute!(stdout, DisableBracketedPaste);
     let _ = execute!(stdout, DisableMouseCapture);
@@ -9513,6 +9933,7 @@ fn recover_terminal_modes<W: Write>(
 
     pop_keyboard_enhancement_flags(writer);
     push_keyboard_enhancement_flags(writer);
+    enable_alternate_scroll_mode(writer);
     if use_mouse_capture && let Err(err) = execute!(writer, EnableMouseCapture) {
         tracing::debug!(?err, "EnableMouseCapture ignored");
     }
@@ -9635,6 +10056,23 @@ pub(crate) fn request_foreground_shell_background(app: &mut App) {
             app.status_message = Some("Shell manager lock is poisoned".to_string());
         }
     }
+}
+
+pub(crate) fn prefill_jobs_cancel_all_if_tasks_sidebar(app: &mut App) -> bool {
+    if !app.view_stack.is_empty()
+        || app.sidebar_focus != SidebarFocus::Tasks
+        || !app
+            .task_panel
+            .iter()
+            .any(|task| task.id.starts_with("shell_") && task.status == "running")
+    {
+        return false;
+    }
+
+    app.input = "/jobs cancel-all".to_string();
+    app.cursor_position = app.input.len();
+    app.status_message = Some("Press Enter to cancel all running commands".to_string());
+    true
 }
 
 pub(crate) fn active_foreground_shell_running(app: &App) -> bool {

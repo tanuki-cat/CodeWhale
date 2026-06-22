@@ -38,7 +38,10 @@ use crate::tools::plan::new_shared_plan_state;
 use crate::tools::subagent::SubAgentStatus;
 use crate::tools::todo::new_shared_todo_list;
 use crate::tui::app::AppMode;
-use codewhale_protocol::runtime::{DynamicToolSpec, TurnEnvironmentParams};
+use codewhale_protocol::runtime::{
+    DynamicToolCallContent, DynamicToolCallParams, DynamicToolCallResult, DynamicToolSpec,
+    TurnEnvironmentParams,
+};
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const MAX_ACTIVE_THREADS_DEFAULT: usize = 8;
@@ -75,6 +78,7 @@ fn sort_turn_items_by_start(items: &mut [TurnItemRecord]) {
 /// session should still fail closed rather than silently mis-replay.
 const CURRENT_RUNTIME_SCHEMA_VERSION: u32 = 2;
 const RUNTIME_RESTART_REASON: &str = "Interrupted by process restart";
+const EMPTY_TURN_REASON: &str = "Turn completed without engine output";
 const APPROVAL_DECISION_TIMEOUT: Duration = Duration::from_secs(300);
 
 const fn default_runtime_schema_version() -> u32 {
@@ -147,6 +151,11 @@ pub struct ThreadRecord {
     /// additive metadata — older readers ignore it without misinterpretation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The session ID associated with this thread. When set, `ensure_engine_loaded`
+    /// loads the full message history (including thinking/tool blocks) from the
+    /// session file instead of reconstructing from turns (which loses process info).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -787,6 +796,33 @@ pub struct RuntimeThreadManager {
     task_manager: Arc<StdMutex<Option<crate::task_manager::SharedTaskManager>>>,
     automations: Arc<StdMutex<Option<crate::automation_manager::SharedAutomationManager>>>,
     pending_approvals: Arc<StdMutex<HashMap<String, oneshot::Sender<ExternalApprovalDecision>>>>,
+    pending_dynamic_tools: Arc<StdMutex<HashMap<String, oneshot::Sender<DynamicToolCallResult>>>>,
+}
+
+/// Helper types for `seed_thread_from_messages` — intermediate representation
+/// of a turn being built from session messages before persisting as items.
+///
+/// A single content block extracted from an assistant message.
+enum SeedItem {
+    Text(String),
+    Thinking(String),
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+        content_blocks: Option<Vec<serde_json::Value>>,
+    },
+}
+
+/// A turn being assembled from session messages.
+struct TurnSeed {
+    user_text: String,
+    items: Vec<SeedItem>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -821,6 +857,7 @@ impl RuntimeThreadManager {
             task_manager: Arc::new(StdMutex::new(None)),
             automations: Arc::new(StdMutex::new(None)),
             pending_approvals: Arc::new(StdMutex::new(HashMap::new())),
+            pending_dynamic_tools: Arc::new(StdMutex::new(HashMap::new())),
         };
         manager.recover_interrupted_state()?;
         Ok(manager)
@@ -850,6 +887,9 @@ impl RuntimeThreadManager {
         if let Ok(mut map) = self.pending_approvals.lock() {
             map.clear();
         }
+        if let Ok(mut map) = self.pending_dynamic_tools.lock() {
+            map.clear();
+        }
     }
 
     #[allow(dead_code)] // Public API for external callers
@@ -874,6 +914,23 @@ impl RuntimeThreadManager {
         }
     }
 
+    fn register_pending_dynamic_tool(
+        &self,
+        call_id: &str,
+    ) -> oneshot::Receiver<DynamicToolCallResult> {
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut map) = self.pending_dynamic_tools.lock() {
+            map.insert(call_id.to_string(), tx);
+        }
+        rx
+    }
+
+    fn cancel_pending_dynamic_tool(&self, call_id: &str) {
+        if let Ok(mut map) = self.pending_dynamic_tools.lock() {
+            map.remove(call_id);
+        }
+    }
+
     pub fn deliver_external_approval(
         &self,
         approval_id: &str,
@@ -888,6 +945,24 @@ impl RuntimeThreadManager {
         };
         match sender {
             Some(tx) => tx.send(decision).is_ok(),
+            None => false,
+        }
+    }
+
+    pub fn deliver_dynamic_tool_result(
+        &self,
+        call_id: &str,
+        result: DynamicToolCallResult,
+    ) -> bool {
+        let sender = match self.pending_dynamic_tools.lock() {
+            Ok(mut map) => map.remove(call_id),
+            Err(e) => {
+                tracing::error!("pending_dynamic_tools mutex poisoned: {e}");
+                return false;
+            }
+        };
+        match sender {
+            Some(tx) => tx.send(result).is_ok(),
             None => false,
         }
     }
@@ -924,12 +999,28 @@ impl RuntimeThreadManager {
             .unwrap_or(0)
     }
 
+    #[allow(dead_code)]
+    pub fn pending_dynamic_tools_count(&self) -> usize {
+        self.pending_dynamic_tools
+            .lock()
+            .map(|map| map.len())
+            .unwrap_or(0)
+    }
+
     #[cfg(test)]
     pub(crate) fn register_pending_approval_for_test(
         &self,
         approval_id: &str,
     ) -> oneshot::Receiver<ExternalApprovalDecision> {
         self.register_pending_approval(approval_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_pending_dynamic_tool_for_test(
+        &self,
+        call_id: &str,
+    ) -> oneshot::Receiver<DynamicToolCallResult> {
+        self.register_pending_dynamic_tool(call_id)
     }
 
     async fn remember_thread_auto_approve(&self, thread_id: &str) {
@@ -1018,6 +1109,7 @@ impl RuntimeThreadManager {
             system_prompt: req.system_prompt,
             task_id: req.task_id,
             title: None,
+            session_id: None,
         };
         self.store.save_thread(&thread)?;
         self.emit_event(
@@ -1264,6 +1356,28 @@ impl RuntimeThreadManager {
         Ok(thread)
     }
 
+    /// Link a session to a thread so that `ensure_engine_loaded` can restore
+    /// the full message history (including thinking/tool blocks) from the
+    /// session file instead of reconstructing from turns.
+    pub async fn set_thread_session_id(&self, thread_id: &str, session_id: &str) -> Result<()> {
+        let mut thread = self.get_thread(thread_id).await?;
+        if thread.session_id.as_deref() == Some(session_id) {
+            return Ok(());
+        }
+        thread.session_id = Some(session_id.to_string());
+        thread.updated_at = Utc::now();
+        self.store.save_thread(&thread)?;
+        self.emit_event(
+            thread_id,
+            None,
+            None,
+            "thread.updated",
+            json!({ "thread": thread, "changes": { "session_id": session_id } }),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn ensure_thread_has_no_active_turn(&self, thread_id: &str) -> Result<()> {
         let active = self.active.lock().await;
         if active
@@ -1499,6 +1613,11 @@ impl RuntimeThreadManager {
 
     /// Seed a thread with messages from a saved session so subsequent turns
     /// continue with the prior conversation context.
+    ///
+    /// Unlike the old text-only implementation, this preserves all content
+    /// block types (thinking, tool_use, tool_result, etc.) as separate turn
+    /// items so that `loadHistory` in the GUI can reconstruct the full
+    /// conversation including process information.
     pub async fn seed_thread_from_messages(
         &self,
         thread_id: &str,
@@ -1507,44 +1626,128 @@ impl RuntimeThreadManager {
         let mut thread = self.get_thread(thread_id).await?;
         let now = Utc::now();
 
-        let mut user_buf: Vec<String> = Vec::new();
-        let mut pending_pairs: Vec<(String, Option<String>)> = Vec::new();
+        // Group messages into turns. A turn starts with a user message and
+        // includes all subsequent assistant messages (which may contain
+        // thinking, tool_use, tool_result blocks) until the next user message.
+        let mut turns: Vec<TurnSeed> = Vec::new();
+        let mut current_turn: Option<TurnSeed> = None;
 
         for msg in messages {
-            let text = msg
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text, .. } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if text.trim().is_empty() {
-                continue;
-            }
-            if msg.role == "user" {
-                user_buf.push(text);
-            } else if msg.role == "assistant" {
-                let user_text = if user_buf.is_empty() {
-                    String::new()
-                } else {
-                    std::mem::take(&mut user_buf).join("\n")
-                };
-                pending_pairs.push((user_text, Some(text)));
+            match msg.role.as_str() {
+                "user" => {
+                    let mut user_text = String::new();
+                    let mut tool_results = Vec::new();
+
+                    for block in &msg.content {
+                        match block {
+                            ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
+                                if !user_text.is_empty() {
+                                    user_text.push('\n');
+                                }
+                                user_text.push_str(text);
+                            }
+                            ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                                content_blocks,
+                            } => {
+                                tool_results.push(SeedItem::ToolResult {
+                                    tool_use_id: tool_use_id.clone(),
+                                    content: content.clone(),
+                                    is_error: is_error.unwrap_or(false),
+                                    content_blocks: content_blocks.clone(),
+                                });
+                            }
+                            // Other block types in user messages are rare;
+                            // skip them gracefully.
+                            _ => {}
+                        }
+                    }
+
+                    if !user_text.is_empty() {
+                        // A real user prompt begins a new turn. Tool results
+                        // without text belong to the preceding assistant turn.
+                        if let Some(t) = current_turn.take() {
+                            turns.push(t);
+                        }
+                        current_turn = Some(TurnSeed {
+                            user_text,
+                            items: tool_results,
+                        });
+                    } else if !tool_results.is_empty() {
+                        let turn = current_turn.get_or_insert_with(|| TurnSeed {
+                            user_text: String::new(),
+                            items: Vec::new(),
+                        });
+                        turn.items.extend(tool_results);
+                    } else {
+                        if let Some(t) = current_turn.take() {
+                            turns.push(t);
+                        }
+                        current_turn = Some(TurnSeed {
+                            user_text: String::new(),
+                            items: Vec::new(),
+                        });
+                    }
+                }
+                "assistant" => {
+                    // If no current turn exists (e.g. session starts with
+                    // an assistant message), create a placeholder turn.
+                    let turn = current_turn.get_or_insert_with(|| TurnSeed {
+                        user_text: String::new(),
+                        items: Vec::new(),
+                    });
+                    for block in &msg.content {
+                        match block {
+                            ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
+                                turn.items.push(SeedItem::Text(text.clone()));
+                            }
+                            ContentBlock::Thinking { thinking, .. }
+                                if !thinking.trim().is_empty() =>
+                            {
+                                turn.items.push(SeedItem::Thinking(thinking.clone()));
+                            }
+                            ContentBlock::ToolUse {
+                                id, name, input, ..
+                            } => {
+                                turn.items.push(SeedItem::ToolUse {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                });
+                            }
+                            ContentBlock::ServerToolUse {
+                                id, name, input, ..
+                            } => {
+                                turn.items.push(SeedItem::ToolUse {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                });
+                            }
+                            // Skip other block types (image_url, etc.)
+                            _ => {}
+                        }
+                    }
+                }
+                // System messages and other roles are ignored for turn seeding.
+                _ => {}
             }
         }
-        if !user_buf.is_empty() {
-            let user_text = std::mem::take(&mut user_buf).join("\n");
-            pending_pairs.push((user_text, None));
+        // Flush the last turn.
+        if let Some(t) = current_turn.take() {
+            turns.push(t);
         }
 
-        for (user_text, assistant_text) in pending_pairs {
+        for turn_seed in turns {
             let turn_id = format!("turn_{}", &Uuid::new_v4().to_string()[..8]);
-            let summary = crate::utils::truncate_with_ellipsis(&user_text, SUMMARY_LIMIT, "...");
+            let summary =
+                crate::utils::truncate_with_ellipsis(&turn_seed.user_text, SUMMARY_LIMIT, "...");
             let mut item_ids = Vec::new();
 
-            if !user_text.is_empty() {
+            // Save user message item.
+            if !turn_seed.user_text.is_empty() {
                 let item_id = format!("item_{}", &Uuid::new_v4().to_string()[..8]);
                 self.store.save_item(&TurnItemRecord {
                     schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
@@ -1553,7 +1756,7 @@ impl RuntimeThreadManager {
                     kind: TurnItemKind::UserMessage,
                     status: TurnItemLifecycleStatus::Completed,
                     summary: summary.clone(),
-                    detail: Some(user_text),
+                    detail: Some(turn_seed.user_text.clone()),
                     metadata: None,
                     artifact_refs: Vec::new(),
                     started_at: Some(now),
@@ -1562,47 +1765,148 @@ impl RuntimeThreadManager {
                 item_ids.push(item_id);
             }
 
-            if let Some(assistant_text) = assistant_text {
-                let asst_summary = if assistant_text.len() > SUMMARY_LIMIT {
-                    crate::utils::truncate_with_ellipsis(&assistant_text, SUMMARY_LIMIT, "...")
-                } else {
-                    assistant_text.clone()
-                };
+            // Save assistant content items in order.
+            for seed_item in &turn_seed.items {
                 let item_id = format!("item_{}", &Uuid::new_v4().to_string()[..8]);
-                self.store.save_item(&TurnItemRecord {
-                    schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-                    id: item_id.clone(),
-                    turn_id: turn_id.clone(),
-                    kind: TurnItemKind::AgentMessage,
-                    status: TurnItemLifecycleStatus::Completed,
-                    summary: asst_summary,
-                    detail: Some(assistant_text),
-                    metadata: None,
-                    artifact_refs: Vec::new(),
-                    started_at: Some(now),
-                    ended_at: Some(now),
-                })?;
+                match seed_item {
+                    SeedItem::Text(text) => {
+                        let asst_summary = if text.len() > SUMMARY_LIMIT {
+                            crate::utils::truncate_with_ellipsis(text, SUMMARY_LIMIT, "...")
+                        } else {
+                            text.clone()
+                        };
+                        self.store.save_item(&TurnItemRecord {
+                            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                            id: item_id.clone(),
+                            turn_id: turn_id.clone(),
+                            kind: TurnItemKind::AgentMessage,
+                            status: TurnItemLifecycleStatus::Completed,
+                            summary: asst_summary,
+                            detail: Some(text.clone()),
+                            metadata: None,
+                            artifact_refs: Vec::new(),
+                            started_at: Some(now),
+                            ended_at: Some(now),
+                        })?;
+                    }
+                    SeedItem::Thinking(thinking) => {
+                        let thinking_summary = if thinking.len() > SUMMARY_LIMIT {
+                            crate::utils::truncate_with_ellipsis(thinking, SUMMARY_LIMIT, "...")
+                        } else {
+                            thinking.clone()
+                        };
+                        self.store.save_item(&TurnItemRecord {
+                            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                            id: item_id.clone(),
+                            turn_id: turn_id.clone(),
+                            kind: TurnItemKind::AgentReasoning,
+                            status: TurnItemLifecycleStatus::Completed,
+                            summary: thinking_summary,
+                            detail: Some(thinking.clone()),
+                            metadata: None,
+                            artifact_refs: Vec::new(),
+                            started_at: Some(now),
+                            ended_at: Some(now),
+                        })?;
+                    }
+                    SeedItem::ToolUse {
+                        id: tool_id,
+                        name,
+                        input,
+                    } => {
+                        let input_str =
+                            serde_json::to_string(input).unwrap_or_else(|_| input.to_string());
+                        let tool_summary = format!("{name}({})", {
+                            let s = &input_str;
+                            if s.len() > 80 {
+                                crate::utils::truncate_with_ellipsis(s, 80, "...")
+                            } else {
+                                s.clone()
+                            }
+                        });
+                        self.store.save_item(&TurnItemRecord {
+                            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                            id: item_id.clone(),
+                            turn_id: turn_id.clone(),
+                            kind: TurnItemKind::ToolCall,
+                            status: TurnItemLifecycleStatus::Completed,
+                            summary: tool_summary,
+                            detail: Some(input_str),
+                            metadata: Some(serde_json::Value::Object(
+                                serde_json::json!({
+                                    "tool_use_id": tool_id,
+                                    "tool_name": name,
+                                })
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                            )),
+                            artifact_refs: Vec::new(),
+                            started_at: Some(now),
+                            ended_at: Some(now),
+                        })?;
+                    }
+                    SeedItem::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        content_blocks,
+                    } => {
+                        let result_summary = if content.len() > SUMMARY_LIMIT {
+                            crate::utils::truncate_with_ellipsis(content, SUMMARY_LIMIT, "...")
+                        } else {
+                            content.clone()
+                        };
+                        let mut metadata = serde_json::Map::new();
+                        metadata.insert("tool_result_for".to_string(), json!(tool_use_id));
+                        metadata.insert("is_error".to_string(), json!(is_error));
+                        if let Some(blocks) = content_blocks {
+                            metadata
+                                .insert("content_blocks".to_string(), Value::Array(blocks.clone()));
+                        }
+                        self.store.save_item(&TurnItemRecord {
+                            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                            id: item_id.clone(),
+                            turn_id: turn_id.clone(),
+                            kind: TurnItemKind::ToolCall,
+                            status: if *is_error {
+                                TurnItemLifecycleStatus::Failed
+                            } else {
+                                TurnItemLifecycleStatus::Completed
+                            },
+                            summary: result_summary,
+                            detail: Some(content.clone()),
+                            metadata: Some(Value::Object(metadata)),
+                            artifact_refs: Vec::new(),
+                            started_at: Some(now),
+                            ended_at: Some(now),
+                        })?;
+                    }
+                }
                 item_ids.push(item_id);
             }
 
-            self.store.save_turn(&TurnRecord {
-                schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-                id: turn_id.clone(),
-                thread_id: thread_id.to_string(),
-                status: RuntimeTurnStatus::Completed,
-                input_summary: summary,
-                created_at: now,
-                started_at: Some(now),
-                ended_at: Some(now),
-                duration_ms: Some(0),
-                usage: None,
-                error: None,
-                item_ids,
-                steer_count: 0,
-            })?;
+            // Only create a turn if there's content.
+            if !item_ids.is_empty() {
+                self.store.save_turn(&TurnRecord {
+                    schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                    id: turn_id.clone(),
+                    thread_id: thread_id.to_string(),
+                    status: RuntimeTurnStatus::Completed,
+                    input_summary: summary,
+                    created_at: now,
+                    started_at: Some(now),
+                    ended_at: Some(now),
+                    duration_ms: Some(0),
+                    usage: None,
+                    error: None,
+                    item_ids,
+                    steer_count: 0,
+                })?;
 
-            thread.latest_turn_id = Some(turn_id);
-            thread.updated_at = now;
+                thread.latest_turn_id = Some(turn_id);
+                thread.updated_at = now;
+            }
         }
 
         self.store.save_thread(&thread)?;
@@ -1764,6 +2068,7 @@ impl RuntimeThreadManager {
                 translation_enabled: false,
                 show_thinking,
                 allowed_tools: None,
+                dynamic_tools: req.dynamic_tools,
                 hook_executor: None,
                 approval_mode: if auto_approve {
                     crate::tui::approval::ApprovalMode::Auto
@@ -1771,6 +2076,7 @@ impl RuntimeThreadManager {
                     crate::tui::approval::ApprovalMode::Suggest
                 },
                 verbosity: self.config.verbosity.clone(),
+                provenance: crate::core::ops::UserInputProvenance::ExternalUser,
             })
             .await
             .map_err(|e| anyhow!("Failed to start turn: {e}"))?;
@@ -2080,6 +2386,11 @@ impl RuntimeThreadManager {
             .lsp
             .clone()
             .map(crate::config::LspConfigToml::into_runtime);
+        let provider = self.config.api_provider();
+        let max_subagents = self
+            .config
+            .max_subagents_for_provider(provider)
+            .clamp(1, MAX_SUBAGENTS);
         let engine_cfg = EngineConfig {
             model: thread.model.clone(),
             workspace: thread.workspace.clone(),
@@ -2088,6 +2399,7 @@ impl RuntimeThreadManager {
             notes_path: self.config.notes_path(),
             mcp_config_path: self.config.mcp_config_path(),
             skills_dir: self.config.skills_dir(),
+            skills_scan_codewhale_only: self.config.skills_config().scan_codewhale_only(),
             instructions: self
                 .config
                 .instructions_paths()
@@ -2098,14 +2410,20 @@ impl RuntimeThreadManager {
             translation_enabled: false,
             show_thinking: settings.show_thinking,
             max_steps: 100,
-            max_subagents: self.config.max_subagents().clamp(1, MAX_SUBAGENTS),
-            launch_concurrency: self.config.launch_concurrency(),
+            max_subagents,
+            max_admitted_subagents: self
+                .config
+                .max_admitted_subagents_for_provider(provider)
+                .max(max_subagents),
+            launch_concurrency: self.config.launch_concurrency_for_provider(provider),
+            subagents_enabled: self.config.subagents_enabled_for_provider(provider),
             features: self.config.features(),
             compaction,
             todos: new_shared_todo_list(),
             plan_state: new_shared_plan_state(),
             goal_state: crate::tools::goal::new_shared_goal_state(),
-            max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
+            max_spawn_depth: self.config.subagent_max_spawn_depth_for_provider(provider),
+            subagent_token_budget: self.config.subagent_token_budget_for_provider(provider),
             network_policy,
             snapshots_enabled: self.config.snapshots_config().enabled,
             snapshots_max_workspace_bytes: self
@@ -2120,6 +2438,7 @@ impl RuntimeThreadManager {
                 task_data_dir: Some(self.manager_cfg.task_data_dir.clone()),
                 active_task_id: thread.task_id.clone(),
                 active_thread_id: Some(thread.id.clone()),
+                dynamic_tool_executor: Some(Arc::new(self.clone())),
                 shell_manager: None,
                 hook_executor: None,
                 handle_store: crate::tools::handle::new_shared_handle_store(),
@@ -2127,13 +2446,14 @@ impl RuntimeThreadManager {
             },
             subagent_model_overrides: self.config.subagent_model_overrides(),
             subagent_api_timeout: std::time::Duration::from_secs(
-                self.config.subagent_api_timeout_secs(),
+                self.config.subagent_api_timeout_secs_for_provider(provider),
             ),
             stream_chunk_timeout: std::time::Duration::from_secs(
                 self.config.stream_chunk_timeout_secs(),
             ),
             subagent_heartbeat_timeout: std::time::Duration::from_secs(
-                self.config.subagent_heartbeat_timeout_secs(),
+                self.config
+                    .subagent_heartbeat_timeout_secs_for_provider(provider),
             ),
             prefer_bwrap: self.config.prefer_bwrap.unwrap_or(false),
             memory_enabled: self.config.memory_enabled(),
@@ -2157,12 +2477,52 @@ impl RuntimeThreadManager {
             tools_always_load: self.config.tools_always_load(),
             tools: self.config.tools.clone(),
             verbosity: self.config.verbosity.clone(),
+            workspace_follow_symlinks: settings.workspace_follow_symlinks,
+            exec_policy_engine: self.config.exec_policy_engine.clone(),
         };
 
         let engine = spawn_engine(engine_cfg, &self.config);
 
-        let turns = self.store.list_turns_for_thread(&thread.id)?;
-        let session_messages = self.reconstruct_messages_from_turns(&turns)?;
+        // When the thread has an associated session, load the full message history
+        // (including thinking/tool blocks) from the session file. This preserves
+        // process information that `reconstruct_messages_from_turns` would lose.
+        let session_messages = if let Some(ref sid) = thread.session_id {
+            match crate::session_manager::default_sessions_dir() {
+                Ok(sessions_dir) => {
+                    match crate::session_manager::SessionManager::new(sessions_dir) {
+                        Ok(manager) => match manager.load_session(sid) {
+                            Ok(session) => session.messages,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to load session {} for thread {}: {e}; falling back to turn reconstruction",
+                                    sid,
+                                    thread.id
+                                );
+                                let turns = self.store.list_turns_for_thread(&thread.id)?;
+                                self.reconstruct_messages_from_turns(&turns)?
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to open sessions dir: {e}; falling back to turn reconstruction"
+                            );
+                            let turns = self.store.list_turns_for_thread(&thread.id)?;
+                            self.reconstruct_messages_from_turns(&turns)?
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to resolve sessions dir: {e}; falling back to turn reconstruction"
+                    );
+                    let turns = self.store.list_turns_for_thread(&thread.id)?;
+                    self.reconstruct_messages_from_turns(&turns)?
+                }
+            }
+        } else {
+            let turns = self.store.list_turns_for_thread(&thread.id)?;
+            self.reconstruct_messages_from_turns(&turns)?
+        };
         let sys_prompt = thread
             .system_prompt
             .as_ref()
@@ -2170,7 +2530,7 @@ impl RuntimeThreadManager {
         if !session_messages.is_empty() || sys_prompt.is_some() {
             engine
                 .send(Op::SyncSession {
-                    session_id: None,
+                    session_id: thread.session_id.clone(),
                     messages: session_messages,
                     system_prompt: sys_prompt,
                     system_prompt_override: thread.system_prompt.is_some(),
@@ -2208,32 +2568,132 @@ impl RuntimeThreadManager {
     fn reconstruct_messages_from_turns(&self, turns: &[TurnRecord]) -> Result<Vec<Message>> {
         let mut messages = Vec::new();
         for turn in turns {
-            let items = self.store.list_items_for_turn(&turn.id)?;
+            let stored_items = self.store.list_items_for_turn(&turn.id)?;
+            let items = if turn.item_ids.is_empty() {
+                stored_items
+            } else {
+                let mut by_id: HashMap<String, TurnItemRecord> = stored_items
+                    .iter()
+                    .cloned()
+                    .map(|item| (item.id.clone(), item))
+                    .collect();
+                let mut ordered = Vec::new();
+                for item_id in &turn.item_ids {
+                    if let Some(item) = by_id.remove(item_id) {
+                        ordered.push(item);
+                    }
+                }
+                for item in stored_items {
+                    if by_id.contains_key(&item.id) {
+                        ordered.push(item);
+                    }
+                }
+                ordered
+            };
+
+            let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
+            let mut user_blocks: Vec<ContentBlock> = Vec::new();
+            let flush_assistant = |blocks: &mut Vec<ContentBlock>, msgs: &mut Vec<Message>| {
+                if !blocks.is_empty() {
+                    msgs.push(Message {
+                        role: "assistant".to_string(),
+                        content: std::mem::take(blocks),
+                    });
+                }
+            };
+            let flush_user = |blocks: &mut Vec<ContentBlock>, msgs: &mut Vec<Message>| {
+                if !blocks.is_empty() {
+                    msgs.push(Message {
+                        role: "user".to_string(),
+                        content: std::mem::take(blocks),
+                    });
+                }
+            };
             for item in items {
                 match item.kind {
                     TurnItemKind::UserMessage => {
+                        flush_assistant(&mut assistant_blocks, &mut messages);
                         let text = item.detail.unwrap_or(item.summary);
-                        messages.push(Message {
-                            role: "user".to_string(),
-                            content: vec![ContentBlock::Text {
+                        if !text.trim().is_empty() {
+                            user_blocks.push(ContentBlock::Text {
                                 text,
                                 cache_control: None,
-                            }],
-                        });
+                            });
+                        }
                     }
                     TurnItemKind::AgentMessage => {
+                        flush_user(&mut user_blocks, &mut messages);
                         let text = item.detail.unwrap_or(item.summary);
-                        messages.push(Message {
-                            role: "assistant".to_string(),
-                            content: vec![ContentBlock::Text {
+                        if !text.trim().is_empty() {
+                            assistant_blocks.push(ContentBlock::Text {
                                 text,
                                 cache_control: None,
-                            }],
-                        });
+                            });
+                        }
+                    }
+                    TurnItemKind::AgentReasoning => {
+                        flush_user(&mut user_blocks, &mut messages);
+                        let thinking = item.detail.unwrap_or(item.summary);
+                        if !thinking.trim().is_empty() {
+                            assistant_blocks.push(ContentBlock::Thinking {
+                                thinking,
+                                signature: None,
+                            });
+                        }
+                    }
+                    TurnItemKind::ToolCall => {
+                        let meta = item.metadata.as_ref();
+                        let is_tool_result = meta.and_then(|m| m.get("tool_result_for")).is_some();
+                        if is_tool_result {
+                            flush_assistant(&mut assistant_blocks, &mut messages);
+                            let tool_use_id = meta
+                                .and_then(|m| m.get("tool_result_for"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let content = item.detail.unwrap_or_default();
+                            let is_error = meta
+                                .and_then(|m| m.get("is_error"))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let content_blocks = meta
+                                .and_then(|m| m.get("content_blocks"))
+                                .and_then(|v| v.as_array())
+                                .cloned();
+                            user_blocks.push(ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error: if is_error { Some(true) } else { None },
+                                content_blocks,
+                            });
+                        } else {
+                            flush_user(&mut user_blocks, &mut messages);
+                            let tool_use_id = meta
+                                .and_then(|m| m.get("tool_use_id"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let tool_name = meta
+                                .and_then(|m| m.get("tool_name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let input_str = item.detail.unwrap_or_default();
+                            let input: serde_json::Value =
+                                serde_json::from_str(&input_str).unwrap_or(serde_json::Value::Null);
+                            assistant_blocks.push(ContentBlock::ToolUse {
+                                id: tool_use_id,
+                                name: tool_name,
+                                input,
+                                caller: None,
+                            });
+                        }
                     }
                     _ => {}
                 }
             }
+            flush_assistant(&mut assistant_blocks, &mut messages);
+            flush_user(&mut user_blocks, &mut messages);
         }
         Ok(messages)
     }
@@ -2251,6 +2711,7 @@ impl RuntimeThreadManager {
         let mut turn_usage: Option<Usage> = None;
         let mut turn_status = RuntimeTurnStatus::Completed;
         let mut turn_error: Option<String> = None;
+        let mut saw_engine_activity = false;
 
         loop {
             let event = {
@@ -2267,6 +2728,13 @@ impl RuntimeThreadManager {
                 }
                 break;
             };
+
+            if !matches!(
+                &event,
+                EngineEvent::TurnStarted { .. } | EngineEvent::TurnComplete { .. }
+            ) {
+                saw_engine_activity = true;
+            }
 
             match event {
                 EngineEvent::TurnStarted { .. } => {
@@ -2539,7 +3007,7 @@ impl RuntimeThreadManager {
                         .await?;
                     }
                 }
-                EngineEvent::AgentSpawned { id, prompt } => {
+                EngineEvent::AgentSpawned { id, prompt, .. } => {
                     let message = format!(
                         "Sub-agent {id} spawned: {}",
                         summarize_text(&prompt, SUMMARY_LIMIT)
@@ -2568,7 +3036,7 @@ impl RuntimeThreadManager {
                     )
                     .await?;
                 }
-                EngineEvent::AgentProgress { id, status } => {
+                EngineEvent::AgentProgress { id, status, .. } => {
                     let message = format!("Sub-agent {id}: {status}");
                     let item = TurnItemRecord {
                         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
@@ -2947,6 +3415,34 @@ impl RuntimeThreadManager {
             .await?;
         }
 
+        if turn_status == RuntimeTurnStatus::Completed && !saw_engine_activity {
+            turn_status = RuntimeTurnStatus::Failed;
+            turn_error = Some(EMPTY_TURN_REASON.to_string());
+            let item = TurnItemRecord {
+                schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                id: format!("item_{}", &Uuid::new_v4().to_string()[..8]),
+                turn_id: turn_id.clone(),
+                kind: TurnItemKind::Error,
+                status: TurnItemLifecycleStatus::Failed,
+                summary: EMPTY_TURN_REASON.to_string(),
+                detail: Some(EMPTY_TURN_REASON.to_string()),
+                metadata: None,
+                artifact_refs: Vec::new(),
+                started_at: Some(Utc::now()),
+                ended_at: Some(Utc::now()),
+            };
+            self.store.save_item(&item)?;
+            self.attach_item_to_turn(&turn_id, &item.id)?;
+            self.emit_event(
+                &thread_id,
+                Some(&turn_id),
+                Some(&item.id),
+                "item.failed",
+                json!({ "item": item }),
+            )
+            .await?;
+        }
+
         let ended_at = Utc::now();
         let mut turn = self.store.load_turn(&turn_id)?;
         turn.status = turn_status;
@@ -3014,6 +3510,16 @@ impl RuntimeThreadManager {
             return None;
         }
         Some((turn.auto_approve, turn.trust_mode))
+    }
+
+    async fn active_turn_id(&self, thread_id: &str) -> Option<String> {
+        let active = self.active.lock().await;
+        active
+            .engines
+            .get(thread_id)?
+            .active_turn
+            .as_ref()
+            .map(|turn| turn.turn_id.clone())
     }
 
     fn approval_decision(
@@ -3097,6 +3603,89 @@ impl RuntimeThreadManager {
         );
         touch_lru(&mut active.lru, thread_id);
         Ok(())
+    }
+}
+
+fn dynamic_tool_result_text(content: &[DynamicToolCallContent]) -> String {
+    content
+        .iter()
+        .map(|item| match item {
+            DynamicToolCallContent::InputText { text } => text.clone(),
+            DynamicToolCallContent::InputImage { image_url } => format!("[image] {image_url}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[async_trait::async_trait]
+impl crate::tools::spec::DynamicToolExecutor for RuntimeThreadManager {
+    async fn execute_dynamic_tool(
+        &self,
+        thread_id: Option<String>,
+        namespace: Option<String>,
+        name: String,
+        input: Value,
+    ) -> std::result::Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError> {
+        let thread_id = thread_id.ok_or_else(|| {
+            crate::tools::spec::ToolError::not_available(format!(
+                "runtime dynamic tool '{name}' has no active thread"
+            ))
+        })?;
+        let turn_id = self.active_turn_id(&thread_id).await.ok_or_else(|| {
+            crate::tools::spec::ToolError::not_available(format!(
+                "runtime dynamic tool '{name}' has no active turn"
+            ))
+        })?;
+        let call_id = format!("call_{}", &Uuid::new_v4().to_string()[..8]);
+        let rx = self.register_pending_dynamic_tool(&call_id);
+
+        let params = DynamicToolCallParams {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            call_id: call_id.clone(),
+            namespace,
+            tool: name.clone(),
+            arguments: input,
+        };
+        if let Err(err) = self
+            .emit_event(
+                &thread_id,
+                Some(&turn_id),
+                None,
+                "tool_call.requested",
+                json!(params),
+            )
+            .await
+        {
+            self.cancel_pending_dynamic_tool(&call_id);
+            return Err(crate::tools::spec::ToolError::execution_failed(format!(
+                "failed to emit runtime dynamic tool request for '{name}': {err}"
+            )));
+        }
+
+        match tokio::time::timeout(APPROVAL_DECISION_TIMEOUT, rx).await {
+            Ok(Ok(result)) => {
+                let text = dynamic_tool_result_text(&result.content);
+                if result.success {
+                    Ok(crate::tools::spec::ToolResult::success(text))
+                } else {
+                    Ok(crate::tools::spec::ToolResult::error(if text.is_empty() {
+                        "dynamic tool failed".to_string()
+                    } else {
+                        text
+                    }))
+                }
+            }
+            Ok(Err(_recv_err)) => Err(crate::tools::spec::ToolError::execution_failed(format!(
+                "runtime dynamic tool '{name}' result channel closed"
+            ))),
+            Err(_timeout) => {
+                self.cancel_pending_dynamic_tool(&call_id);
+                Err(crate::tools::spec::ToolError::Timeout {
+                    seconds: APPROVAL_DECISION_TIMEOUT.as_secs(),
+                })
+            }
+        }
     }
 }
 
@@ -3309,6 +3898,7 @@ mod tests {
             system_prompt: None,
             task_id: None,
             title: None,
+            session_id: None,
         }
     }
 
@@ -3416,6 +4006,149 @@ mod tests {
 
         // Cleanup so we don't leak across tests.
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn store_load_thread_defaults_missing_session_id() {
+        let dir = test_runtime_dir();
+        let store = RuntimeThreadStore::open(dir.clone()).expect("open store");
+        let thread = sample_thread("thr_legacy_session");
+        let path = store.threads_dir.join(format!("{}.json", thread.id));
+        std::fs::create_dir_all(path.parent().unwrap()).expect("mkdirs");
+        let mut payload = serde_json::to_value(&thread).expect("serialize thread");
+        payload
+            .as_object_mut()
+            .expect("thread object")
+            .remove("session_id");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&payload).expect("encode thread"),
+        )
+        .expect("write thread");
+
+        let loaded = store
+            .load_thread(&thread.id)
+            .expect("legacy thread should load");
+        assert_eq!(loaded.session_id, None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn seed_thread_keeps_tool_results_on_preceding_turn() -> Result<()> {
+        let dir = test_runtime_dir();
+        let manager = test_manager(dir.clone())?;
+        let thread = sample_thread("thr_seed_blocks");
+        manager.store.save_thread(&thread)?;
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "check the files".to_string(),
+                    cache_control: None,
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "need a tool".to_string(),
+                        signature: Some("sig-1".to_string()),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "shell".to_string(),
+                        input: json!({ "cmd": "one" }),
+                        caller: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "tool-2".to_string(),
+                        name: "shell".to_string(),
+                        input: json!({ "cmd": "two" }),
+                        caller: None,
+                    },
+                ],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool-1".to_string(),
+                    content: "one".to_string(),
+                    is_error: None,
+                    content_blocks: Some(vec![json!({
+                        "type": "text",
+                        "text": "structured one"
+                    })]),
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool-2".to_string(),
+                    content: "two".to_string(),
+                    is_error: Some(true),
+                    content_blocks: None,
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                    cache_control: None,
+                }],
+            },
+        ];
+
+        manager
+            .seed_thread_from_messages(&thread.id, &messages)
+            .await?;
+        let turns = manager.store.list_turns_for_thread(&thread.id)?;
+        assert_eq!(turns.len(), 1);
+
+        let restored = manager.reconstruct_messages_from_turns(&turns)?;
+        let roles = restored
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+        assert_eq!(restored[2].content.len(), 2);
+
+        match &restored[2].content[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                content_blocks,
+            } => {
+                assert_eq!(tool_use_id, "tool-1");
+                assert_eq!(content, "one");
+                assert_eq!(*is_error, None);
+                assert_eq!(
+                    content_blocks
+                        .as_ref()
+                        .and_then(|blocks| blocks[0].get("text")),
+                    Some(&json!("structured one"))
+                );
+            }
+            other => panic!("expected first tool result, got {other:?}"),
+        }
+        match &restored[2].content[1] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                content_blocks,
+            } => {
+                assert_eq!(tool_use_id, "tool-2");
+                assert_eq!(content, "two");
+                assert_eq!(*is_error, Some(true));
+                assert!(content_blocks.is_none());
+            }
+            other => panic!("expected second tool result, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
     }
 
     #[test]
@@ -3727,6 +4460,92 @@ mod tests {
             events.iter().any(|ev| ev.event == "turn.completed"),
             "expected turn.completed event after restart"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_turn_without_engine_output_fails() -> Result<()> {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest {
+                model: None,
+                workspace: None,
+                mode: None,
+                allow_shell: None,
+                trust_mode: None,
+                auto_approve: None,
+                archived: false,
+                system_prompt: None,
+                task_id: None,
+                ..Default::default()
+            })
+            .await?;
+
+        let harness = install_mock_engine(&manager, &thread.id).await;
+        let mut rx_op = harness.rx_op;
+        let tx_event = harness.tx_event;
+        tokio::spawn(async move {
+            if matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+                let _ = tx_event
+                    .send(EngineEvent::TurnStarted {
+                        turn_id: "engine_empty_turn".to_string(),
+                    })
+                    .await;
+                let _ = tx_event
+                    .send(EngineEvent::TurnComplete {
+                        usage: Usage {
+                            input_tokens: 10,
+                            output_tokens: 0,
+                            ..Usage::default()
+                        },
+                        status: TurnOutcomeStatus::Completed,
+                        error: None,
+                        tool_catalog: None,
+                        base_url: None,
+                    })
+                    .await;
+            }
+        });
+
+        let turn = manager
+            .start_turn(
+                &thread.id,
+                StartTurnRequest {
+                    prompt: "empty turn".to_string(),
+                    input_summary: None,
+                    model: None,
+                    mode: None,
+                    allow_shell: None,
+                    trust_mode: None,
+                    auto_approve: None,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let failed = wait_for_terminal_turn(&manager, &turn.id, Duration::from_secs(2)).await?;
+        assert_eq!(failed.status, RuntimeTurnStatus::Failed);
+        assert_eq!(failed.error.as_deref(), Some(EMPTY_TURN_REASON));
+
+        let events = manager.events_since(&thread.id, None)?;
+        assert!(events.iter().any(|ev| {
+            ev.event == "item.failed"
+                && ev
+                    .payload
+                    .get("item")
+                    .and_then(|item| item.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("error")
+        }));
+        assert!(events.iter().any(|ev| {
+            ev.event == "turn.completed"
+                && ev
+                    .payload
+                    .get("turn")
+                    .and_then(|turn| turn.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("failed")
+        }));
         Ok(())
     }
 
@@ -4448,6 +5267,7 @@ mod tests {
                 description: "stale approval".to_string(),
                 input: serde_json::json!({}),
                 intent_summary: None,
+                approval_force_prompt: false,
             })
             .await?;
 
@@ -4527,6 +5347,7 @@ mod tests {
                 description: "external allow".to_string(),
                 input: serde_json::json!({}),
                 intent_summary: Some("I will update the config file.".to_string()),
+                approval_force_prompt: false,
             })
             .await?;
 
@@ -4624,6 +5445,7 @@ mod tests {
                 description: "external deny".to_string(),
                 input: serde_json::json!({}),
                 intent_summary: None,
+                approval_force_prompt: false,
             })
             .await?;
 
@@ -4820,6 +5642,7 @@ mod tests {
                 description: "remember=true".to_string(),
                 input: serde_json::json!({}),
                 intent_summary: None,
+                approval_force_prompt: false,
             })
             .await?;
 
@@ -5275,6 +6098,7 @@ mod tests {
             system_prompt: None,
             task_id: None,
             title: None,
+            session_id: None,
         };
         manager.store.save_thread(&thread)?;
 

@@ -305,6 +305,7 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         | "minimax-m2.1-highspeed"
         | "minimax-m2" => Some(204_800),
         "z-ai/glm-5.1" | "z-ai/glm-5v-turbo" | "glm-5.1" | "glm-5v-turbo" => Some(202_752),
+        "z-ai/glm-5-turbo" | "glm-5-turbo" => Some(202_752),
         "z-ai/glm-5.2" | "glm-5.2" => Some(1_000_000),
         "minimax/minimax-m3" | "minimax-m3" | "qwen/qwen3.6-flash" | "qwen/qwen3.6-plus" => {
             Some(1_000_000)
@@ -350,7 +351,8 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
         "minimax/minimax-m3" | "minimax-m3" => Some(524_288),
         "qwen/qwen3.6-35b-a3b" | "qwen/qwen3.6-27b" => Some(262_140),
         "qwen/qwen3.6-flash" | "qwen/qwen3.6-max-preview" | "qwen/qwen3.6-plus" => Some(65_536),
-        "z-ai/glm-5.1" | "z-ai/glm-5.2" | "glm-5.1" | "glm-5.2" => Some(131_072),
+        "z-ai/glm-5.1" | "z-ai/glm-5.2" | "z-ai/glm-5-turbo" | "glm-5.1" | "glm-5.2"
+        | "glm-5-turbo" => Some(131_072),
         "xiaomi/mimo-v2.5-pro" | "xiaomi/mimo-v2.5" | "mimo-v2.5-pro" | "mimo-v2.5" => {
             Some(131_072)
         }
@@ -426,8 +428,10 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "mimo-v2.5"
             | "z-ai/glm-5.1"
             | "z-ai/glm-5.2"
+            | "z-ai/glm-5-turbo"
             | "glm-5.1"
             | "glm-5.2"
+            | "glm-5-turbo"
     ) || is_openai_gpt_55_api_model(&lower)
         || is_openai_codex_model(&lower)
 }
@@ -821,6 +825,11 @@ mod tests {
         );
         assert_eq!(max_output_tokens_for_model("z-ai/glm-5.1"), Some(131_072));
         assert_eq!(max_output_tokens_for_model("z-ai/glm-5.2"), Some(131_072));
+        assert_eq!(
+            max_output_tokens_for_model("z-ai/glm-5-turbo"),
+            Some(131_072)
+        );
+        assert_eq!(max_output_tokens_for_model("glm-5-turbo"), Some(131_072));
     }
 
     #[test]
@@ -837,6 +846,7 @@ mod tests {
             ("minimax-m2", 204_800),
             ("glm-5.1", 202_752),
             ("glm-5.2", 1_000_000),
+            ("glm-5-turbo", 202_752),
         ] {
             assert_eq!(context_window_for_model(model), Some(expected_window));
             assert!(model_supports_reasoning(model));
@@ -845,6 +855,10 @@ mod tests {
         assert!(model_supports_reasoning("kimi-for-coding"));
         assert_eq!(context_window_for_model("glm-5v-turbo"), Some(202_752));
         assert!(!model_supports_reasoning("glm-5v-turbo"));
+        // GLM-5-Turbo is a fast text sibling (distinct from the glm-5v-turbo
+        // vision model): same compact window as 5.1 but reasoning-capable.
+        assert_eq!(context_window_for_model("z-ai/glm-5-turbo"), Some(202_752));
+        assert!(model_supports_reasoning("z-ai/glm-5-turbo"));
         assert_eq!(max_output_tokens_for_model("kimi-k2.7-code"), Some(262_144));
         assert_eq!(max_output_tokens_for_model("kimi-k2.6"), Some(262_144));
         assert_eq!(

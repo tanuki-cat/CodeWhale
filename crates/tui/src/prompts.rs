@@ -44,6 +44,9 @@ pub struct PromptSessionContext<'a> {
     /// Optional output-verbosity mode. `concise` appends a short output
     /// discipline block; unset keeps the normal conversational prompt.
     pub verbosity: Option<&'a str>,
+    /// Restrict skill discovery to CodeWhale-owned roots plus explicit
+    /// `skills_dir` configuration.
+    pub skills_scan_codewhale_only: bool,
 }
 
 impl Default for PromptSessionContext<'_> {
@@ -58,6 +61,7 @@ impl Default for PromptSessionContext<'_> {
             context_window_override: None,
             show_thinking: true,
             verbosity: None,
+            skills_scan_codewhale_only: false,
         }
     }
 }
@@ -165,23 +169,34 @@ for the current turn."
 /// in `prompts/constitution.md` can reference it without the model having to
 /// guess from the user's first message. `locale_tag` is resolved by
 /// the caller from `Settings` so this function stays I/O-free.
-fn render_environment_block(workspace: &Path, locale_tag: &str) -> String {
+fn render_environment_block(_workspace: &Path, locale_tag: &str) -> String {
     let codewhale_version = env!("CARGO_PKG_VERSION");
     let platform = std::env::consts::OS;
     let shell = crate::shell_dispatcher::global_dispatcher()
         .kind()
         .binary()
         .to_string();
-    let pwd = workspace.display();
 
+    // The workspace path (`pwd`) is intentionally delivered per-turn via the
+    // `<turn_meta>` block (see `turn_metadata_block`) rather than embedded here.
+    //
+    // Rationale: when the workspace path changes between sessions (e.g. an
+    // ephemeral per-session workspace), a volatile value inside the otherwise
+    // static system prefix invalidates the inference server's prefix cache at
+    // that exact point. The cache then only partially matches and the tail must
+    // be re-prefilled from the divergence boundary. On backends that pair prefix
+    // caching with speculative decoding, this partial re-prefill can perturb the
+    // logits at the boundary enough to degrade structured tool-call emission
+    // (the model regresses to bare text). Keeping the static system prefix
+    // byte-identical across sessions lets the prefix cache be reused; the live
+    // workspace path still reaches the model every turn through `turn_meta`.
     format!(
         "## Environment\n\
          \n\
          - lang: {locale_tag}\n\
          - codewhale_version: {codewhale_version}\n\
          - platform: {platform}\n\
-         - shell: {shell}\n\
-         - pwd: {pwd}"
+         - shell: {shell}"
     )
 }
 
@@ -1000,6 +1015,7 @@ pub fn system_prompt_for_mode_with_context_and_skills(
             context_window_override: None,
             show_thinking: true,
             verbosity: None,
+            skills_scan_codewhale_only: false,
         },
     )
 }
@@ -1098,19 +1114,28 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
         );
     }
 
-    // 3. Skills block. #432: walks every candidate workspace
-    // skills directory (`.agents/skills`, `skills`,
-    // `.opencode/skills`, `.claude/skills`, `.cursor/skills`) plus global
-    // `~/.agents/skills` / `~/.deepseek/skills` so skills installed for any
-    // AI-tool convention show up in the catalogue. When an explicit
+    // 3. Skills block. #432: default discovery walks every compatible
+    // workspace/global skill directory so skills installed for other AI-tool
+    // conventions show up in the catalogue. Users can opt into a CodeWhale-only
+    // scan with `[skills] scan_codewhale_only = true`. When an explicit
     // `skills_dir` is configured, union it with the workspace view instead of
     // treating it as a fallback; the workspace view often returns Some and
     // would otherwise shadow the configured directory entirely.
+    let skill_discovery_mode = crate::skills::SkillDiscoveryMode::from_codewhale_only(
+        session_context.skills_scan_codewhale_only,
+    );
     let skills_block = match skills_dir {
         Some(dir) => {
-            crate::skills::render_available_skills_context_for_workspace_and_dir(workspace, dir)
+            crate::skills::render_available_skills_context_for_workspace_and_dir_with_mode(
+                workspace,
+                dir,
+                skill_discovery_mode,
+            )
         }
-        None => crate::skills::render_available_skills_context_for_workspace(workspace),
+        None => crate::skills::render_available_skills_context_for_workspace_with_mode(
+            workspace,
+            skill_discovery_mode,
+        ),
     };
     if let Some(block) = skills_block {
         full_prompt = format!("{full_prompt}\n\n{block}");
@@ -1811,7 +1836,8 @@ mod tests {
             "- codewhale_version: {}",
             env!("CARGO_PKG_VERSION")
         )));
-        assert!(block.contains(&format!("- pwd: {}", tmp.path().display())));
+        // pwd is now delivered per-turn via `turn_meta`, not in the static block.
+        assert!(!block.contains("- pwd:"));
         assert!(block.contains("- platform:"));
         assert!(block.contains("- shell:"));
     }
@@ -1882,6 +1908,7 @@ mod tests {
                 context_window_override: None,
                 show_thinking: true,
                 verbosity: None,
+                skills_scan_codewhale_only: false,
             },
         ) {
             SystemPrompt::Text(text) => text,
@@ -1953,6 +1980,7 @@ mod tests {
                 context_window_override: None,
                 show_thinking: true,
                 verbosity: None,
+                skills_scan_codewhale_only: false,
             },
         ) {
             SystemPrompt::Text(text) => text,
@@ -1997,6 +2025,7 @@ mod tests {
                 context_window_override: None,
                 show_thinking: false,
                 verbosity: None,
+                skills_scan_codewhale_only: false,
             },
         ) {
             SystemPrompt::Text(text) => text,
@@ -2051,6 +2080,7 @@ mod tests {
                 context_window_override: None,
                 show_thinking: true,
                 verbosity: None,
+                skills_scan_codewhale_only: false,
             },
         ) {
             SystemPrompt::Text(text) => text,
@@ -2156,6 +2186,7 @@ mod tests {
                 context_window_override: None,
                 show_thinking: true,
                 verbosity: None,
+                skills_scan_codewhale_only: false,
             },
         ) {
             SystemPrompt::Text(text) => text,
@@ -2194,6 +2225,7 @@ mod tests {
                 context_window_override: None,
                 show_thinking: true,
                 verbosity: None,
+                skills_scan_codewhale_only: false,
             },
         ) {
             SystemPrompt::Text(text) => text,
@@ -2224,6 +2256,7 @@ mod tests {
                 context_window_override: None,
                 show_thinking: true,
                 verbosity: None,
+                skills_scan_codewhale_only: false,
             },
         ) {
             SystemPrompt::Text(text) => text,
@@ -2283,6 +2316,7 @@ mod tests {
                 context_window_override: None,
                 show_thinking: true,
                 verbosity: None,
+                skills_scan_codewhale_only: false,
             },
         ) {
             SystemPrompt::Text(text) => text,
@@ -2313,6 +2347,7 @@ mod tests {
                 context_window_override: None,
                 show_thinking: true,
                 verbosity: None,
+                skills_scan_codewhale_only: false,
             },
         ) {
             SystemPrompt::Text(text) => text,
@@ -2584,6 +2619,7 @@ mod tests {
                 context_window_override: None,
                 show_thinking: true,
                 verbosity: None,
+                skills_scan_codewhale_only: false,
             },
         ) {
             SystemPrompt::Text(text) => text,
@@ -2620,6 +2656,7 @@ mod tests {
                 context_window_override: None,
                 show_thinking: true,
                 verbosity: None,
+                skills_scan_codewhale_only: false,
             },
         ) {
             SystemPrompt::Text(text) => text,
@@ -2804,6 +2841,45 @@ mod tests {
         assert!(prompt.contains("thinking: \"high\""));
         assert!(prompt.contains("thinking: \"max\""));
         assert!(prompt.contains("thinking: \"auto\""));
+        // explore defaults to the faster lane, and parallel exploration is
+        // encouraged for broad investigations.
+        assert!(prompt.contains("defaults to `model_strength: \"faster\"`"));
+        assert!(prompt.contains("2-4 `type: \"explore\"` sub-agents"));
+        assert!(prompt.contains("self-reports"));
+    }
+
+    #[test]
+    fn prompt_documents_structured_subagent_briefs() {
+        let prompt = compose_prompt(Personality::Calm);
+        for field in [
+            "Subagent Brief",
+            "QUESTION",
+            "SCOPE",
+            "ALREADY_KNOWN",
+            "EFFORT",
+            "STOP_CONDITION",
+            "VERDICT",
+            "EVIDENCE",
+            "GAPS",
+            "NEXT",
+        ] {
+            assert!(
+                prompt.contains(field),
+                "main prompt should include Subagent Brief field `{field}`"
+            );
+        }
+        assert!(prompt.contains("should not repeat them unless it finds a"));
+    }
+
+    #[test]
+    fn prompt_bounds_explore_without_tiny_cap_for_implementers() {
+        let prompt = compose_prompt(Personality::Calm);
+        assert!(prompt.contains("Explore briefs default to `quick`"));
+        assert!(prompt.contains("read-only"));
+        assert!(prompt.contains("3-5 tool calls"));
+        assert!(prompt.contains("Review and verifier children may use more calls"));
+        assert!(prompt.contains("are not forced into a 3-5 tool-call cap"));
+        assert!(prompt.contains("checkpoints before scope"));
     }
 
     #[test]
@@ -3162,6 +3238,7 @@ mod tests {
                 context_window_override: None,
                 show_thinking: true,
                 verbosity: Some(" Concise "),
+                skills_scan_codewhale_only: false,
             },
         ) {
             SystemPrompt::Text(text) => text,

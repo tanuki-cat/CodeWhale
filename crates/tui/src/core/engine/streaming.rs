@@ -103,6 +103,30 @@ pub(super) fn should_resume_after_sleep(
     sleep_detected && retry_attempts < MAX_STREAM_RETRIES && !cancelled
 }
 
+/// Convert low-level reqwest/hyper stream read errors into an operator-facing
+/// message. The raw provider error remains attached, but the lead sentence
+/// explains why CodeWhale may retry before any output and why it must surface
+/// the warning once partial output has already streamed.
+pub(super) fn stream_read_error_user_message(message: &str, any_content_received: bool) -> String {
+    let lower = message.to_ascii_lowercase();
+    let is_stream_read = lower.contains("stream read error")
+        || lower.contains("error decoding response body")
+        || lower.contains("chunk decode error")
+        || lower.contains("body decode");
+    if !is_stream_read {
+        return message.to_string();
+    }
+
+    let retry_note = if any_content_received {
+        "Some output had already streamed, so CodeWhale is surfacing the warning instead of replaying the request and risking duplicated output."
+    } else {
+        "No output had streamed yet, so CodeWhale will retry automatically while retry budget remains."
+    };
+    format!(
+        "Provider stream connection dropped while reading the response body. {retry_note} Details: {message}"
+    )
+}
+
 pub(crate) const TOOL_CALL_START_MARKERS: [&str; 5] = [
     "[TOOL_CALL]",
     "<codewhale:tool_call",

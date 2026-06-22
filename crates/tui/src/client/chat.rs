@@ -5,6 +5,7 @@
 //! all live here.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -146,7 +147,8 @@ impl DeepSeekClient {
             }
             body["tools"] = json!(chat_tools);
         }
-        if let Some(choice) = request.tool_choice.as_ref()
+        if should_send_tool_choice_for_chat(self.api_provider, request.reasoning_effort.as_deref())
+            && let Some(choice) = request.tool_choice.as_ref()
             && let Some(mapped) = map_tool_choice_for_chat(choice)
         {
             body["tool_choice"] = mapped;
@@ -269,7 +271,8 @@ impl DeepSeekClient {
             }
             body["tools"] = json!(chat_tools);
         }
-        if let Some(choice) = request.tool_choice.as_ref()
+        if should_send_tool_choice_for_chat(self.api_provider, request.reasoning_effort.as_deref())
+            && let Some(choice) = request.tool_choice.as_ref()
             && let Some(mapped) = map_tool_choice_for_chat(choice)
         {
             body["tool_choice"] = mapped;
@@ -586,6 +589,7 @@ impl<'a> PromptBuilder<'a> {
             ),
             false,
         );
+        dump_system_prompt_if_requested(&messages);
         if provider == ApiProvider::Arcee {
             apply_arcee_waf_safe_message_encoding(&mut messages);
         }
@@ -639,7 +643,44 @@ impl<'a> PromptBuilder<'a> {
     }
 }
 
+const SYSTEM_PROMPT_DUMP_ENV: &str = "CODEWHALE_DUMP_SYSTEM_PROMPT";
+const SYSTEM_PROMPT_DUMP_BEGIN: &str = "<<<CODEWHALE_SYSTEM_PROMPT_BEGIN>>>";
+const SYSTEM_PROMPT_DUMP_END: &str = "<<<CODEWHALE_SYSTEM_PROMPT_END>>>";
 const ARCEE_WAF_TEXT_SPLIT_TRIGGERS: &[(&str, &str, &str)] = &[("python -c", "python ", "-c")];
+
+fn dump_system_prompt_if_requested(messages: &[Value]) {
+    let Ok(flag) = std::env::var(SYSTEM_PROMPT_DUMP_ENV) else {
+        return;
+    };
+    if !matches!(flag.trim(), "1" | "true" | "TRUE" | "yes" | "YES") {
+        return;
+    }
+    let Some(prompt) = messages.iter().find_map(system_message_text) else {
+        return;
+    };
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{SYSTEM_PROMPT_DUMP_BEGIN}");
+    let _ = writeln!(stderr, "{prompt}");
+    let _ = writeln!(stderr, "{SYSTEM_PROMPT_DUMP_END}");
+}
+
+fn system_message_text(message: &Value) -> Option<String> {
+    if message.get("role").and_then(Value::as_str) != Some("system") {
+        return None;
+    }
+    match message.get("content")? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
 
 fn apply_arcee_waf_safe_message_encoding(messages: &mut [Value]) {
     for message in messages {
@@ -1807,6 +1848,23 @@ fn map_tool_choice_for_chat(choice: &Value) -> Option<Value> {
     }
 }
 
+fn should_send_tool_choice_for_chat(provider: ApiProvider, effort: Option<&str>) -> bool {
+    if !matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        return true;
+    }
+    !reasoning_effort_enables_thinking(effort)
+}
+
+fn reasoning_effort_enables_thinking(effort: Option<&str>) -> bool {
+    let Some(effort) = effort else {
+        return false;
+    };
+    !matches!(
+        effort.trim().to_ascii_lowercase().as_str(),
+        "off" | "disabled" | "none" | "false"
+    )
+}
+
 /// Final-pass sanitizer over the outgoing chat-completions JSON payload.
 /// Forces a non-empty `reasoning_content` onto assistant messages that carry
 /// `tool_calls`, when the model + effort combination requires it. DeepSeek's
@@ -2625,6 +2683,37 @@ mod stream_diagnostics_tests {
             stream_open_timeout_from_env(Some("999")),
             Duration::from_secs(300)
         );
+    }
+
+    #[test]
+    fn deepseek_thinking_omits_tool_choice() {
+        for effort in [Some("high"), Some("max"), Some("medium"), Some("")] {
+            assert!(
+                !should_send_tool_choice_for_chat(ApiProvider::Deepseek, effort),
+                "DeepSeek thinking rejects explicit tool_choice for {effort:?}"
+            );
+            assert!(
+                !should_send_tool_choice_for_chat(ApiProvider::DeepseekCN, effort),
+                "DeepSeek CN thinking rejects explicit tool_choice for {effort:?}"
+            );
+        }
+
+        for effort in [
+            None,
+            Some("off"),
+            Some("disabled"),
+            Some("none"),
+            Some("false"),
+        ] {
+            assert!(should_send_tool_choice_for_chat(
+                ApiProvider::Deepseek,
+                effort
+            ));
+        }
+        assert!(should_send_tool_choice_for_chat(
+            ApiProvider::Openrouter,
+            Some("high")
+        ));
     }
 
     #[test]

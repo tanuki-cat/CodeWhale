@@ -6,10 +6,37 @@
 //! checkpoints, and loop termination.
 
 use super::*;
+use crate::core::ops::UserInputProvenance;
 use crate::prompt_zones::PinnedPrefix;
 
-fn loop_guard_block_tool_result(message: String) -> ToolResult {
-    ToolResult::error(message).with_metadata(json!({"loop_guard": "identical_tool_call"}))
+fn loop_guard_block_tool_result(
+    tool_name: &str,
+    message: String,
+    kind: AttemptBlockKind,
+) -> ToolResult {
+    if loop_guard_block_is_guidance(tool_name) {
+        return ToolResult::success(message).with_metadata(json!({
+            "loop_guard": kind.as_str(),
+            "loop_guard_guidance": true,
+            "executed": false,
+        }));
+    }
+
+    ToolResult::error(message).with_metadata(json!({"loop_guard": kind.as_str()}))
+}
+
+fn loop_guard_block_is_guidance(tool_name: &str) -> bool {
+    let normalized = tool_name.to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "grep_files"
+            | "file_search"
+            | "list_dir"
+            | "web_search"
+            | "fetch_url"
+            | "tool_search_tool_regex"
+            | "tool_search_tool_bm25"
+    ) || normalized.contains("search")
 }
 
 const MAX_APPROVAL_INTENT_SUMMARY_CHARS: usize = 2_000;
@@ -39,6 +66,55 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    async fn drain_subagent_completion_events(&mut self, status_label: &str) -> usize {
+        let mut completions: Vec<crate::tools::subagent::SubAgentCompletion> = Vec::new();
+        while let Ok(completion) = self.rx_subagent_completion.try_recv() {
+            if self
+                .delivered_subagent_completion_ids
+                .insert(completion.agent_id.clone())
+            {
+                completions.push(completion);
+            }
+        }
+
+        let synthesized = {
+            let manager = self.subagent_manager.read().await;
+            manager.terminal_results_excluding(&self.delivered_subagent_completion_ids)
+        };
+        for result in synthesized {
+            if self
+                .delivered_subagent_completion_ids
+                .insert(result.agent_id.clone())
+            {
+                completions.push(crate::tools::subagent::subagent_completion_from_result(
+                    &result,
+                ));
+            }
+        }
+
+        let count = completions.len();
+        if count == 0 {
+            return 0;
+        }
+
+        for completion in completions {
+            self.add_session_message(subagent_completion_runtime_message(&completion.payload))
+                .await;
+        }
+        let prefix = if status_label.is_empty() {
+            String::new()
+        } else {
+            format!("{status_label} ")
+        };
+        let _ = self
+            .tx_event
+            .send(Event::status(format!(
+                "Resuming turn with {count} {prefix}sub-agent completion(s)"
+            )))
+            .await;
+        count
+    }
+
     pub(super) async fn handle_deepseek_turn(
         &mut self,
         turn: &mut TurnContext,
@@ -63,14 +139,16 @@ impl Engine {
         let mut tool_catalog = tools.unwrap_or_default();
         if !tool_catalog.is_empty() {
             ensure_advanced_tooling(&mut tool_catalog, mode, &self.config.tools_always_load);
-            // Provider-specific first-turn surface (e.g. Arcee's Cloudflare WAF
-            // rejects CodeWhale's full agent catalog). Runs after advanced
-            // tooling so code/js-execution and tool-search rows are policed too.
-            apply_provider_tool_policy(
-                &mut tool_catalog,
-                client.api_provider(),
-                &self.config.tools_always_load,
-            );
+        }
+        if let Some(registry) = tool_registry {
+            let issues = tool_catalog_consistency_issues(&tool_catalog, registry);
+            if !issues.is_empty() {
+                tracing::warn!(
+                    target: "engine.tool_catalog",
+                    ?issues,
+                    "model/search tool catalog is inconsistent with the runtime registry"
+                );
+            }
         }
         let mut active_tool_names = initial_active_tools(&tool_catalog);
         let mut loop_guard = LoopGuard::default();
@@ -107,6 +185,13 @@ impl Engine {
                     )))
                     .await;
             }
+
+            // Child agents can finish while the parent model is still taking
+            // tool steps. Surface queued completions before the next provider
+            // request so the parent can use them immediately instead of
+            // discovering them only when it eventually emits no more tools or
+            // the idle handler starts a separate follow-up turn.
+            self.drain_subagent_completion_events("queued").await;
 
             // Ensure system prompt is up to date with latest session states
             self.refresh_system_prompt();
@@ -632,10 +717,12 @@ impl Engine {
                                 }
                             }
                         }
-                        turn_error.get_or_insert(message.clone());
+                        let user_message =
+                            stream_read_error_user_message(&message, any_content_received);
+                        turn_error.get_or_insert(user_message.clone());
                         let _ = self
                             .tx_event
-                            .send(Event::error(ErrorEnvelope::classify(message, true)))
+                            .send(Event::error(ErrorEnvelope::classify(user_message, true)))
                             .await;
                         if stream_errors >= MAX_STREAM_ERRORS_BEFORE_FAIL {
                             break;
@@ -1061,6 +1148,11 @@ impl Engine {
                     continue;
                 }
 
+                let shell_completions = self.drain_shell_completion_events();
+                if let Some(status) = shell_completion_status_text(&shell_completions, "") {
+                    let _ = self.tx_event.send(Event::status(status)).await;
+                }
+
                 // Sub-agent completion handoff (issue #756). The model finished
                 // streaming with no tool calls — but if it has direct children
                 // still running (or completions queued from children that
@@ -1069,26 +1161,8 @@ impl Engine {
                 // resume instead of ending the turn. This fulfils the contract
                 // already documented in `prompts/constitution.md`: the parent is
                 // promised it'll see the sentinel when a child finishes.
-                let shell_completions = self.drain_shell_completion_events();
-                if !shell_completions.is_empty() {
-                    let count = shell_completions.len();
-                    self.add_session_message(shell_completion_runtime_message(&shell_completions))
-                        .await;
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Resuming turn with {count} shell completion(s)"
-                        )))
-                        .await;
-                    turn.next_step();
-                    continue;
-                }
-
-                let mut completions: Vec<crate::tools::subagent::SubAgentCompletion> = Vec::new();
-                while let Ok(c) = self.rx_subagent_completion.try_recv() {
-                    completions.push(c);
-                }
-                if completions.is_empty() {
+                let subagent_completions = self.drain_subagent_completion_events("").await;
+                if subagent_completions == 0 {
                     // #3216: do NOT barrier the parent on running children.
                     // Launching a sub-agent is not the same as joining it — the
                     // parent ends its turn and stays responsive. Running children
@@ -1113,18 +1187,7 @@ impl Engine {
                             .await;
                     }
                 }
-                if !completions.is_empty() {
-                    let count = completions.len();
-                    for c in completions {
-                        self.add_session_message(subagent_completion_runtime_message(&c.payload))
-                            .await;
-                    }
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Resuming turn with {count} sub-agent completion(s)"
-                        )))
-                        .await;
+                if subagent_completions > 0 {
                     turn.next_step();
                     continue;
                 }
@@ -1179,7 +1242,10 @@ impl Engine {
                                     format!("[REPL round {round_num} output]\n{}", round.stdout)
                                 };
                                 self.add_session_message(
-                                    self.user_text_message_with_turn_metadata(feedback),
+                                    self.runtime_text_message_with_turn_metadata(
+                                        feedback,
+                                        UserInputProvenance::Runtime,
+                                    ),
                                 )
                                 .await;
                             }
@@ -1191,9 +1257,10 @@ impl Engine {
                                     )))
                                     .await;
                                 self.add_session_message(
-                                    self.user_text_message_with_turn_metadata(format!(
-                                        "[REPL round {round_num} execution failed]\n{e}"
-                                    )),
+                                    self.runtime_text_message_with_turn_metadata(
+                                        format!("[REPL round {round_num} execution failed]\n{e}"),
+                                        UserInputProvenance::Runtime,
+                                    ),
                                 )
                                 .await;
                             }
@@ -1236,39 +1303,12 @@ impl Engine {
                 // while we were running the thinking-only check, surface its
                 // sentinel rather than delaying it to the next turn.
                 let late_shell_completions = self.drain_shell_completion_events();
-                if !late_shell_completions.is_empty() {
-                    let count = late_shell_completions.len();
-                    self.add_session_message(shell_completion_runtime_message(
-                        &late_shell_completions,
-                    ))
-                    .await;
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Resuming turn with {count} late shell completion(s)"
-                        )))
-                        .await;
-                    turn.next_step();
-                    continue;
+                if let Some(status) = shell_completion_status_text(&late_shell_completions, "late")
+                {
+                    let _ = self.tx_event.send(Event::status(status)).await;
                 }
 
-                let mut late_completions: Vec<crate::tools::subagent::SubAgentCompletion> =
-                    Vec::new();
-                while let Ok(c) = self.rx_subagent_completion.try_recv() {
-                    late_completions.push(c);
-                }
-                if !late_completions.is_empty() {
-                    let count = late_completions.len();
-                    for c in late_completions {
-                        self.add_session_message(subagent_completion_runtime_message(&c.payload))
-                            .await;
-                    }
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Resuming turn with {count} late sub-agent completion(s)"
-                        )))
-                        .await;
+                if self.drain_subagent_completion_events("late").await > 0 {
                     turn.next_step();
                     continue;
                 }
@@ -1280,9 +1320,10 @@ impl Engine {
                     )
                     .await
                 {
-                    self.add_session_message(
-                        self.user_text_message_with_turn_metadata(continuation),
-                    )
+                    self.add_session_message(self.runtime_text_message_with_turn_metadata(
+                        continuation,
+                        UserInputProvenance::Runtime,
+                    ))
                     .await;
                     turn.next_step();
                     continue;
@@ -1372,6 +1413,7 @@ impl Engine {
 
                 let mut approval_required = false;
                 let mut approval_description = "Tool execution requires approval".to_string();
+                let mut approval_force_prompt = false;
                 let mut supports_parallel = false;
                 let mut read_only = false;
                 let mut detached_start = false;
@@ -1540,6 +1582,29 @@ impl Engine {
                     approval_required = true;
                 }
 
+                if blocked_error.is_none()
+                    && let Some(decision) = exec_shell_ask_rule_decision(
+                        &self.config,
+                        &tool_name,
+                        &tool_input,
+                        &self.session.workspace,
+                        self.session.approval_mode,
+                    )
+                {
+                    match decision {
+                        ExecShellAskRuleDecision::Prompt(reason) => {
+                            approval_required = true;
+                            approval_description = reason;
+                            approval_force_prompt = true;
+                        }
+                        ExecShellAskRuleDecision::Block(reason) => {
+                            approval_required = false;
+                            approval_force_prompt = false;
+                            blocked_error = Some(ToolError::permission_denied(reason));
+                        }
+                    }
+                }
+
                 let should_emit_hydration_status =
                     !deferred_tools_hydrated_this_batch.contains(&tool_name);
                 if blocked_error.is_none()
@@ -1566,11 +1631,11 @@ impl Engine {
 
                 if blocked_error.is_none()
                     && guard_result.is_none()
-                    && let AttemptDecision::Block(message) =
-                        loop_guard.record_attempt(&tool_name, &tool_input)
+                    && let AttemptDecision::Block { kind, message } =
+                        loop_guard.record_attempt(&tool_name, &tool_input, read_only)
                 {
                     crate::logging::warn(message.clone());
-                    guard_result = Some(loop_guard_block_tool_result(message));
+                    guard_result = Some(loop_guard_block_tool_result(&tool_name, message, kind));
                 }
 
                 plans.push(ToolExecutionPlan {
@@ -1582,6 +1647,7 @@ impl Engine {
                     interactive,
                     approval_required,
                     approval_description,
+                    approval_force_prompt,
                     supports_parallel,
                     read_only,
                     detached_start,
@@ -2027,6 +2093,7 @@ impl Engine {
                                     } else {
                                         intent_summary.clone()
                                     },
+                                    approval_force_prompt: plan.approval_force_prompt,
                                 })
                                 .await;
 
@@ -2079,12 +2146,12 @@ impl Engine {
                         // Per-tool snapshot for surgical undo (#384): capture workspace
                         // state before file-modifying tools execute so `/undo` can
                         // revert the most recent write_file/edit_file/apply_patch.
-                        if result_override.is_none()
-                            && matches!(
-                                tool_name.as_str(),
-                                "write_file" | "edit_file" | "apply_patch"
-                            )
-                        {
+                        // See `should_pre_tool_snapshot` for the gating rationale (#3292).
+                        if should_pre_tool_snapshot(
+                            self.config.snapshots_enabled,
+                            result_override.is_some(),
+                            tool_name.as_str(),
+                        ) {
                             let ws = self.session.workspace.clone();
                             let tid = tool_id.clone();
                             let cap = self.config.snapshots_max_workspace_bytes;
@@ -2357,13 +2424,11 @@ impl Engine {
             return None;
         }
 
-        let run_max = crate::tools::goal::MAX_GOAL_CONTINUATIONS_PER_RUN;
-        // Route the continuation decision through the goal-loop decision core
-        // (#3215). The progress fields are now sourced from the shared goal
-        // snapshot instead of only the per-turn local counter. Train 3 owns the
-        // deep worker re-dispatcher that will persist these same increments into
-        // ThreadGoal via `record_thread_goal_usage` /
-        // `record_thread_goal_continuation`.
+        // Route the continuation decision through the goal-loop decision core.
+        // There is no run-level cap — a goal runs until complete/blocked,
+        // paused, or an optional token/time budget is exhausted. The per-turn
+        // guard (`per_turn_max`) only bounds how many continuation passes
+        // happen *within* a single turn before yielding back to the engine.
         let decision = crate::goal_loop::decide_continuation(
             crate::goal_loop::GoalRunStatus::Active,
             crate::goal_loop::GoalProgress {
@@ -2374,14 +2439,10 @@ impl Engine {
             crate::goal_loop::GoalBudget {
                 token_budget: snapshot.token_budget.map(u64::from),
                 time_budget_seconds: None,
-                max_continuations: run_max,
             },
         );
         if let crate::goal_loop::ContinuationDecision::Stop(reason) = decision {
             let message = match reason {
-                crate::goal_loop::StopReason::ContinuationLimit => format!(
-                    "Goal remains active after {run_max} total continuation pass(es); ending turn to avoid a runaway loop."
-                ),
                 crate::goal_loop::StopReason::TokenBudget => format!(
                     "Goal token budget reached ({} / {} tokens); ending continuation.",
                     snapshot.tokens_used,
@@ -2406,15 +2467,14 @@ impl Engine {
         let _ = self
             .tx_event
             .send(Event::status(format!(
-                "Continuing active goal audit ({}/{per_turn_max} this turn, {} total)",
+                "Continuing active goal ({}/{per_turn_max} this turn, {} total)",
                 *continuations_this_turn, snapshot.continuation_count
             )))
             .await;
 
         Some(crate::tools::goal::render_continuation_prompt(
             &snapshot,
-            *continuations_this_turn,
-            per_turn_max,
+            snapshot.continuation_count,
         ))
     }
 
@@ -2446,60 +2506,70 @@ fn subagent_completion_runtime_message(payload: &str) -> Message {
     // role carries no semantic weight here — only template-compatibility cost.
     Message {
         role: "user".to_string(),
-        content: vec![ContentBlock::Text {
-            text: subagent_completion_runtime_text(payload),
-            cache_control: None,
-        }],
+        content: vec![
+            ContentBlock::Text {
+                text: subagent_completion_runtime_text(payload),
+                cache_control: None,
+            },
+            runtime_event_turn_metadata_block(UserInputProvenance::SubAgentHandoff),
+        ],
     }
 }
 
-fn shell_completion_runtime_message(
+fn runtime_event_turn_metadata_block(provenance: UserInputProvenance) -> ContentBlock {
+    ContentBlock::Text {
+        text: format!(
+            "<turn_meta>\nInput provenance: {}\nInput authority: non_authoritative\n</turn_meta>",
+            provenance.as_str()
+        ),
+        cache_control: None,
+    }
+}
+
+fn shell_completion_status_text(
     events: &[crate::tools::shell::ShellCompletionEvent],
-) -> Message {
-    let mut lines = Vec::with_capacity(events.len() + 2);
-    lines.push(
-        "This is an internal runtime event, not user input. Use these background shell completions to continue; they replace manual exec_shell_wait polling."
-            .to_string(),
-    );
-    for event in events {
-        let command = truncate_runtime_event_field(&event.command, 160);
-        let status = format!("{:?}", event.status);
-        let exit = event
-            .exit_code
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let mut line = format!(
-            "- task {} ({command}) -> {status} exit={exit} in {}ms",
-            event.task_id, event.duration_ms
-        );
-        if let Some(linked) = event.linked_task_id.as_deref() {
-            line.push_str(&format!(" linked_task={linked}"));
-        }
-        lines.push(line);
-        if event.status != crate::tools::shell::ShellStatus::Completed {
-            let stdout = truncate_runtime_event_field(&event.stdout_tail, 400);
-            let stderr = truncate_runtime_event_field(&event.stderr_tail, 400);
-            if !stdout.trim().is_empty() {
-                lines.push(format!("  stdout_tail: {stdout}"));
-            }
-            if !stderr.trim().is_empty() {
-                lines.push(format!("  stderr_tail: {stderr}"));
-            }
+    timing: &str,
+) -> Option<String> {
+    if events.is_empty() {
+        return None;
+    }
+
+    let count = events.len();
+    let failed = events
+        .iter()
+        .filter(|event| event.status != crate::tools::shell::ShellStatus::Completed)
+        .count();
+    let noun = if count == 1 { "job" } else { "jobs" };
+    let prefix = if timing.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{} ", timing.trim())
+    };
+    let mut status = if failed == 0 {
+        format!("{prefix}{count} background shell {noun} completed")
+    } else {
+        format!("{prefix}{count} background shell {noun} finished ({failed} failed)")
+    };
+
+    if count == 1
+        && let Some(event) = events.first()
+    {
+        let command = truncate_runtime_status_field(&event.command, 80);
+        status.push_str(&format!(": {command}"));
+        if let Some(owner) = event
+            .owner_agent_name
+            .as_deref()
+            .or(event.owner_agent_id.as_deref())
+            .filter(|owner| !owner.trim().is_empty())
+        {
+            status.push_str(&format!(" (by {owner})"));
         }
     }
-    Message {
-        role: "user".to_string(),
-        content: vec![ContentBlock::Text {
-            text: format!(
-                "<codewhale:runtime_event kind=\"shell_completion\" visibility=\"internal\">\n{}\n</codewhale:runtime_event>",
-                lines.join("\n")
-            ),
-            cache_control: None,
-        }],
-    }
+
+    Some(status)
 }
 
-fn truncate_runtime_event_field(text: &str, max_chars: usize) -> String {
+fn truncate_runtime_status_field(text: &str, max_chars: usize) -> String {
     let normalized = text.replace(['\n', '\r'], " ");
     let mut chars = normalized.chars();
     let mut out = chars.by_ref().take(max_chars).collect::<String>();
@@ -2524,6 +2594,25 @@ fn should_hold_turn_for_subagents(queued_completions: usize, running_children: u
 fn stream_chunk_timeout_budget(config: &EngineConfig) -> (u64, Duration) {
     let secs = config.stream_chunk_timeout.as_secs();
     (secs, Duration::from_secs(secs))
+}
+
+/// Whether a per-tool pre-execution snapshot should be taken before running
+/// `tool_name` (#384).
+///
+/// Gated on `snapshots.enabled` (#3292) so that disabling snapshots suppresses
+/// the per-tool `tool:<call_id>` commits, matching the pre/post-turn snapshot
+/// call sites which already honor the same flag. A tool whose result is already
+/// overridden (denied, hook-supplied, or otherwise short-circuited) never
+/// executes a file write, so it is skipped too. Only the file-modifying tools
+/// produce undoable workspace changes worth snapshotting.
+fn should_pre_tool_snapshot(
+    snapshots_enabled: bool,
+    has_result_override: bool,
+    tool_name: &str,
+) -> bool {
+    snapshots_enabled
+        && !has_result_override
+        && matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
 }
 
 /// Synthesize the tool result recorded for a tool call that never executed
@@ -2557,6 +2646,49 @@ mod cancel_batch_tests {
             "interrupted result should explain the cancellation: {:?}",
             result.content
         );
+    }
+}
+
+#[cfg(test)]
+mod pre_tool_snapshot_gate_tests {
+    use super::*;
+
+    // #3292: disabling snapshots must suppress the per-tool `tool:<call_id>`
+    // commits, just like the pre/post-turn snapshot sites.
+    #[test]
+    fn disabled_snapshots_suppress_per_tool_snapshot() {
+        for tool in ["write_file", "edit_file", "apply_patch"] {
+            assert!(
+                !should_pre_tool_snapshot(false, false, tool),
+                "snapshots.enabled=false must skip per-tool snapshot for {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_snapshots_snapshot_file_modifying_tools() {
+        for tool in ["write_file", "edit_file", "apply_patch"] {
+            assert!(
+                should_pre_tool_snapshot(true, false, tool),
+                "snapshots.enabled=true must snapshot {tool} before it runs"
+            );
+        }
+    }
+
+    #[test]
+    fn overridden_result_skips_snapshot() {
+        // A denied/short-circuited tool never executes a write, so no snapshot.
+        assert!(!should_pre_tool_snapshot(true, true, "write_file"));
+    }
+
+    #[test]
+    fn non_modifying_tools_are_never_snapshotted() {
+        for tool in ["read_file", "shell", "grep", "list_dir"] {
+            assert!(
+                !should_pre_tool_snapshot(true, false, tool),
+                "{tool} does not modify the workspace and must not be snapshotted"
+            );
+        }
     }
 }
 
@@ -2797,9 +2929,9 @@ mod tests {
     }
 
     #[test]
-    fn shell_completion_handoff_is_internal_user_message() {
-        let message =
-            shell_completion_runtime_message(&[crate::tools::shell::ShellCompletionEvent {
+    fn shell_completion_status_does_not_create_runtime_handoff() {
+        let status = shell_completion_status_text(
+            &[crate::tools::shell::ShellCompletionEvent {
                 task_id: "shell_abc".to_string(),
                 command: "cargo test -p codewhale-tui".to_string(),
                 status: crate::tools::shell::ShellStatus::Failed,
@@ -2808,19 +2940,19 @@ mod tests {
                 stdout_tail: "running tests".to_string(),
                 stderr_tail: "test failed".to_string(),
                 linked_task_id: Some("task_1".to_string()),
-            }]);
+                owner_agent_id: Some("agent_verifier".to_string()),
+                owner_agent_name: Some("verifier".to_string()),
+            }],
+            "",
+        )
+        .expect("status text");
 
-        assert_eq!(message.role, "user");
-        let text = match &message.content[0] {
-            ContentBlock::Text { text, .. } => text,
-            other => panic!("expected text block, got {other:?}"),
-        };
-        assert!(text.contains("kind=\"shell_completion\""));
-        assert!(text.contains("visibility=\"internal\""));
-        assert!(text.contains("manual exec_shell_wait polling"));
-        assert!(text.contains("shell_abc"));
-        assert!(text.contains("Failed exit=101"));
-        assert!(text.contains("stderr_tail: test failed"));
+        assert!(status.contains("1 background shell job finished (1 failed)"));
+        assert!(status.contains("cargo test -p codewhale-tui"));
+        assert!(status.contains("by verifier"));
+        assert!(!status.contains("runtime_event"));
+        assert!(!status.contains("manual exec_shell_wait polling"));
+        assert!(!status.contains("stderr_tail"));
     }
 
     #[test]
@@ -2975,7 +3107,11 @@ mod tests {
 
     #[test]
     fn loop_guard_block_tool_result_counts_as_failure() {
-        let result = loop_guard_block_tool_result("Blocked: repeated call".to_string());
+        let result = loop_guard_block_tool_result(
+            "edit_file",
+            "Blocked: repeated call".to_string(),
+            AttemptBlockKind::IdenticalToolCall,
+        );
 
         assert!(
             !result.success,
@@ -2988,6 +3124,35 @@ mod tests {
                 .and_then(|m| m.get("loop_guard"))
                 .and_then(|v| v.as_str()),
             Some("identical_tool_call")
+        );
+    }
+
+    #[test]
+    fn loop_guard_search_block_tool_result_is_guidance() {
+        let result = loop_guard_block_tool_result(
+            "grep_files",
+            "Stop calling `grep_files`; use current evidence.".to_string(),
+            AttemptBlockKind::NoProgressToolLoop,
+        );
+
+        assert!(
+            result.success,
+            "read-only search loop blocks should guide the model without feeding the failure loop"
+        );
+        let metadata = result.metadata.as_ref().expect("metadata");
+        assert_eq!(
+            metadata.get("loop_guard").and_then(|v| v.as_str()),
+            Some("no_progress_tool_loop")
+        );
+        assert_eq!(
+            metadata
+                .get("loop_guard_guidance")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            metadata.get("executed").and_then(|v| v.as_bool()),
+            Some(false)
         );
     }
 

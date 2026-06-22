@@ -7,6 +7,219 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.63] - 2026-06-19
+
+### Added
+
+- **Sub-agent fanout safeguards (#3318, #3319).** High-fanout Workflow runs can
+  now queue and drain more agents than the instantaneous concurrency cap by
+  default, with `[subagents] max_admitted` available to tune that bounded
+  admission population. Distinct `agent` calls are no longer capped by the
+  per-turn loop guard before runtime launch concurrency and provider
+  rate-limit backoff can apply. `[subagents] token_budget` applies a shared
+  aggregate token ceiling to a root `agent` run and its descendants.
+- **Per-worker sub-agent token enforcement (#3321).** A `token_budget` /
+  `max_tokens` set on an individual `agent` call now bounds that single worker
+  mid-run: once its accumulated model tokens exceed the cap it stops cleanly
+  with a `budget_exhausted` status instead of running to `max_steps`. This
+  complements the scope-level admission gate (#3319) — the per-worker cap stops
+  one runaway worker, the scope cap bounds total fan-out — without
+  double-counting. Harvested from #3321 by @donglovejava.
+- **Provider-specific sub-agent fanout config.** `[subagents.providers.<provider>]`
+  profiles now override `enabled`, `max_concurrent`, `max_admitted`,
+  `launch_concurrency`, `max_depth`, token budget, API timeout, and heartbeat
+  timeout for the active provider. Use broad direct-API profiles such as
+  `[subagents.providers.deepseek]` and tighter subscription profiles such as
+  `[subagents.providers.glm]`; `/config subagents status` shows both global
+  and active-provider resolved values.
+- **Sub-agent control and isolation.** The single `agent` tool now exposes
+  status, peek, and cancel actions for running children, and accepts
+  `worktree: true` to create an isolated git worktree/branch for parallel edit
+  lanes instead of requiring callers to hand-roll a `cwd`.
+
+### Fixed
+
+- **Mode and tool catalog correctness.** Core action tools remain discoverable
+  in the model-facing catalog/tool search, and a consistency self-check flags
+  registered handlers that drift out of the advertised catalog. Review-looking
+  prompts in explicit Agent/YOLO mode now keep the requested mode and tools,
+  with only an advisory review hint.
+- **Sub-agent orchestration recovery.** Child agents now retry transient
+  provider header/SSE timeouts before failing, and parent runs synthesize missed
+  child completions from terminal child state so orchestration cannot hang on a
+  lost completion event.
+- **DeepSeek thinking tool calls.** DeepSeek chat-completions requests now omit
+  explicit `tool_choice` whenever reasoning/thinking is enabled, avoiding
+  provider rejections while leaving no-thinking routes unchanged.
+- **Task sidebar shortcuts and attribution.** Ctrl-K stays palette/emacs-kill,
+  while Ctrl-X is scoped to Tasks-sidebar background shell cancellation. Shell
+  jobs launched by sub-agents now render with their child-agent owner in the
+  Tasks sidebar and transcript.
+- **Benchmark-turn recovery and context economy.** Repeated read-only search
+  loop blocks now return guidance instead of fatal tool failures, Python build
+  failures that are missing `setuptools` include an install/retry hint, long
+  foreground shell timeouts steer models toward background execution, and noisy
+  shell/test/web outputs are compacted earlier for large-context routes.
+- **Config display redaction.** `codew config get/list` now recursively masks
+  token-, secret-, password-, credential-, and authorization-like keys inside
+  unknown `extras` tables and redacts sensitive HTTP header values before
+  printing config output.
+- **Queued follow-up hints and force-steer keys.** The pending-input preview now
+  advertises `Ctrl+S send now` whenever queued follow-ups exist, and
+  Ctrl/Cmd+Enter force-steering also accepts the common Ctrl+J terminal
+  encoding while a turn is running.
+- **Sidebar default visibility restored (#3328).** New and upgraded sessions
+  now use a pinned composed sidebar by default when the terminal is wide
+  enough, so live Agents and Tasks surface without opting back into idle
+  auto-collapse. Older settings files that captured the v0.8.62 auto-collapse
+  default now migrate to `pinned` unless `/sidebar auto --save` records an
+  explicit opt-in. `/sidebar` now reports when width or auto-collapse
+  suppresses rendering instead of saying the sidebar is visible. Reported by
+  @dxfq.
+- **JavaScript execution proxy env handling (#3273, #3331).** `js_execution`
+  now enables Node's environment-proxy mode when proxy variables are present,
+  mirrors lowercase proxy variables for the child process, and backfills
+  `HTTP_PROXY` / `HTTPS_PROXY` from `ALL_PROXY`. Reported by @lordwedggie and
+  harvested from #3331 by @cyq1017.
+- **Legacy app-server non-loopback auth hardening (#3258).** Bare
+  `codewhale app-server --host 0.0.0.0` now fails fast unless an explicit
+  `--auth-token` or `CODEWHALE_APP_SERVER_TOKEN` is supplied, keeping generated
+  one-time `cwapp_*` tokens loopback-only.
+- **Legacy `.deepseek` state write-path migration (#3240).** State subdirectories
+  (`sessions`, `slop_ledger`, `trophies`, `catalog`) are now always written under
+  `~/.codewhale/`, and the first write of a subdir relocates any pre-existing
+  `~/.deepseek/<sub>` contents into the primary location so the legacy tree stops
+  growing while old data is preserved. The read resolver still finds legacy data
+  for backfill until each subdir migrates. Reported by @Final527; onboarding
+  marker slice from #3302 by @nightt5879.
+- **State subdir validation on Windows (#3240).** State path hardening now
+  rejects rooted/prefixed subdir strings such as `/etc` before resolving or
+  migrating state directories, keeping the `.codewhale` write resolver inside
+  its state root across platforms.
+
+## [0.8.62] - 2026-06-17
+
+### Changed
+
+- **GLM-5.2 is now the default direct Z.AI model.** `DEFAULT_ZAI_MODEL` resolves
+  to `GLM-5.2` in both `codewhale-tui` and `codewhale-config`; the `glm-5.1`
+  alias still resolves to `GLM-5.1` (the defaulting was decoupled from the alias
+  arm so it no longer tracks the default). Docs and `config.example.toml` no
+  longer describe GLM-5.2 as an opt-in preview.
+- **GLM-5-Turbo registered as a real model** and wired as the faster/explore
+  sub-agent sibling for the GLM family: a `GLM-5.2` parent routes
+  faster/explore children to `GLM-5-Turbo` (direct Z.ai) and `z-ai/glm-5-turbo`
+  (OpenRouter), instead of down to GLM-5.1. GLM-5.1 and GLM-5-Turbo themselves
+  have no cheaper tier and keep children on the parent.
+- **`type: "explore"` sub-agents default to `model_strength: "faster"`.** Bounded
+  read-only lookup/search/status work now uses the cheaper same-family sibling
+  automatically, unless an explicit `model` or `model_strength: "same"` is
+  supplied. Non-explore roles keep the conservative `same` default.
+- **GPT-5.5 / OpenAI Codex faster route stays on GPT-5.5** with reasoning
+  resolved to `low` (the Codex Responses API has no true `off`, so the resolved
+  effort is now honest `low` rather than `off` silently rewritten). No
+  DeepSeek/GLM fallback is fabricated when no cheaper same-provider sibling
+  exists. DeepSeek Pro→Flash routing and its no-thinking faster lane are
+  unchanged.
+- **Base prompt / delegate skill guidance** updated to encourage parallel
+  read-only exploration (2-4 `type: "explore"` sub-agents) for broad repo,
+  version, branch, benchmark, and API-surface investigations, while keeping
+  architecture, integration, and final verification in the parent. The
+  delegate skill examples now use provider-neutral `model_strength` instead of
+  hardcoded DeepSeek model ids.
+- **Agent synthesis guardrails.** The base constitution now frames tools around
+  sufficient evidence rather than open-ended persistence: extra reads, searches,
+  and delegation must target a missing fact, and agents should answer with
+  limits instead of broadening searches indefinitely. The runtime loop guard
+  now blocks duplicate read-only/delegated calls earlier and caps repeated
+  broad lookup/delegation loops in a single turn with a synthesis-forcing tool
+  error. Guard metadata distinguishes exact duplicates
+  (`identical_tool_call`) from no-progress loops (`no_progress_tool_loop`).
+- **Sub-agent handoff and visibility.** Direct sub-agent completions are drained
+  before the next parent model request, so finished children can wake the main
+  model promptly instead of waiting for an empty-tool-use branch or idle engine
+  path. Nested sub-agents now report completions to their immediate parent
+  inbox; the main model still receives only direct-child completions, avoiding
+  grandchild floods while preserving nested evidence flow. Sub-agent output
+  guidance now requires child-agent provenance when a sub-agent relies on a
+  child report: cite the child `agent_id` and the child's EVIDENCE line(s), and
+  do not present child findings as directly verified facts. The sidebar orders
+  sub-agents as a parent/child tree and annotates nested rows with parent and
+  depth information in hover text.
+- **Sub-agent summary provenance (#2652).** A sub-agent's free-text result is now
+  explicitly treated as an unverified self-report rather than confirmed
+  evidence. The completion sentinel carries `summary_kind: complete | truncated`
+  so the parent model can branch on whether it saw the full report or a clipped
+  excerpt. Short summaries (≤ 12,000 chars) get a soft "re-verify material
+  claims" suffix; longer ones are head+tail truncated with an honest marker
+  stating the elided middle is not retrievable via `retrieve_tool_result`.
+  Every summary therefore carries exactly one boundary marker, never both.
+- **Provider metadata centralization.** Provider env vars, config keys, aliases,
+  and auth hints are now resolved through the shared `ProviderMetadata` registry
+  across `codewhale-config`, `codewhale-tui`, and `codewhale-cli`, reducing drift
+  between the provider picker, `codewhale auth`, `doctor --json`, and setup
+  hints.
+
+### Added
+
+- **Agent clarification questions (#3102).** Agents now have a first-class
+  `request_user_input` tool to ask the user structured clarifying questions
+  through a modal UI surface instead of only emitting a chat message and hoping
+  the user notices. Mirrors the approval/secret-request flow the harness
+  already used for permissions. The tool accepts 1-3 questions, each with a
+  header, an id, 2-4 selectable options (label + description), and
+  `allow_free_text` / `multi_select` flags (both default to `false` for
+  back-compat). Input is validated up front with actionable errors. Wired
+  across all layers: the `request_user_input` tool, engine handling
+  (`turn_loop` → `approval`), an interactive TUI modal (`UserInputView`) with
+  full keyboard navigation, and the runtime protocol
+  (`EventFrame::UserInputRequest` + `AppRequest::SubmitUserInput`) so headless
+  / app-server clients can answer programmatically. Parity tests cover the
+  wire round-trip and the omitted-flags default.
+- **Transcript hyperlinks — out-of-band OSC 8 (#3029).** Clickable file /
+  file:line / URL links now reach the terminal through a column-drift-safe
+  path. Link payloads are embedded in-band by the markdown renderer, then
+  extracted out of the ratatui buffer cells and re-emitted out-of-band by
+  `ColorCompatBackend` — so the `ESC` bytes never occupy display columns or
+  corrupt selection. Supporting terminals get live hyperlinks; others see the
+  label text unchanged. Clipboard/selection extraction strips residual codes as
+  defense-in-depth.
+- **CodeWhale-only skill discovery gate (#3296).** New
+  `[skills].scan_codewhale_only = true` limits session-time skill discovery to
+  CodeWhale-owned roots (`<workspace>/.codewhale/skills`, `~/.codewhale/skills`,
+  and any explicit `skills_dir`) while ignoring cross-tool directories such as
+  `.claude/skills`, `.opencode/skills`, `.cursor/skills`, and `~/.agents/skills`.
+  The default remains the broad compatibility scan.
+- **Permission/ask runtime rules (#3295).** Sibling `permissions.toml` ask-only
+  rules are now loaded by the TUI engine and applied to `exec_shell` before
+  Auto/session approval shortcuts. Matching ask rules force an approval prompt
+  in otherwise auto-approved flows and are rejected under
+  `approval_mode = "never"`.
+- **Runtime API no-auth documentation.** `docs/RUNTIME_API.md` now documents
+  `codewhale app-server --insecure-no-auth` for loopback-only testing and warns
+  against combining it with `--mobile` on `0.0.0.0`.
+
+### Fixed
+
+- **TUI polish.** The empty-startup welcome block is centered by the actual
+  rendered text width, fixing the off-center layout left over from the old
+  sidebar-oriented welcome composition. Streaming HTTP body read errors now
+  explain whether CodeWhale can retry before output, or is surfacing a warning
+  after partial output to avoid replaying and duplicating streamed text.
+- **Config comment preservation.** Rewriting `config.toml`, `settings.toml`, or
+  `tui.toml` now merges user comments and formatting back into the serialized
+  document; if comment merge fails, the write falls back to plain serialized
+  output rather than failing.
+- **Snapshot gate respected for per-tool snapshots (#3292).** Per-tool snapshots
+  now check `[snapshots].enabled` before writing, matching the existing
+  session-level gate.
+- **Poppler `pdftotext` detection (#1667).** The dependency resolver now probes
+  `pdftotext -v` instead of `--version`, because Poppler treats `--version` as
+  an input filename. Fixes detection on systems where only Poppler is installed.
+- **Plan confirmation checklist visibility.** The Plan-mode confirmation modal
+  now shows the active checklist under the plan details, so users can review the
+  concrete `checklist_write` work breakdown before accepting or revising a plan.
+
 ### Retroactive credits
 
 A credit-reconciliation pass found shipped community fixes that were never
@@ -2071,7 +2284,9 @@ overflow report and `/theme` picker edge-wrapping patch in #1814.
 
 Older releases (v0.8.39 and earlier) are archived in [docs/CHANGELOG_ARCHIVE.md](docs/CHANGELOG_ARCHIVE.md).
 
-[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.60...HEAD
+[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.63...HEAD
+[0.8.63]: https://github.com/Hmbown/CodeWhale/compare/v0.8.62...v0.8.63
+[0.8.62]: https://github.com/Hmbown/CodeWhale/compare/v0.8.61...v0.8.62
 [0.8.61]: https://github.com/Hmbown/CodeWhale/compare/v0.8.60...v0.8.61
 [0.8.60]: https://github.com/Hmbown/CodeWhale/compare/v0.8.59...v0.8.60
 [0.8.59]: https://github.com/Hmbown/CodeWhale/compare/v0.8.58...v0.8.59

@@ -400,7 +400,7 @@ impl ToolSpec for TaskShellStartTool {
     }
 
     fn description(&self) -> &'static str {
-        "Start a long-running shell command in the background and return a shell task_id immediately. The transcript is notified automatically on completion; use task_shell_wait for early output or to record gate evidence on the active durable task."
+        "Start a long-running shell command in the background and return a shell task_id immediately. Completion is tracked in the task/status surface; use task_shell_wait for early output, explicit barriers, or gate evidence on the active durable task."
     }
 
     fn input_schema(&self) -> Value {

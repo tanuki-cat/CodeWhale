@@ -263,7 +263,7 @@ impl ToolSpec for RunVerifiersTool {
                 "background": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Start verifier gates as background shell jobs and return task_ids immediately. Use for long build/test/lint gates; the transcript is notified automatically on completion, and exec_shell_wait/task_shell_wait are only for early output or true dependency barriers."
+                    "description": "Start verifier gates as background shell jobs and return task_ids immediately. Use for long build/test/lint gates; completion is tracked in task/status state, and exec_shell_wait/task_shell_wait are only for early output, final output, or true dependency barriers."
                 }
             },
             "additionalProperties": false
@@ -470,11 +470,11 @@ fn start_background_gates(
     let success = failed_to_start == 0 && started > 0;
     let summary = if failed_to_start == 0 {
         format!(
-            "Started {started} verifier gate(s) in the background; {skipped} skipped. You will be notified automatically when each gate finishes; continue inspecting or implementing while they run."
+            "Started {started} verifier gate(s) in the background; {skipped} skipped. Completion is tracked in task/status state. Continue inspecting or implementing while they run."
         )
     } else {
         format!(
-            "Started {started} verifier gate(s), failed to start {failed_to_start}, and skipped {skipped}. You will be notified automatically when each gate finishes; continue inspecting or implementing while they run."
+            "Started {started} verifier gate(s), failed to start {failed_to_start}, and skipped {skipped}. Completion is tracked in task/status state. Continue inspecting or implementing while they run."
         )
     };
     let task_ids = jobs
@@ -502,7 +502,8 @@ fn start_background_gates(
         "backgrounded": true,
         "detached_start": true,
         "verifier_background": true,
-        "auto_notify_on_completion": true,
+        "auto_resume_on_completion": false,
+        "completion_surface": "task_status",
         "background_policy": "nonblocking",
         "task_ids": task_ids,
         "poll_with": ["exec_shell_wait", "task_shell_wait"]
@@ -1121,7 +1122,27 @@ fn char_boundary_index(text: &str, max_chars: usize) -> usize {
 mod tests {
     use super::*;
     use crate::tools::shell::ShellStatus;
+    use std::time::Duration;
     use tempfile::tempdir;
+
+    const BACKGROUND_COMPLETION_WAIT_MS: u64 = 30_000;
+
+    fn wait_for_completed_shell(
+        manager: &mut crate::tools::shell::ShellManager,
+        task_id: &str,
+    ) -> crate::tools::shell::ShellResult {
+        let deadline = Instant::now() + Duration::from_millis(BACKGROUND_COMPLETION_WAIT_MS);
+
+        loop {
+            let result = manager
+                .get_output(task_id, true, 1_000)
+                .expect("background output");
+            if result.status != ShellStatus::Running || Instant::now() >= deadline {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 
     #[test]
     fn run_verifiers_requires_user_approval() {
@@ -1281,7 +1302,7 @@ mod tests {
         assert!(parsed.background);
         assert_eq!(parsed.started, 1);
         assert_eq!(parsed.failed_to_start, 0);
-        assert!(parsed.summary.contains("notified automatically"));
+        assert!(parsed.summary.contains("Completion is tracked"));
         let task_id = parsed.jobs[0]
             .task_id
             .as_deref()
@@ -1298,19 +1319,27 @@ mod tests {
             metadata
                 .get("auto_notify_on_completion")
                 .and_then(Value::as_bool),
-            Some(true)
+            None
+        );
+        assert_eq!(
+            metadata
+                .get("auto_resume_on_completion")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            metadata.get("completion_surface").and_then(Value::as_str),
+            Some("task_status")
         );
         assert_eq!(
             metadata.get("background_policy").and_then(Value::as_str),
             Some("nonblocking")
         );
 
-        let output = ctx
-            .shell_manager
-            .lock()
-            .expect("shell manager")
-            .get_output(task_id, true, 10_000)
-            .expect("background output");
+        let output = wait_for_completed_shell(
+            &mut ctx.shell_manager.lock().expect("shell manager"),
+            task_id,
+        );
         assert_eq!(output.status, ShellStatus::Completed);
         assert!(
             output.stdout.contains("rustc"),

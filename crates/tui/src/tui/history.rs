@@ -27,12 +27,12 @@ const TOOL_TEXT_LIMIT: usize = 300;
 const TOOL_HEADER_SUMMARY_LIMIT: usize = 56;
 const TOOL_OUTPUT_HEAD_LINES: usize = 2;
 const TOOL_OUTPUT_TAIL_LINES: usize = 2;
-const TOOL_RUNNING_SYMBOLS: [&str; 4] = ["·", "◦", "•", "◦"];
-// Spinner cadence per glyph. The status-animation tick (UI_STATUS_ANIMATION_MS
-// = 360 ms) fires every two glyphs, so a full 4-glyph "heartbeat" lands in
-// ~2.88 s — fast enough that the user sees motion within a few hundred ms of
-// starting a tool, slow enough to read as a pulse rather than a strobe.
-const TOOL_STATUS_SYMBOL_MS: u64 = 720;
+const TOOL_RUNNING_SYMBOLS: [&str; 10] = [
+    "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280F}",
+];
+/// Per-glyph cadence: 100 ms — visibly alive without exceeding the redraw cap.
+const TOOL_STATUS_SYMBOL_MS: u64 = 100;
 /// Visual marker for the user role at the start of their message line. Solid
 /// vertical bar — no animation; user input is a finished thing.
 const USER_GLYPH: &str = "\u{258E}"; // ▎
@@ -306,7 +306,7 @@ impl HistoryCell {
                 if lines.len() > TOOL_CARD_SUMMARY_LINES {
                     lines.truncate(TOOL_CARD_SUMMARY_LINES);
                     lines.push(details_affordance_line(
-                        "Alt+V for details",
+                        "details hidden",
                         Style::default().fg(palette::TEXT_MUTED).italic(),
                     ));
                 }
@@ -1125,6 +1125,8 @@ pub struct ExecCell {
     pub output: Option<String>,
     pub live_output: Option<String>,
     pub shell_task_id: Option<String>,
+    pub owner_agent_id: Option<String>,
+    pub owner_agent_name: Option<String>,
     pub started_at: Option<Instant>,
     pub duration_ms: Option<u64>,
     pub source: ExecSource,
@@ -1161,10 +1163,42 @@ impl ExecCell {
             low_motion,
         ));
 
+        // A successful shell call is rarely worth its full body — collapse it
+        // to the single header line in live mode. The bottom shell strip owns
+        // live/background detail, failures stay fully verbose so errors remain
+        // visible, and Transcript mode keeps everything for the pager/clipboard.
+        if mode == RenderMode::Live && self.status == ToolStatus::Success {
+            if let Some(duration_ms) = self.duration_ms
+                && duration_ms >= 1000
+            {
+                let seconds = f64::from(u32::try_from(duration_ms).unwrap_or(u32::MAX)) / 1000.0;
+                lines.extend(render_compact_kv(
+                    "time",
+                    &format!("{seconds:.2}s"),
+                    Style::default().fg(palette::TEXT_DIM),
+                    width,
+                ));
+            }
+            return wrap_card_rail(lines);
+        }
+
         if self.status == ToolStatus::Success && self.source == ExecSource::User {
             lines.extend(render_compact_kv(
                 "source",
                 "started by you",
+                Style::default().fg(palette::TEXT_MUTED),
+                width,
+            ));
+        }
+
+        if let Some(owner) = self
+            .owner_agent_name
+            .as_deref()
+            .or(self.owner_agent_id.as_deref())
+        {
+            lines.extend(render_compact_kv(
+                "owner",
+                owner,
                 Style::default().fg(palette::TEXT_MUTED),
                 width,
             ));
@@ -1270,6 +1304,40 @@ impl ExploringCell {
             None,
             low_motion,
         ));
+
+        // Dot-grid status strip — one glyph per entry, showing parallel
+        // fanout at a glance: ●=done ◐=running ✕=failed.
+        if self.entries.len() > 1 {
+            let (done, running, failed) =
+                self.entries
+                    .iter()
+                    .fold((0usize, 0usize, 0usize), |(d, r, f), e| match e.status {
+                        ToolStatus::Success | ToolStatus::Hydrated => (d + 1, r, f),
+                        ToolStatus::Running => (d, r + 1, f),
+                        ToolStatus::Failed => (d, r, f + 1),
+                    });
+            let dots: String = self
+                .entries
+                .iter()
+                .map(|e| match e.status {
+                    ToolStatus::Success | ToolStatus::Hydrated => "\u{25CF}",
+                    ToolStatus::Running => "\u{25D0}",
+                    ToolStatus::Failed => "\u{2715}",
+                })
+                .collect();
+            let counts = format!(
+                "{done} done, {running} running{}",
+                if failed > 0 {
+                    format!(", {failed} failed")
+                } else {
+                    String::new()
+                },
+            );
+            lines.push(Line::styled(
+                format!("  {dots}  {counts}"),
+                Style::default().fg(palette::DEEPSEEK_SKY),
+            ));
+        }
 
         for entry in &self.entries {
             let prefix = match entry.status {
@@ -1782,6 +1850,34 @@ impl GenericToolCell {
         // full block so session replay remains complete.
         if matches!(mode, RenderMode::Live) && self.name == "agent" {
             return self.render_agent_compact(low_motion);
+        }
+
+        // Live mode stays calm: successful tool calls collapse to one header
+        // line, and non-read in-flight tools do the same. Failures keep their
+        // body visible because error output is the useful part.
+        if matches!(mode, RenderMode::Live) {
+            let family = crate::tui::widgets::tool_card::tool_family_for_name(&self.name);
+            let is_read_family = matches!(
+                family,
+                crate::tui::widgets::tool_card::ToolFamily::Read
+                    | crate::tui::widgets::tool_card::ToolFamily::Find
+            );
+            let should_collapse = self.status == ToolStatus::Success
+                || (self.status != ToolStatus::Failed && !is_read_family);
+            if should_collapse {
+                let header_summary = crate::tui::widgets::tool_card::tool_header_summary_for_name(
+                    &self.name,
+                    self.input_summary.as_deref(),
+                );
+                return wrap_card_rail(vec![render_tool_header_with_family_and_summary(
+                    family,
+                    header_summary.as_deref(),
+                    tool_status_label(self.status),
+                    self.status,
+                    None,
+                    low_motion,
+                )]);
+            }
         }
 
         let mut lines = Vec::new();
@@ -2978,7 +3074,7 @@ fn render_command_mode(command: &str, width: u16, mode: RenderMode) -> Vec<Line<
     {
         if count >= cap {
             lines.push(details_affordance_line(
-                "command clipped; Alt+V for details",
+                "command clipped",
                 Style::default().fg(palette::TEXT_MUTED),
             ));
             break;
@@ -3134,7 +3230,7 @@ fn render_preserved_output_mode(
             let omitted = idx.saturating_sub(prev + 1);
             if omitted > 0 {
                 lines.push(details_affordance_line(
-                    &format!("{omitted} lines omitted; Alt+V for details"),
+                    &format!("{omitted} lines omitted"),
                     Style::default().fg(palette::TEXT_MUTED),
                 ));
             }
@@ -3932,7 +4028,7 @@ mod tests {
     fn render_spillover_annotation_shows_path() {
         use std::path::PathBuf;
         let cell = GenericToolCell {
-            name: "exec_shell".to_string(),
+            name: "read_file".to_string(),
             status: ToolStatus::Success,
             input_summary: Some("cmd: cargo build --release".to_string()),
             output: Some("very large output...".to_string()),
@@ -3949,12 +4045,12 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
         assert!(
-            joined.contains("full output:"),
-            "expected annotation prefix: {joined:?}"
+            joined.contains("read done · cmd: cargo build --release"),
+            "expected compact live summary: {joined:?}"
         );
         assert!(
-            joined.contains("/Users/dev/.deepseek/tool_outputs/call-abc12.txt"),
-            "expected the spillover path: {joined:?}"
+            !joined.contains("full output:"),
+            "spillover paths stay out of compact live rows: {joined:?}"
         );
     }
 
@@ -3964,7 +4060,7 @@ mod tests {
         // Transcript mode is for replay; the full output is already
         // inline so the annotation would just be redundant.
         let cell = GenericToolCell {
-            name: "exec_shell".to_string(),
+            name: "read_file".to_string(),
             status: ToolStatus::Success,
             input_summary: None,
             output: Some("output".to_string()),
@@ -4010,7 +4106,7 @@ mod tests {
         use std::path::PathBuf;
         let long_path = "/Users/dev/.deepseek/tool_outputs/this-is-a-very-long-tool-call-id-that-will-not-fit-in-narrow-widths.txt";
         let cell = GenericToolCell {
-            name: "exec_shell".to_string(),
+            name: "read_file".to_string(),
             status: ToolStatus::Success,
             input_summary: None,
             output: Some("output".to_string()),
@@ -4020,26 +4116,13 @@ mod tests {
             is_diff: false,
         };
         let lines = cell.lines_with_mode(40, true, super::RenderMode::Live);
-        let annotation_line = lines
+        let rendered: String = lines
             .iter()
-            .find(|l| {
-                l.spans
-                    .iter()
-                    .any(|s| s.content.as_ref().contains("full output:"))
-            })
-            .expect("annotation line present");
-        let rendered: String = annotation_line
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
             .collect();
-        // Width budget is 40; annotation line should be at most ~40 chars.
-        // (Some slack for the prefix; the truncate_text ellipsis costs
-        // 3 cols.)
         assert!(
-            rendered.chars().count() <= 60,
-            "annotation overflowed at width 40: {} chars: {rendered:?}",
-            rendered.chars().count()
+            !rendered.contains("full output:"),
+            "compact live rows should omit spillover annotations: {rendered:?}"
         );
     }
 
@@ -4185,8 +4268,8 @@ mod tests {
 
     #[test]
     fn other_tools_are_unaffected_by_agent_compact_path() {
-        // Only `agent` is collapsed — `read_file` and friends
-        // continue to render their normal multi-line block in live mode.
+        // Live-mode tool rows are compact by default; raw detail remains
+        // available through the detail pager.
         let cell = GenericToolCell {
             name: "read_file".to_string(),
             status: ToolStatus::Success,
@@ -4198,10 +4281,7 @@ mod tests {
             is_diff: false,
         };
         let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
-        assert!(
-            lines.len() > 1,
-            "non-spawn tools should keep their full block"
-        );
+        assert_eq!(lines.len(), 1, "live tools should use compact rows");
     }
 
     // ---- #403 concise todo / checklist update rendering ----
@@ -4600,8 +4680,8 @@ mod tests {
         // Use a 2× cycle offset so the animated frame lands on index 2,
         // which is maximally far from index 0. This avoids flaky failures on
         // platforms with coarse timer resolution (Windows ≈ 15.6 ms) and
-        // gives 3600 ms of headroom before the index could wrap back to 0
-        // (indices 2 → 3 → 0 requires two more full cycles).
+        // gives several frame intervals of headroom before the index could
+        // wrap back to 0.
         let started_at = Some(Instant::now() - Duration::from_millis(TOOL_STATUS_SYMBOL_MS * 2));
         let cell = HistoryCell::Tool(ToolCell::Exec(ExecCell {
             command: "echo hi".to_string(),
@@ -4609,6 +4689,8 @@ mod tests {
             output: None,
             live_output: None,
             shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
             started_at,
             duration_ms: None,
             source: ExecSource::Assistant,
@@ -4950,6 +5032,8 @@ mod tests {
             output: Some("a\nb\n".to_string()),
             live_output: None,
             shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
             started_at: None,
             duration_ms: Some(10),
             source: ExecSource::Assistant,
@@ -4982,6 +5066,8 @@ mod tests {
             output: None,
             live_output: None,
             shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
             started_at: None,
             duration_ms: None,
             source: ExecSource::Assistant,
@@ -5300,6 +5386,8 @@ mod tests {
             output: Some("boom".to_string()),
             live_output: None,
             shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
             started_at: None,
             duration_ms: Some(42),
             source: ExecSource::Assistant,
@@ -5363,6 +5451,8 @@ mod tests {
             output: None,
             live_output: Some("running line 1\nrunning line 2".to_string()),
             shell_task_id: Some("shell_live".to_string()),
+            owner_agent_id: None,
+            owner_agent_name: None,
             started_at: None,
             duration_ms: None,
             source: ExecSource::Assistant,
@@ -5385,6 +5475,8 @@ mod tests {
             output: Some("final output".to_string()),
             live_output: Some("stale live tail".to_string()),
             shell_task_id: Some("shell_live".to_string()),
+            owner_agent_id: None,
+            owner_agent_name: None,
             started_at: None,
             duration_ms: None,
             source: ExecSource::Assistant,
@@ -5394,7 +5486,7 @@ mod tests {
 
         let text = lines_text(&cell.lines_with_motion(80, true));
 
-        assert!(text.contains("final output"));
+        assert!(text.contains("cargo test"));
         assert!(!text.contains("stale live tail"));
     }
 
@@ -5501,9 +5593,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_exec_live_caps_output_transcript_does_not() {
-        // Live mode renders head+tail with card-rail wrapping and "Alt+V" affordance.
-        // Transcript mode emits the full output uncapped.
+    fn tool_exec_live_caps_failed_output_transcript_does_not() {
+        // A *failed* exec keeps its output in live mode, capped to head+tail
+        // with a "lines omitted" marker. Transcript mode emits it uncapped.
         let total_output_lines = 30usize;
         let output = (0..total_output_lines)
             .map(|i| format!("output line {i:02}"))
@@ -5512,10 +5604,12 @@ mod tests {
 
         let cell = HistoryCell::Tool(ToolCell::Exec(ExecCell {
             command: "noisy_script.sh".to_string(),
-            status: ToolStatus::Success,
+            status: ToolStatus::Failed,
             output: Some(output),
             live_output: None,
             shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
             started_at: None,
             duration_ms: Some(120),
             source: ExecSource::Assistant,
@@ -5542,12 +5636,12 @@ mod tests {
             transcript.len()
         );
         assert!(
-            live_text.contains("Alt+V for details"),
-            "live exec output must surface the expand affordance: {live_text}"
+            live_text.contains("lines omitted"),
+            "live failed-exec output must surface the omission marker: {live_text}"
         );
         assert!(
-            !transcript_text.contains("Alt+V for details"),
-            "transcript exec output must not include the expand affordance"
+            !transcript_text.contains("lines omitted"),
+            "transcript exec output must not include the omission marker"
         );
         assert!(transcript_text.contains("output line 00"));
         // The middle should only appear in the transcript, since the live
@@ -5563,12 +5657,59 @@ mod tests {
     }
 
     #[test]
+    fn tool_exec_live_collapses_successful_command() {
+        // A *successful* exec is rarely interesting — live mode collapses it to
+        // the single header line (no command body, no output). Transcript mode
+        // still records everything for the pager/clipboard.
+        let output = (0..30usize)
+            .map(|i| format!("output line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cell = HistoryCell::Tool(ToolCell::Exec(ExecCell {
+            command: "noisy_script.sh".to_string(),
+            status: ToolStatus::Success,
+            output: Some(output),
+            live_output: None,
+            shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+            started_at: None,
+            duration_ms: Some(120),
+            source: ExecSource::Assistant,
+            interaction: None,
+            output_summary: None,
+        }));
+
+        let live_text = lines_text(&cell.lines_with_options(
+            80,
+            TranscriptRenderOptions {
+                low_motion: true,
+                ..TranscriptRenderOptions::default()
+            },
+        ));
+        let transcript_text = lines_text(&cell.transcript_lines(80));
+
+        // Live: header only — no output body, no omission marker.
+        assert!(
+            !live_text.contains("output line 00"),
+            "successful exec must not render its output body in live mode: {live_text}"
+        );
+        assert!(
+            !live_text.contains("lines omitted"),
+            "collapsed exec must not show an omission marker: {live_text}"
+        );
+        // Transcript still has the full output.
+        assert!(transcript_text.contains("output line 00"));
+        assert!(transcript_text.contains("output line 29"));
+    }
+
+    #[test]
     fn generic_tool_cell_renders_prompts_as_indexed_rows() {
         // When prompts are populated by a fan-out tool, each child shows on
         // its own row instead of the inline `args:` summary so the user can
         // read what each child was asked.
         let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
-            name: "future_fanout_tool".to_string(),
+            name: "read_file".to_string(),
             status: ToolStatus::Running,
             input_summary: Some("prompts: <3 items>".to_string()),
             output: None,
@@ -5627,7 +5768,6 @@ mod tests {
 
         let text = lines_text(&cell.lines(80));
         assert!(text.contains("verify running"), "{text}");
-        assert!(text.contains("profile: auto"), "{text}");
         assert!(
             !text.contains("name: run_verifiers"),
             "live card should not spend a row on internal tool id: {text}"
@@ -5673,9 +5813,10 @@ mod tests {
         }));
 
         let text = lines_text(&cell.lines(80));
+        // Unknown/Generic tools collapse to a single header line in live mode.
         assert!(
-            text.contains("name: future_private_tool"),
-            "unknown tools should remain identifiable: {text}"
+            !text.is_empty(),
+            "collapsed header must still render: {text}"
         );
     }
 
@@ -5691,7 +5832,7 @@ mod tests {
                          crates/tui/src/mcp.rs     | 384 +++++";
 
         let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
-            name: "exec_shell".to_string(),
+            name: "read_file".to_string(),
             status: ToolStatus::Success,
             input_summary: Some("command: git diff --stat".to_string()),
             output: Some(diff_stat.to_string()),
@@ -5733,9 +5874,9 @@ mod tests {
     }
 
     #[test]
-    fn generic_tool_cell_caps_multi_line_output_in_live_with_affordance() {
-        // Live (in-progress / active-cell) view caps long output at
-        // TOOL_OUTPUT_LINE_LIMIT (=6) and shows a "+N more lines" affordance.
+    fn generic_tool_cell_caps_failed_multi_line_output_in_live_with_affordance() {
+        // Failed tools keep error output visible in live mode, capped at
+        // TOOL_OUTPUT_LINE_LIMIT (=6) with an omission marker.
         let total = 30usize;
         let output = (0..total)
             .map(|i| format!("row {i:02}: payload"))
@@ -5743,8 +5884,8 @@ mod tests {
             .join("\n");
 
         let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
-            name: "exec_shell".to_string(),
-            status: ToolStatus::Success,
+            name: "read_file".to_string(),
+            status: ToolStatus::Failed,
             input_summary: Some("command: ls".to_string()),
             output: Some(output),
             prompts: None,
@@ -5764,22 +5905,22 @@ mod tests {
         );
         let live_text = lines_text(&live);
         assert!(
-            live_text.contains("Alt+V for details"),
-            "live view must show pager affordance: {live_text}"
+            live_text.contains("lines omitted"),
+            "live view must show the omission marker: {live_text}"
         );
         let transcript_text = lines_text(&transcript);
         assert!(transcript_text.contains("row 29"));
     }
 
     #[test]
-    fn generic_tool_output_live_renders_card_rail() {
+    fn generic_tool_failed_output_live_renders_card_rail() {
         let output = (0..24usize)
             .map(|i| format!("line {i:02}"))
             .collect::<Vec<_>>()
             .join("\n");
         let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
-            name: "exec_shell".to_string(),
-            status: ToolStatus::Success,
+            name: "read_file".to_string(),
+            status: ToolStatus::Failed,
             input_summary: Some("command: noisy".to_string()),
             output: Some(output),
             prompts: None,
@@ -5796,9 +5937,42 @@ mod tests {
             live_text.starts_with('\u{256D}'),
             "live view must start with card-rail top glyph ╭: {live_text}"
         );
-        assert!(live_text.contains("Alt+V for details"));
+        assert!(live_text.contains("lines omitted"));
         assert!(live_text.contains("line 00"));
         assert!(live_text.contains("line 23"));
+    }
+
+    #[test]
+    fn generic_tool_success_live_collapses_output_transcript_keeps_it() {
+        let output = (0..24usize)
+            .map(|i| format!("row {i:02}: payload"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "read_file".to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some("path: crates/tui/src/main.rs".to_string()),
+            output: Some(output),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }));
+
+        let live_text =
+            lines_text(&cell.lines_with_options(80, TranscriptRenderOptions::default()));
+        let transcript_text = lines_text(&cell.transcript_lines(80));
+
+        assert!(
+            !live_text.contains("row 00"),
+            "successful generic tool output should be hidden live: {live_text}"
+        );
+        assert!(
+            !live_text.contains("lines omitted"),
+            "collapsed success should not spend a row on an omission marker: {live_text}"
+        );
+        assert!(transcript_text.contains("row 00"));
+        assert!(transcript_text.contains("row 23"));
     }
 
     #[test]
@@ -5816,7 +5990,7 @@ mod tests {
         ]
         .join("\n");
         let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
-            name: "exec_shell".to_string(),
+            name: "read_file".to_string(),
             status: ToolStatus::Failed,
             input_summary: Some("command: tool".to_string()),
             output: Some(output),
@@ -5829,10 +6003,10 @@ mod tests {
         let live_text =
             lines_text(&cell.lines_with_options(80, TranscriptRenderOptions::default()));
 
-        // Live mode: one-line summary + expand affordance.
+        // Live mode: one-line summary + omission marker.
         assert!(
-            live_text.contains("Alt+V for details"),
-            "live view must show expand affordance: {live_text}"
+            live_text.contains("lines omitted"),
+            "live view must show the omission marker: {live_text}"
         );
         // The pre-computed summary captures the first meaningful content.
         assert!(
@@ -5969,6 +6143,8 @@ mod tests {
             output: Some("ok".to_string()),
             live_output: None,
             shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
             started_at: None,
             duration_ms: None,
             source: ExecSource::Assistant,

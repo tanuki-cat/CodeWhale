@@ -134,8 +134,13 @@ impl TuiPrefs {
         }
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read tui.toml from {}", path.display()))?;
-        let prefs: TuiPrefs = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse tui.toml from {}", path.display()))?;
+        let prefs: TuiPrefs = match toml::from_str(&content) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Failed to parse {} (using defaults): {e:#}", path.display());
+                return Ok(Self::default());
+            }
+        };
         Ok(prefs)
     }
 
@@ -148,8 +153,18 @@ impl TuiPrefs {
                 format!("Failed to create config directory {}", parent.display())
             })?;
         }
-        let content = toml::to_string_pretty(self).context("Failed to serialize TuiPrefs")?;
-        std::fs::write(&path, content)
+        let serialized = toml::to_string_pretty(self).context("Failed to serialize TuiPrefs")?;
+        let body = if path.exists() {
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read tui.toml at {}", path.display()))?;
+            codewhale_config::merge_and_preserve_comments(&serialized, &raw).unwrap_or_else(|e| {
+                tracing::warn!("failed to merge tui.toml comments, saving without them: {e:#}");
+                serialized
+            })
+        } else {
+            serialized
+        };
+        std::fs::write(&path, body)
             .with_context(|| format!("Failed to write tui.toml to {}", path.display()))?;
         Ok(())
     }
@@ -263,8 +278,11 @@ pub struct Settings {
     pub default_mode: String,
     /// Sidebar width as percentage of terminal width
     pub sidebar_width_percent: u16,
-    /// Sidebar focus mode: auto, work, tasks, agents, context, hidden
+    /// Sidebar focus mode: pinned, auto, tasks, agents, context, hidden
     pub sidebar_focus: String,
+    /// Migration marker for users who explicitly opt into idle auto-collapse.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sidebar_auto_collapse_opt_in: bool,
     /// Enable the session-context panel (#504). Shows working set, tokens,
     /// cost, MCP/LSP status, cycle count, and memory info.
     pub context_panel: bool,
@@ -319,6 +337,19 @@ pub struct Settings {
     /// `binary_unavailable` response with an install hint, matching the
     /// pre-v0.8.32 behavior.
     pub prefer_external_pdftotext: bool,
+    /// Follow symbolic links during workspace file discovery walks (`@`-mention
+    /// completion, fuzzy resolve, and the file-index builder). When `false`
+    /// (default) symlinked directories are skipped, which keeps walks fast and
+    /// avoids accidentally traversing into system paths. Set to `true` to
+    /// support symlink-based multi-project workspaces where several project
+    /// directories are symlinked into a single hub directory.
+    ///
+    /// **Note**: The walker has built-in cycle detection that skips already-
+    /// visited real paths, so symlink loops (A→B→A) will not cause infinite
+    /// recursion. However, enabling this on workspaces with symlinks that
+    /// point to large directory trees (e.g. `/usr`, home directories) can
+    /// significantly increase first-turn latency and memory usage.
+    pub workspace_follow_symlinks: bool,
 }
 
 impl Default for Settings {
@@ -351,7 +382,8 @@ impl Default for Settings {
             transcript_spacing: "comfortable".to_string(),
             default_mode: "agent".to_string(),
             sidebar_width_percent: 28,
-            sidebar_focus: "auto".to_string(),
+            sidebar_focus: "pinned".to_string(),
+            sidebar_auto_collapse_opt_in: false,
             context_panel: false,
             cost_currency: "usd".to_string(),
             max_input_history: 100,
@@ -362,6 +394,7 @@ impl Default for Settings {
             status_indicator: "whale".to_string(),
             synchronized_output: "auto".to_string(),
             prefer_external_pdftotext: false,
+            workspace_follow_symlinks: false,
         }
     }
 }
@@ -398,14 +431,29 @@ impl Settings {
         } else {
             let content = std::fs::read_to_string(&read_path)
                 .with_context(|| format!("Failed to read settings from {}", read_path.display()))?;
-            let mut s: Settings = toml::from_str(&content).with_context(|| {
-                format!("Failed to parse settings from {}", read_path.display())
-            })?;
+            let mut s: Settings = match toml::from_str(&content) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse {} (using defaults): {e:#}",
+                        read_path.display()
+                    );
+                    return Ok(Self::default());
+                }
+            };
             s.default_mode = normalize_mode(&s.default_mode).to_string();
             s.composer_density = normalize_composer_density(&s.composer_density).to_string();
             s.transcript_spacing = normalize_transcript_spacing(&s.transcript_spacing).to_string();
             s.tool_collapse_mode = normalize_tool_collapse_mode(&s.tool_collapse_mode).to_string();
             s.sidebar_focus = normalize_sidebar_focus(&s.sidebar_focus).to_string();
+            if s.sidebar_focus == "auto" && !s.sidebar_auto_collapse_opt_in {
+                // v0.8.62 wrote the surprising auto-collapse default into many
+                // full settings files. Treat unmarked saved "auto" as that
+                // legacy default so upgraded users get the sidebar back, while
+                // `/sidebar auto --save` and `/set sidebar_focus auto` below
+                // preserve an explicit opt-in from this release onward (#3328).
+                s.sidebar_focus = "pinned".to_string();
+            }
             s.status_indicator = normalize_status_indicator(&s.status_indicator).to_string();
             s.synchronized_output =
                 normalize_synchronized_output(&s.synchronized_output).to_string();
@@ -549,8 +597,18 @@ impl Settings {
             })?;
         }
 
-        let content = toml::to_string_pretty(self).context("Failed to serialize settings")?;
-        std::fs::write(&path, content)
+        let serialized = toml::to_string_pretty(self).context("Failed to serialize settings")?;
+        let body = if path.exists() {
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read settings at {}", path.display()))?;
+            codewhale_config::merge_and_preserve_comments(&serialized, &raw).unwrap_or_else(|e| {
+                tracing::warn!("failed to merge settings comments, saving without them: {e:#}");
+                serialized
+            })
+        } else {
+            serialized
+        };
+        std::fs::write(&path, body)
             .with_context(|| format!("Failed to write settings to {}", path.display()))?;
         Ok(())
     }
@@ -688,6 +746,9 @@ impl Settings {
             "prefer_external_pdftotext" | "external_pdftotext" | "pdftotext" => {
                 self.prefer_external_pdftotext = parse_bool(value)?;
             }
+            "workspace_follow_symlinks" | "follow_symlinks" => {
+                self.workspace_follow_symlinks = parse_bool(value)?;
+            }
             "default_mode" | "mode" => {
                 let normalized = normalize_mode(value);
                 if !["agent", "plan", "yolo"].contains(&normalized) {
@@ -715,18 +776,19 @@ impl Settings {
             "sidebar_focus" | "focus" => {
                 let normalized = match value.trim().to_ascii_lowercase().as_str() {
                     "auto" => "auto",
-                    "work" | "plan" | "todos" => "work",
+                    "pinned" | "visible" | "show" | "on" | "work" | "plan" | "todos" => "pinned",
                     "tasks" => "tasks",
                     "agents" | "subagents" | "sub-agents" => "agents",
                     "context" | "session" => "context",
                     "hidden" | "hide" | "closed" | "off" | "none" => "hidden",
                     _ => {
                         anyhow::bail!(
-                            "Failed to update setting: invalid sidebar focus '{value}'. Expected: auto, work, tasks, agents, context, hidden."
+                            "Failed to update setting: invalid sidebar focus '{value}'. Expected: pinned, auto, tasks, agents, context, hidden."
                         )
                     }
                 };
                 self.sidebar_focus = normalized.to_string();
+                self.sidebar_auto_collapse_opt_in = normalized == "auto";
             }
             "context_panel" | "context" | "session_panel" => {
                 self.context_panel = parse_bool(value)?;
@@ -826,6 +888,10 @@ impl Settings {
         lines.push(format!(
             "  prefer_external_pdftotext: {}",
             self.prefer_external_pdftotext
+        ));
+        lines.push(format!(
+            "  workspace_follow_symlinks: {}",
+            self.workspace_follow_symlinks
         ));
         lines.push(format!("  default_mode:       {}", self.default_mode));
         lines.push(format!(
@@ -942,6 +1008,10 @@ impl Settings {
             (
                 "prefer_external_pdftotext",
                 "Route PDF reads through Poppler's pdftotext instead of the bundled pure-Rust extractor: on/off (default off)",
+            ),
+            (
+                "workspace_follow_symlinks",
+                "Follow symbolic links during workspace file discovery walks: on/off (default off). Enable for symlink-based multi-project workspaces. Has built-in cycle detection but may increase latency on large symlinked trees.",
             ),
             ("default_mode", "Default mode: agent, plan, yolo"),
             ("sidebar_width", "Sidebar width percentage: 10-50"),
@@ -1343,13 +1413,17 @@ fn normalize_background_color_setting(value: &str) -> Result<Option<String>> {
 
 fn normalize_sidebar_focus(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
-        "work" | "plan" | "todos" => "work",
+        "pinned" | "visible" | "show" | "on" | "work" | "plan" | "todos" => "pinned",
         "tasks" => "tasks",
         "agents" | "subagents" | "sub-agents" => "agents",
         "context" | "session" => "context",
         "hidden" | "hide" | "closed" | "off" | "none" => "hidden",
         _ => "auto",
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Resolve an environment variable as a boolean. Recognises the
@@ -1407,6 +1481,28 @@ mod tests {
     fn default_settings_show_footer_water_strip() {
         let settings = Settings::default();
         assert!(settings.fancy_animations);
+    }
+
+    #[test]
+    fn default_settings_keep_sidebar_pinned() {
+        let settings = Settings::default();
+        assert_eq!(settings.sidebar_focus, "pinned");
+        assert!(!settings.sidebar_auto_collapse_opt_in);
+    }
+
+    #[test]
+    fn sidebar_auto_opt_in_marker_is_serialized_only_when_enabled() {
+        let default_body = toml::to_string_pretty(&Settings::default()).expect("serialize");
+        assert!(!default_body.contains("sidebar_auto_collapse_opt_in"));
+
+        let mut settings = Settings::default();
+        settings
+            .set("sidebar_focus", "auto")
+            .expect("enable auto collapse");
+
+        let auto_body = toml::to_string_pretty(&settings).expect("serialize");
+        assert!(auto_body.contains("sidebar_focus = \"auto\""));
+        assert!(auto_body.contains("sidebar_auto_collapse_opt_in = true"));
     }
 
     #[test]
@@ -1563,17 +1659,20 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_focus_accepts_work_values_and_legacy_aliases() {
+    fn sidebar_focus_accepts_pinned_values_and_legacy_aliases() {
         let mut settings = Settings::default();
 
+        settings.set("sidebar_focus", "pinned").expect("set pinned");
+        assert_eq!(settings.sidebar_focus, "pinned");
+
         settings.set("sidebar_focus", "work").expect("set work");
-        assert_eq!(settings.sidebar_focus, "work");
+        assert_eq!(settings.sidebar_focus, "pinned");
 
         settings.set("focus", "plan").expect("legacy plan alias");
-        assert_eq!(settings.sidebar_focus, "work");
+        assert_eq!(settings.sidebar_focus, "pinned");
 
         settings.set("focus", "todos").expect("legacy todos alias");
-        assert_eq!(settings.sidebar_focus, "work");
+        assert_eq!(settings.sidebar_focus, "pinned");
 
         settings.set("focus", "context").expect("context focus");
         assert_eq!(settings.sidebar_focus, "context");
@@ -1583,6 +1682,17 @@ mod tests {
 
         settings.set("focus", "off").expect("off alias");
         assert_eq!(settings.sidebar_focus, "hidden");
+        assert!(!settings.sidebar_auto_collapse_opt_in);
+
+        settings.set("focus", "auto").expect("auto focus");
+        assert_eq!(settings.sidebar_focus, "auto");
+        assert!(settings.sidebar_auto_collapse_opt_in);
+
+        settings
+            .set("focus", "visible")
+            .expect("pinned alias clears auto marker");
+        assert_eq!(settings.sidebar_focus, "pinned");
+        assert!(!settings.sidebar_auto_collapse_opt_in);
 
         let err = settings
             .set("sidebar_focus", "classic")
@@ -2590,6 +2700,40 @@ mod tests {
     }
 
     #[test]
+    fn settings_load_migrates_legacy_saved_auto_sidebar_focus_to_pinned() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let settings_path = tmp.path().join("settings.toml");
+        std::fs::write(&settings_path, "sidebar_focus = \"auto\"\n").expect("settings");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
+
+        let loaded = Settings::load().expect("load settings");
+
+        assert_eq!(loaded.sidebar_focus, "pinned");
+        assert!(!loaded.sidebar_auto_collapse_opt_in);
+    }
+
+    #[test]
+    fn settings_load_preserves_explicit_auto_sidebar_opt_in() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let settings_path = tmp.path().join("settings.toml");
+        std::fs::write(
+            &settings_path,
+            "sidebar_focus = \"auto\"\nsidebar_auto_collapse_opt_in = true\n",
+        )
+        .expect("settings");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
+
+        let loaded = Settings::load().expect("load settings");
+
+        assert_eq!(loaded.sidebar_focus, "auto");
+        assert!(loaded.sidebar_auto_collapse_opt_in);
+    }
+
+    #[test]
     fn tui_prefs_path_defaults_to_codewhale_home_for_new_writes() {
         let _g = config_path_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2749,6 +2893,79 @@ mod tests {
         assert_eq!(loaded.theme, "light");
         assert_eq!(loaded.font_size, 14);
         assert_eq!(loaded.keybinds.submit.as_deref(), Some("ctrl+enter"));
+
+        // SAFETY: cleanup under the guard.
+        unsafe {
+            std::env::remove_var("DEEPSEEK_CONFIG_PATH");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tui_prefs_save_preserves_comments() {
+        let _g = config_path_test_guard();
+        let tmp = std::env::temp_dir().join("dst_tui_prefs_comment_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config_file = tmp.join("config.toml");
+        // SAFETY: test-only env mutation guarded by config_path_test_guard.
+        unsafe {
+            std::env::set_var("DEEPSEEK_CONFIG_PATH", config_file.to_str().unwrap());
+        }
+
+        // tui.toml lives next to config.toml
+        let tui_path = tmp.join("tui.toml");
+        std::fs::write(
+            &tui_path,
+            "# my theme comment\ntheme = \"dark\"\n# footer note\n",
+        )
+        .unwrap();
+
+        let prefs = TuiPrefs {
+            theme: "light".to_string(),
+            ..TuiPrefs::default()
+        };
+        prefs.save().expect("save should succeed");
+
+        let body = std::fs::read_to_string(&tui_path).expect("read tui.toml");
+        assert!(body.contains("# my theme comment"), "comment lost: {body}");
+        assert!(body.contains("# footer note"), "footer lost: {body}");
+        assert!(body.contains("light"), "new value not written: {body}");
+
+        // SAFETY: cleanup under the guard.
+        unsafe {
+            std::env::remove_var("DEEPSEEK_CONFIG_PATH");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn settings_save_preserves_comments() {
+        let _g = config_path_test_guard();
+        let tmp = std::env::temp_dir().join("dst_settings_comment_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config_file = tmp.join("config.toml");
+        // SAFETY: test-only env mutation guarded by config_path_test_guard.
+        unsafe {
+            std::env::set_var("DEEPSEEK_CONFIG_PATH", config_file.to_str().unwrap());
+        }
+
+        // settings.toml lives next to config.toml
+        let settings_path = tmp.join("settings.toml");
+        std::fs::write(
+            &settings_path,
+            "# my setting\ncost_currency = \"usd\"\n# trailing\n",
+        )
+        .unwrap();
+
+        // Load the existing file so we have a real struct to modify.
+        let mut settings = Settings::load().expect("load settings");
+        settings.cost_currency = "cny".to_string();
+        settings.save().expect("save should succeed");
+
+        let body = std::fs::read_to_string(&settings_path).expect("read settings.toml");
+        assert!(body.contains("# my setting"), "comment lost: {body}");
+        assert!(body.contains("# trailing"), "trailing lost: {body}");
+        assert!(body.contains("cny"), "new value not written: {body}");
 
         // SAFETY: cleanup under the guard.
         unsafe {

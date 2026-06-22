@@ -106,6 +106,8 @@ pub enum ViewEvent {
         approval_key: String,
         /// Lossy / arity-aware fingerprint, used to scope *approvals*.
         approval_grouping_key: String,
+        /// Ask-only permission rules to append when the decision approves.
+        persistent_ask_rules: Vec<codewhale_config::ToolAskRule>,
     },
     ElevationDecision {
         tool_id: String,
@@ -706,6 +708,13 @@ impl ConfigView {
                 scope: ConfigScope::Saved,
             },
             ConfigRow {
+                section: ConfigSection::Composer,
+                key: "workspace_follow_symlinks".to_string(),
+                value: settings.workspace_follow_symlinks.to_string(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
                 section: ConfigSection::Sidebar,
                 key: "sidebar_width".to_string(),
                 value: settings.sidebar_width_percent.to_string(),
@@ -1250,7 +1259,7 @@ fn config_hint_for_key(key: &str) -> &'static str {
         }
         "mcp_config_path" => "path to mcp.json",
         "fleet.exec.max_spawn_depth" => {
-            "0 blocks child agents; 3 default (same axis as sub-agents); capped at 3"
+            "0 blocks child agents; 3 default (same axis as sub-agents); capped at 8"
         }
         _ => "",
     }
@@ -1783,6 +1792,8 @@ fn live_subagent_result(
         nickname,
         status,
         worker_status: None,
+        parent_run_id: None,
+        spawn_depth: 0,
         result: None,
         steps_taken: 0,
         checkpoint: None,
@@ -1874,6 +1885,7 @@ impl ModalView for SubAgentsView {
                     SubAgentStatus::Interrupted(_) => interrupted.push(agent),
                     SubAgentStatus::Failed(_) => failed.push(agent),
                     SubAgentStatus::Cancelled => cancelled.push(agent),
+                    SubAgentStatus::BudgetExhausted => failed.push(agent),
                 }
             }
 
@@ -2149,6 +2161,11 @@ fn format_agent_status(
             Some(reason.as_str()),
         ),
         SubAgentStatus::Cancelled => ("cancelled", Style::default().fg(palette::TEXT_MUTED), None),
+        SubAgentStatus::BudgetExhausted => (
+            "budget_exhausted",
+            Style::default().fg(palette::STATUS_WARNING),
+            None,
+        ),
         SubAgentStatus::Failed(reason) => (
             "failed",
             Style::default().fg(palette::DEEPSEEK_RED),
@@ -2305,6 +2322,8 @@ mod tests {
             nickname: None,
             status,
             worker_status: None,
+            parent_run_id: None,
+            spawn_depth: 0,
             result: None,
             steps_taken: 1,
             checkpoint: None,

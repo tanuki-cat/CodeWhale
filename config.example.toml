@@ -42,9 +42,11 @@ base_url = "https://api.deepseek.com/beta"
 #   xiaomi/mimo-v2.5-pro          — OpenRouter Xiaomi MiMo 2.5 Pro
 #   xiaomi/mimo-v2.5              — OpenRouter Xiaomi MiMo 2.5
 #   z-ai/glm-5.1                  — OpenRouter Z.AI GLM 5.1
-#   z-ai/glm-5.2                  — OpenRouter Z.AI GLM 5.2 (opt-in preview)
-#   GLM-5.1                       — default direct Z.AI Coding Plan model
-#   GLM-5.2                       — direct Z.AI opt-in preview model
+#   z-ai/glm-5.2                  — OpenRouter Z.AI GLM 5.2 (default)
+#   z-ai/glm-5-turbo              — OpenRouter Z.AI GLM 5 Turbo (faster/explore sub-agent sibling)
+#   GLM-5.2                       — default direct Z.AI Coding Plan model
+#   GLM-5.1                       — direct Z.AI smaller model
+#   GLM-5-Turbo                   — direct Z.AI fast model (faster/explore sub-agent sibling)
 #   step-3.7-flash                — default direct StepFun / StepFlash model ID
 #   kimi-k2.6                       — default Moonshot/Kimi model ID
 #   gpt-4.1                         — default generic OpenAI-compatible model ID
@@ -251,6 +253,15 @@ max_subagents = 10 # optional (1-20)
 # [subagents]
 # max_concurrent = 10
 # api_timeout_secs = 120 # per-step API timeout, clamped to 1..=1800
+#
+# How many levels of nested sub-agents the `agent` tool may spawn:
+#   max_depth = 0   # opt out completely — the agent never spawns sub-agents
+#   max_depth = 1   # the agent may spawn sub-agents, but those may not spawn more
+#   max_depth = 2   # one more level of nesting, etc.
+# Unset defaults to 3; any value is clamped to the hard ceiling (3). The depth
+# limit is enforced in code, not requested of the model — a sub-agent past the
+# limit cannot be spawned regardless of what the model decides.
+# max_depth = 3
 
 # Optional managed policy paths (defaults to /etc/deepseek/*.toml on unix):
 # managed_config_path = "/etc/deepseek/managed_config.toml"
@@ -421,7 +432,7 @@ max_subagents = 10 # optional (1-20)
 # base_url = "https://api.z.ai/api/coding/paas/v4"
 # # General API endpoint, if you are not using the Coding Plan:
 # # base_url = "https://api.z.ai/api/paas/v4"
-# model = "GLM-5.1"                             # default; GLM-5.2 is opt-in preview
+# model = "GLM-5.2"                             # default; GLM-5.1 is the smaller model, GLM-5-Turbo the fast sub-agent sibling
 
 # StepFun / StepFlash direct OpenAI-compatible endpoint (https://platform.stepfun.com)
 [providers.stepfun]
@@ -579,6 +590,7 @@ max_subagents = 10 # optional (1-20)
 # [skills]
 # registry_url = "https://raw.githubusercontent.com/Hmbown/deepseek-skills/main/index.json"
 # max_install_size_bytes = 5_242_880
+# scan_codewhale_only = false # true: ignore Claude/OpenCode/Cursor/agentskills.io skill dirs
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # TUI

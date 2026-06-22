@@ -47,20 +47,13 @@ pub struct ProviderPickerView {
 impl ProviderPickerView {
     #[must_use]
     pub fn new(active: ApiProvider, config: &Config) -> Self {
-        // Present providers in neutral case-insensitive alphabetical order by
-        // display name (#3076) rather than leading with whichever provider sits
-        // first in `ApiProvider::all()` (historically DeepSeek). DeepSeek stays
-        // present and searchable; the active provider is highlighted via
-        // `selected_idx` below, so it is never lost in the list.
-        let mut providers: Vec<(ApiProvider, bool)> = ApiProvider::all()
-            .iter()
-            .map(|p| (*p, has_api_key_for(config, *p)))
+        // Present providers in the shared metadata display order (#3076). The
+        // active provider is highlighted via `selected_idx` below, so it is
+        // never lost in the list.
+        let providers: Vec<(ApiProvider, bool)> = ApiProvider::sorted_for_display()
+            .into_iter()
+            .map(|p| (p, has_api_key_for(config, p)))
             .collect();
-        providers.sort_by(|(a, _), (b, _)| {
-            a.display_name()
-                .to_ascii_lowercase()
-                .cmp(&b.display_name().to_ascii_lowercase())
-        });
         let selected_idx = providers
             .iter()
             .position(|(p, _)| *p == active)
@@ -109,33 +102,8 @@ impl ProviderPickerView {
         self.api_key_input.clear();
     }
 
-    fn env_var_for(provider: ApiProvider) -> &'static str {
-        match provider {
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN => "DEEPSEEK_API_KEY",
-            ApiProvider::NvidiaNim => "NVIDIA_API_KEY",
-            ApiProvider::Openai => "OPENAI_API_KEY",
-            ApiProvider::Anthropic => "ANTHROPIC_API_KEY",
-            ApiProvider::Atlascloud => "ATLASCLOUD_API_KEY",
-            ApiProvider::WanjieArk => "WANJIE_ARK_API_KEY",
-            ApiProvider::Volcengine => "VOLCENGINE_API_KEY",
-            ApiProvider::Openrouter => "OPENROUTER_API_KEY",
-            ApiProvider::XiaomiMimo => "XIAOMI_MIMO_API_KEY / XIAOMI_API_KEY / MIMO_API_KEY",
-            ApiProvider::Novita => "NOVITA_API_KEY",
-            ApiProvider::Fireworks => "FIREWORKS_API_KEY",
-            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => "SILICONFLOW_API_KEY",
-            ApiProvider::Arcee => "ARCEE_API_KEY",
-            ApiProvider::Moonshot => "MOONSHOT_API_KEY / KIMI_API_KEY",
-            ApiProvider::Sglang => "SGLANG_API_KEY",
-            ApiProvider::Vllm => "VLLM_API_KEY",
-            ApiProvider::Ollama => "OLLAMA_API_KEY",
-            ApiProvider::Huggingface => "HUGGINGFACE_API_KEY / HF_TOKEN",
-            ApiProvider::Deepinfra => "DEEPINFRA_API_KEY / DEEPINFRA_TOKEN",
-            ApiProvider::Together => "TOGETHER_API_KEY",
-            ApiProvider::OpenaiCodex => "OPENAI_CODEX_ACCESS_TOKEN / CODEX_ACCESS_TOKEN",
-            ApiProvider::Zai => "ZAI_API_KEY / Z_AI_API_KEY",
-            ApiProvider::Stepfun => "STEPFUN_API_KEY / STEP_API_KEY",
-            ApiProvider::Minimax => "MINIMAX_API_KEY",
-        }
+    fn env_var_for(provider: ApiProvider) -> String {
+        provider.env_vars_label()
     }
 
     fn provider_hint(provider: ApiProvider, has_key: bool) -> String {
@@ -147,7 +115,9 @@ impl ProviderPickerView {
             ApiProvider::XiaomiMimo => {
                 "(needs API key; token-plan endpoint by default)".to_string()
             }
-            ApiProvider::Ollama => "self-hosted; defaults to http://localhost:11434".to_string(),
+            ApiProvider::Ollama => {
+                format!("self-hosted; defaults to {}", provider.default_base_url())
+            }
             ApiProvider::Sglang | ApiProvider::Vllm if has_key => {
                 "(configured; optional key)".to_string()
             }
@@ -521,6 +491,22 @@ mod tests {
         );
         // DeepSeek is no longer hard-coded first.
         assert_ne!(names.first(), Some(&"DeepSeek"));
+    }
+
+    #[test]
+    fn key_entry_hint_uses_metadata_env_vars() {
+        assert_eq!(
+            ProviderPickerView::env_var_for(ApiProvider::NvidiaNim),
+            "NVIDIA_API_KEY / NVIDIA_NIM_API_KEY / DEEPSEEK_API_KEY"
+        );
+    }
+
+    #[test]
+    fn ollama_hint_uses_metadata_default_base_url() {
+        assert!(
+            ProviderPickerView::provider_hint(ApiProvider::Ollama, true)
+                .contains(ApiProvider::Ollama.default_base_url())
+        );
     }
 
     #[test]

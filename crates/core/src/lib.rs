@@ -18,7 +18,7 @@ use codewhale_protocol::{
     ResponseChannel, ReviewDecision, Thread, ThreadForkParams, ThreadGoal, ThreadGoalClearParams,
     ThreadGoalGetParams, ThreadGoalProgressParams, ThreadGoalSetParams, ThreadGoalStatus,
     ThreadListParams, ThreadReadParams, ThreadRequest, ThreadResponse, ThreadResumeParams,
-    ThreadSetNameParams, ThreadStatus, ToolPayload,
+    ThreadSetNameParams, ThreadStatus, ToolPayload, UserInputRequestEvent,
 };
 use codewhale_state::{
     JobStateRecord, JobStateStatus, SessionSource, StateStore, ThreadGoalRecord,
@@ -1382,6 +1382,48 @@ impl Runtime {
             }));
         }
 
+        // Headless `request_user_input`: mirror the approval fire-and-return
+        // branch (issue #3102). The TUI intercepts this tool by name before
+        // dispatch and blocks on a reply channel; the headless runtime instead
+        // emits a typed `UserInputRequest` frame and returns a
+        // `user_input_required` status so the client can render the question
+        // and POST answers back via `AppRequest::SubmitUserInput`. It does NOT
+        // block — consistent with the headless approval model, which has no
+        // resume channel either.
+        if call.name == REQUEST_USER_INPUT_TOOL_NAME {
+            let request_id = format!("user-input-{}", Uuid::new_v4());
+            let arguments = match &call.payload {
+                ToolPayload::Function { arguments } => arguments.as_str(),
+                // Custom/Mcp/LocalShell can't carry a user_input payload; fall
+                // through to the generic dispatch error below.
+                _ => "",
+            };
+            let maybe_frame = user_input_request_frame(
+                call_id.clone(),
+                response_id.clone(),
+                request_id.clone(),
+                arguments,
+            );
+            let mut events = Vec::new();
+            if let Some(frame) = maybe_frame {
+                self.hooks
+                    .emit(HookEvent::GenericEventFrame {
+                        frame: Box::new(frame.clone()),
+                    })
+                    .await;
+                events.push(event_frame_payload(&frame));
+            }
+            return Ok(json!({
+                "ok": false,
+                "status": "user_input_required",
+                "execution_kind": execution_kind,
+                "response_id": response_id,
+                "request_id": request_id,
+                "precheck": precheck,
+                "events": events,
+            }));
+        }
+
         let start_frame = EventFrame::ToolCallStart {
             response_id: response_id.clone(),
             tool_name: call.name.clone(),
@@ -1853,6 +1895,33 @@ fn approval_request_frame(
     })
 }
 
+/// Build an [`EventFrame::UserInputRequest`] for a headless
+/// `request_user_input` tool call, mirroring [`approval_request_frame`].
+///
+/// `arguments` is the raw JSON arguments string the model supplied to the
+/// `request_user_input` tool (a `ToolPayload::Function` body). On parse
+/// failure we return `None` so the caller falls through to the generic tool
+/// error path rather than silently dropping the request.
+fn user_input_request_frame(
+    call_id: String,
+    turn_id: String,
+    request_id: String,
+    arguments: &str,
+) -> Option<EventFrame> {
+    let parsed: Value = serde_json::from_str(arguments).ok()?;
+    // Extract the `questions` array and lift it into the headless event
+    // shape. We tolerate missing `allow_free_text`/`multi_select` (default
+    // false) and extra fields, matching the lenient TUI `from_value` path.
+    let questions = parsed.get("questions").cloned().filter(Value::is_array)?;
+    let request = UserInputRequestEvent {
+        call_id,
+        turn_id,
+        request_id,
+        questions: serde_json::from_value(questions).ok()?,
+    };
+    Some(EventFrame::UserInputRequest { request })
+}
+
 fn approval_requirement_payload(requirement: &ExecApprovalRequirement) -> Value {
     match requirement {
         ExecApprovalRequirement::Skip {
@@ -1922,6 +1991,13 @@ fn event_frame_payload(frame: &EventFrame) -> Value {
     serde_json::to_value(frame)
         .unwrap_or_else(|_| json!({"event":"error","message":"failed to encode event frame"}))
 }
+
+/// Tool name that triggers the headless clarification-question flow.
+///
+/// Mirrors the TUI's `REQUEST_USER_INPUT_NAME`
+/// (`crates/tui/src/core/engine/tool_catalog.rs`); duplicated here rather than
+/// depended on across crates so `core` stays free of `tui` imports.
+const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
 
 fn json_optional_string(value: &Value) -> Option<String> {
     if value.is_null() {
@@ -2210,6 +2286,56 @@ mod tests {
             Some("tool=exec_shell command=cargo test")
         );
         assert_eq!(request.reason, requirement.reason());
+    }
+
+    #[test]
+    fn user_input_request_frame_lifts_questions_from_arguments() {
+        // issue #3102: the headless frame constructor must parse the model's
+        // `request_user_input` arguments and lift the questions into the
+        // UserInputRequestEvent, defaulting the boolean flags when omitted.
+        let arguments = r#"{"questions":[{"header":"Scope","id":"scope","question":"Which?","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}],"allow_free_text":true}]}"#;
+        let frame = user_input_request_frame(
+            "call-1".to_string(),
+            "turn-1".to_string(),
+            "ui-1".to_string(),
+            arguments,
+        )
+        .expect("user input frame");
+
+        let EventFrame::UserInputRequest { request } = frame else {
+            panic!("expected user_input_request frame");
+        };
+        assert_eq!(request.call_id, "call-1");
+        assert_eq!(request.turn_id, "turn-1");
+        assert_eq!(request.request_id, "ui-1");
+        assert_eq!(request.questions.len(), 1);
+        assert_eq!(request.questions[0].id, "scope");
+        assert!(request.questions[0].allow_free_text);
+        // multi_select omitted in the payload → defaults to false.
+        assert!(!request.questions[0].multi_select);
+        assert_eq!(request.questions[0].options.len(), 2);
+    }
+
+    #[test]
+    fn user_input_request_frame_returns_none_on_invalid_arguments() {
+        // On parse failure the constructor returns None so invoke_tool falls
+        // through to the generic tool error path instead of silently dropping.
+        let frame = user_input_request_frame(
+            "call-1".to_string(),
+            "turn-1".to_string(),
+            "ui-1".to_string(),
+            "not json",
+        );
+        assert!(frame.is_none());
+
+        // Valid JSON but missing the questions array is also rejected.
+        let frame = user_input_request_frame(
+            "call-1".to_string(),
+            "turn-1".to_string(),
+            "ui-1".to_string(),
+            r#"{"foo":"bar"}"#,
+        );
+        assert!(frame.is_none());
     }
 
     #[test]

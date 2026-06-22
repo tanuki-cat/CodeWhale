@@ -1,5 +1,6 @@
 # Build artifacts
 /target
+/extensions/vscode/out/
 *.pdb
 *.exe
 *.dll
@@ -40,6 +41,7 @@ dist/
 outputs/
 tmp/
 backup/
+/web/lib/facts.generated.ts
 
 # Reference papers / large research blobs (keep locally if needed, don't ship)
 docs/DeepSeek_V4.pdf
@@ -131,7 +133,10 @@ scripts/**/__pycache__/
 .harbor-datasets/
 .pinchbench-skill/
 .terminal-bench-datasets/
+.venv-bench/
 .uv-bin/
+.uv-cache/
+.uv-tools/
 codewhale__*.json
 issues/
 logs/

@@ -9,6 +9,7 @@ use crate::models::{Message, SystemPrompt};
 use crate::tools::goal::GoalStatus;
 use crate::tui::app::AppMode;
 use crate::tui::approval::ApprovalMode;
+use codewhale_protocol::runtime::DynamicToolSpec;
 use std::path::PathBuf;
 
 /// Prefix used for tool-call ids created by local composer shell shortcuts.
@@ -24,6 +25,44 @@ pub struct SessionSnapshot {
     pub workspace: PathBuf,
     pub system_prompt: Option<SystemPrompt>,
     pub mode: String,
+}
+
+/// Origin of text being introduced as a user-role turn.
+///
+/// Chat providers force several runtime/control-plane signals through
+/// `role = "user"` for compatibility, so role alone is not authority.
+#[allow(dead_code)] // Some origins are reserved for ingestion sites landing after the first gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserInputProvenance {
+    /// Text typed or submitted through the active UI/API input boundary.
+    ExternalUser,
+    /// Runtime-generated continuation, diagnostic, or tool feedback.
+    Runtime,
+    /// Completion/event text from a child worker or sub-agent handoff.
+    SubAgentHandoff,
+    /// Text restored from a saved/imported transcript.
+    ImportedTranscript,
+    /// Text recalled from memory or another persisted source.
+    MemoryRecall,
+    /// Assistant-authored text that is shaped like a user response.
+    AssistantGenerated,
+}
+
+impl UserInputProvenance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExternalUser => "external_user",
+            Self::Runtime => "runtime",
+            Self::SubAgentHandoff => "subagent_handoff",
+            Self::ImportedTranscript => "imported_transcript",
+            Self::MemoryRecall => "memory_recall",
+            Self::AssistantGenerated => "assistant_generated",
+        }
+    }
+
+    pub fn can_authorize_work(self) -> bool {
+        matches!(self, Self::ExternalUser)
+    }
 }
 
 /// Operations that can be submitted to the engine.
@@ -58,10 +97,15 @@ pub enum Op {
         /// Tool restriction from custom slash command frontmatter.
         /// `None` means the current turn may use the normal tool set.
         allowed_tools: Option<Vec<String>>,
+        /// Runtime-supplied tools available only for this turn.
+        dynamic_tools: Vec<DynamicToolSpec>,
         /// Hook executor for control-plane hooks.
         /// `ToolCallBefore` hooks may deny a tool call with exit code 2.
         hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
         verbosity: Option<String>,
+        /// Structural input origin. This gates whether the turn may inherit
+        /// YOLO/auto-approval authority; user-shaped text is not enough.
+        provenance: UserInputProvenance,
     },
 
     /// Execute a user-submitted composer shell command (`! <command>`) without
@@ -73,6 +117,16 @@ pub enum Op {
         trust_mode: bool,
         auto_approve: bool,
         approval_mode: ApprovalMode,
+    },
+
+    /// Set the runtime goal status without dispatching a model turn. Used by
+    /// `/goal pause`, `/goal resume`, `/goal clear`, etc. so the engine's
+    /// `SharedGoalState` learns the new status immediately and a queued
+    /// continuation doesn't overwrite it back to Active.
+    SetGoalStatus {
+        status: GoalStatus,
+        /// When `true`, clear the objective entirely (`/goal clear`).
+        clear: bool,
     },
 
     /// Cancel the current request
@@ -107,6 +161,16 @@ pub enum Op {
 
     /// Update the SSE idle timeout used for subsequent streamed turns.
     SetStreamChunkTimeout { timeout_secs: u64 },
+
+    /// Update sub-agent runtime controls for subsequent turns.
+    SetSubagentRuntimeConfig {
+        enabled: bool,
+        max_subagents: usize,
+        launch_concurrency: usize,
+        max_spawn_depth: u32,
+        api_timeout_secs: u64,
+        heartbeat_timeout_secs: u64,
+    },
 
     /// Sync engine session state (used for resume/load)
     SyncSession {

@@ -329,6 +329,25 @@ impl Default for ModelRegistry {
                 supports_reasoning: true,
             },
             ModelInfo {
+                id: "z-ai/glm-5-turbo".to_string(),
+                provider: ProviderKind::Openrouter,
+                aliases: vec!["glm-5-turbo".to_string(), "zai-glm-5-turbo".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "GLM-5.2".to_string(),
+                provider: ProviderKind::Zai,
+                aliases: vec![
+                    "glm-5.2".to_string(),
+                    "glm-5-2".to_string(),
+                    "zai-glm-5.2".to_string(),
+                    "zai-glm-5-2".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
                 id: "GLM-5.1".to_string(),
                 provider: ProviderKind::Zai,
                 aliases: vec![
@@ -341,13 +360,12 @@ impl Default for ModelRegistry {
                 supports_reasoning: true,
             },
             ModelInfo {
-                id: "GLM-5.2".to_string(),
+                id: "GLM-5-Turbo".to_string(),
                 provider: ProviderKind::Zai,
                 aliases: vec![
-                    "glm-5.2".to_string(),
-                    "glm-5-2".to_string(),
-                    "zai-glm-5.2".to_string(),
-                    "zai-glm-5-2".to_string(),
+                    "glm-5-turbo".to_string(),
+                    "glm-5turbo".to_string(),
+                    "zai-glm-5-turbo".to_string(),
                 ],
                 supports_tools: true,
                 supports_reasoning: true,
@@ -1395,9 +1413,10 @@ mod tests {
     fn zai_direct_models_resolve_when_provider_hinted() {
         let registry = ModelRegistry::default();
 
+        // GLM-5.2 is now the default direct Z.AI model.
         let default = registry.resolve(None, Some(ProviderKind::Zai));
         assert_eq!(default.resolved.provider, ProviderKind::Zai);
-        assert_eq!(default.resolved.id, "GLM-5.1");
+        assert_eq!(default.resolved.id, "GLM-5.2");
 
         for (alias, expected) in [
             ("GLM-5.1", "GLM-5.1"),
@@ -1405,6 +1424,9 @@ mod tests {
             ("GLM-5.2", "GLM-5.2"),
             ("glm-5.2", "GLM-5.2"),
             ("zai-glm-5-2", "GLM-5.2"),
+            ("GLM-5-Turbo", "GLM-5-Turbo"),
+            ("glm-5-turbo", "GLM-5-Turbo"),
+            ("zai-glm-5-turbo", "GLM-5-Turbo"),
         ] {
             let resolved = registry.resolve(Some(alias), Some(ProviderKind::Zai));
 

@@ -29,7 +29,9 @@ use crate::config::MAX_SUBAGENTS;
 use crate::core::events::Event;
 use crate::dependencies::{ExternalTool, Git};
 use crate::llm_client::LlmClient;
-use crate::models::{ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt, Tool};
+use crate::models::{
+    ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt, Tool, Usage,
+};
 use crate::request_tuning::RequestTuning;
 use crate::tools::handle::VarHandle;
 use crate::tools::plan::{PlanState, SharedPlanState};
@@ -37,7 +39,9 @@ use crate::tools::registry::{ToolRegistry, ToolRegistryBuilder};
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
 };
-use crate::tools::todo::{SharedTodoList, TodoList};
+use crate::tools::todo::SharedTodoList;
+#[cfg(test)]
+use crate::tools::todo::TodoList;
 use crate::tui::app::ReasoningEffort;
 use crate::utils::spawn_supervised;
 use crate::worker_profile::{ModelRoute, ToolScope, WorkerRuntimeProfile};
@@ -72,6 +76,7 @@ fn release_resident_leases_for(agent_id: &str) {
 /// the `SubAgentManager`.
 const DEFAULT_MAX_STEPS: u32 = u32::MAX;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+const MIN_SUBAGENT_SPAWN_TOKEN_RESERVE: u64 = 1;
 
 /// Format a step counter for sub-agent progress messages.
 ///
@@ -89,6 +94,8 @@ fn format_step_counter(steps: u32, max_steps: u32) -> String {
 // the requested ceiling.
 const SUBAGENT_RESPONSE_MAX_TOKENS: u32 = 16_384;
 const MAX_CONSECUTIVE_TRUNCATED_SUBAGENT_RESPONSES: u32 = 5;
+const SUBAGENT_TRANSIENT_PROVIDER_MAX_RETRIES: u32 = 2;
+const SUBAGENT_TRANSIENT_PROVIDER_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 /// Per-step LLM API call timeout. Each `create_message` request must complete
 /// within this window or the step is treated as timed out. Prevents a single
 /// stuck API call from blocking the sub-agent indefinitely.
@@ -106,6 +113,7 @@ const MAX_AGENT_WORKER_RECORDS: usize = 256;
 const MAX_AGENT_WORKER_EVENTS_PER_RECORD: usize = 128;
 const SUBAGENT_STATE_SCHEMA_VERSION: u32 = 1;
 const SUBAGENT_STATE_FILE: &str = "subagents.v1.json";
+const SUBAGENT_WORKTREE_ROOT_DIR: &str = ".codewhale-worktrees";
 const SUBAGENT_RESTART_REASON: &str = "Interrupted by process restart";
 const SUBAGENT_QUEUED_LAUNCH_REASON: &str = "queued: waiting for a sub-agent launch slot";
 const SUBAGENT_MODEL_WAIT_REASON: &str = "waiting for model response";
@@ -590,6 +598,11 @@ pub enum SubAgentStatus {
     Interrupted(String),
     Failed(String),
     Cancelled,
+    /// Worker stopped because it exceeded its own per-worker token budget.
+    /// Distinct from the scope-level admission gate (#3319): this caps a
+    /// single runaway worker mid-run, while the scope gate bounds total
+    /// fan-out across a root run and its descendants.
+    BudgetExhausted,
 }
 
 /// Structured reason a non-running sub-agent needs parent action.
@@ -622,6 +635,10 @@ pub struct SubAgentResult {
     pub status: SubAgentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_status: Option<AgentWorkerStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    #[serde(default)]
+    pub spawn_depth: u32,
     pub result: Option<String>,
     pub steps_taken: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -748,7 +765,19 @@ pub struct AgentRunArtifactRef {
 pub struct AgentRunUsage {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_spent_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_remaining_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_scope: Option<String>,
     pub note: String,
 }
 
@@ -888,8 +917,51 @@ fn default_agent_run_takeover() -> AgentRunTakeoverTarget {
 fn default_agent_run_usage() -> AgentRunUsage {
     AgentRunUsage {
         status: "unknown".to_string(),
+        input_tokens: None,
+        output_tokens: None,
         total_tokens: None,
+        token_budget: None,
+        budget_spent_tokens: None,
+        budget_remaining_tokens: None,
+        budget_scope: None,
         note: "Token usage is not yet reported by the sub-agent worker ledger.".to_string(),
+    }
+}
+
+fn positive_token_budget(budget: Option<u64>) -> Option<u64> {
+    budget.filter(|value| *value > 0)
+}
+
+fn usage_total_tokens(usage: &Usage) -> u64 {
+    u64::from(usage.input_tokens).saturating_add(u64::from(usage.output_tokens))
+}
+
+fn refresh_usage_note(usage: &mut AgentRunUsage) {
+    let worker_total = usage.total_tokens.unwrap_or(0);
+    if let Some(limit) = usage.token_budget {
+        let spent = usage.budget_spent_tokens.unwrap_or(worker_total);
+        let remaining = usage
+            .budget_remaining_tokens
+            .unwrap_or_else(|| limit.saturating_sub(spent));
+        usage.status = if remaining == 0 {
+            "budget_exhausted".to_string()
+        } else if worker_total > 0 {
+            "reported".to_string()
+        } else {
+            "tracking".to_string()
+        };
+        usage.note = if worker_total > 0 {
+            format!(
+                "Token budget: {spent}/{limit} spent, {remaining} remaining. This worker reported {worker_total} tokens."
+            )
+        } else {
+            format!("Token budget: {spent}/{limit} spent, {remaining} remaining.")
+        };
+    } else if worker_total > 0 {
+        usage.status = "reported".to_string();
+        usage.note = format!("Provider reported {worker_total} tokens for this worker.");
+    } else if usage.status.is_empty() {
+        *usage = default_agent_run_usage();
     }
 }
 
@@ -1118,6 +1190,8 @@ fn normalize_worker_record(mut record: AgentWorkerRecord) -> AgentWorkerRecord {
     }
     if record.usage.status.is_empty() {
         record.usage = default_agent_run_usage();
+    } else {
+        refresh_usage_note(&mut record.usage);
     }
     if record.verification.status.is_empty() {
         record.verification = default_agent_run_verification();
@@ -1159,6 +1233,7 @@ pub(crate) struct SubAgentSpawnOptions {
     pub model_route: Option<ModelRoute>,
     pub nickname: Option<String>,
     pub fork_context: bool,
+    pub token_budget: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1230,11 +1305,13 @@ struct SpawnRequest {
     model: Option<String>,
     model_strength: SubAgentModelStrength,
     thinking: SubAgentThinking,
-    /// Optional working directory for the child. Must canonicalize to a
-    /// path inside the parent's workspace. Used to dispatch parallel work
-    /// into separate git worktrees: parent runs `git worktree add` first,
-    /// then spawns children with the worktree path as `cwd`.
+    /// Optional working directory for the child. Must canonicalize to a path
+    /// inside the parent's workspace. For first-class git worktree isolation,
+    /// use `worktree` instead of pre-creating a cwd by hand.
     cwd: Option<PathBuf>,
+    /// Optional first-class git worktree isolation. When set, CodeWhale
+    /// creates a sibling worktree/branch and runs the child from that checkout.
+    worktree: Option<SubAgentWorktreeRequest>,
     /// Optional file path for cache-aware resident mode (#529). When set,
     /// the child's prompt is prefixed with the file contents for prefix-cache
     /// locality. A global ownership table prevents two agents from holding
@@ -1246,6 +1323,25 @@ struct SpawnRequest {
     /// Legacy recursion budget for descendants. The model-facing child tool
     /// surface is leaf-only; this remains for persisted/internal records.
     max_depth: Option<u32>,
+    /// Optional aggregate token budget for this child and its descendants.
+    /// When unset, the child inherits the parent's budget pool or the
+    /// configured root default.
+    token_budget: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubAgentWorktreeRequest {
+    branch: Option<String>,
+    path: Option<PathBuf>,
+    base_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentUsageBudgetScope {
+    scope_id: String,
+    limit: u64,
+    spent: u64,
+    remaining: u64,
 }
 
 /// Durable recovery point for an interrupted sub-agent session.
@@ -1318,7 +1414,7 @@ impl Default for PersistedSubAgentState {
 }
 
 /// Default cap on sub-agent recursion depth. Override via
-/// `[runtime] max_spawn_depth = N` in config.
+/// `[subagents] max_depth = N` in config.
 ///
 /// Sourced from [`codewhale_config::DEFAULT_SPAWN_DEPTH`] so standalone
 /// sub-agents and fleet workers share ONE recursion axis (no "two moving
@@ -1326,10 +1422,12 @@ impl Default for PersistedSubAgentState {
 /// [`codewhale_config::MAX_SPAWN_DEPTH_CEILING`].
 pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = codewhale_config::DEFAULT_SPAWN_DEPTH;
 
-/// Terminal-state notification emitted to the engine's parent turn loop
-/// when one of its direct children finishes (issue #756). Carries the
-/// already-rendered `<codewhale:subagent.done>` sentinel that the model
-/// expects in the transcript per `prompts/constitution.md`.
+/// Terminal-state notification emitted to the immediate parent's completion
+/// inbox when one of its children finishes (issue #756). For root-spawned
+/// agents that inbox is the engine turn loop; for nested agents it is a
+/// parent-local receiver inside `run_subagent`. Carries the already-rendered
+/// `<codewhale:subagent.done>` sentinel that the model expects in the
+/// transcript per `prompts/constitution.md`.
 #[derive(Debug, Clone)]
 pub struct SubAgentCompletion {
     /// The completing child's agent id. Held for routing/logging — the
@@ -1380,6 +1478,11 @@ pub struct SubAgentRuntime {
     /// Depth in the spawn tree. 0 = top-level user turn; 1 = direct child;
     /// etc. Children clone the parent runtime and increment this on spawn.
     pub spawn_depth: u32,
+    /// Agent id that should be recorded as parent for any child spawned
+    /// through this runtime's model-visible `agent` tool. `None` for the
+    /// root engine; set to the running sub-agent id for nested spawns so UI
+    /// surfaces can render the tree.
+    pub parent_agent_id: Option<String>,
     /// Hard cap on recursion depth. A child whose `spawn_depth + 1` would
     /// exceed this is rejected at the spawn entry. Use `>` (strictly
     /// greater than) so equality is allowed — matches codex's pattern.
@@ -1392,11 +1495,12 @@ pub struct SubAgentRuntime {
     /// whole spawn tree publishes into one ordered, fan-out-able mailbox.
     /// `None` only when no consumer is wired (legacy entry points / tests).
     pub mailbox: Option<Mailbox>,
-    /// Wakeup channel for the engine's parent turn loop (issue #756). Only
-    /// the engine's direct children fire on this — propagated to descendants
-    /// via clone but gated to `spawn_depth == 1` at the send site so the
-    /// parent isn't flooded with grandchild completions it didn't directly
-    /// orchestrate. `None` when no consumer is wired (tests / legacy paths).
+    /// Wakeup channel for this runtime's immediate parent (issue #756). For
+    /// the engine's direct children this points at the engine turn loop. While
+    /// a sub-agent is running, its tool registry swaps this for a local inbox
+    /// so nested children report to their orchestrating sub-agent instead of
+    /// flooding the root parent. `None` when no consumer is wired (tests /
+    /// legacy paths).
     pub parent_completion_tx: Option<mpsc::UnboundedSender<SubAgentCompletion>>,
     /// Snapshot of the request prefix visible to an opt-in forked child.
     pub fork_context: Option<SubAgentForkContext>,
@@ -1412,6 +1516,11 @@ pub struct SubAgentRuntime {
     /// child registries. Keeps parent and sub-agent `speech` / `tts` tools on
     /// the same `[speech].output_dir` / env override.
     pub speech_output_dir: Option<PathBuf>,
+    /// Shared todo list — the parent's `SharedTodoList`, cloned into each
+    /// child so sub-agent `checklist_update` calls are visible in the
+    /// Work sidebar live. Without this, each child gets a fresh isolated
+    /// list and the parent never sees child progress until completion.
+    pub todos: SharedTodoList,
 }
 
 impl SubAgentRuntime {
@@ -1441,6 +1550,7 @@ impl SubAgentRuntime {
             event_tx,
             manager,
             spawn_depth: 0,
+            parent_agent_id: None,
             max_spawn_depth: DEFAULT_MAX_SPAWN_DEPTH,
             cancel_token: CancellationToken::new(),
             mailbox: None,
@@ -1449,7 +1559,17 @@ impl SubAgentRuntime {
             mcp_pool: None,
             step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
             speech_output_dir: None,
+            todos: crate::tools::todo::new_shared_todo_list(),
         }
+    }
+
+    /// Attach the parent's shared todo list so sub-agent `checklist_update`
+    /// calls are visible in the Work sidebar live. Without this, children
+    /// get a fresh isolated list.
+    #[must_use]
+    pub fn with_todos(mut self, todos: SharedTodoList) -> Self {
+        self.todos = todos;
+        self
     }
 
     /// Attach an MCP pool so the subagent can execute MCP tools.
@@ -1479,10 +1599,10 @@ impl SubAgentRuntime {
         self
     }
 
-    /// Attach the wakeup channel so the engine's parent turn loop can resume
-    /// when this runtime's direct children finish (issue #756). The channel
-    /// is propagated to descendants via clone, but only `spawn_depth == 1`
-    /// agents fire on it — see `run_subagent_task`.
+    /// Attach the wakeup channel for this runtime's immediate parent. The
+    /// engine uses this for direct children; running sub-agents replace it in
+    /// the runtime handed to their nested `agent` tool so child completions are
+    /// routed back to the sub-agent that spawned them.
     #[must_use]
     pub fn with_parent_completion_tx(
         mut self,
@@ -1520,7 +1640,7 @@ impl SubAgentRuntime {
     }
 
     /// Override the maximum spawn depth (default `DEFAULT_MAX_SPAWN_DEPTH`).
-    /// Used by config wiring (`[runtime] max_spawn_depth = N`) and tests.
+    /// Used by config wiring (`[subagents] max_depth = N`) and tests.
     #[must_use]
     #[allow(dead_code)]
     pub fn with_max_spawn_depth(mut self, max: u32) -> Self {
@@ -1594,6 +1714,7 @@ impl SubAgentRuntime {
             event_tx: self.event_tx.clone(),
             manager: self.manager.clone(),
             spawn_depth: self.spawn_depth + 1,
+            parent_agent_id: self.parent_agent_id.clone(),
             max_spawn_depth: self.max_spawn_depth,
             cancel_token: self.cancel_token.child_token(),
             mailbox: self.mailbox.clone(),
@@ -1602,6 +1723,7 @@ impl SubAgentRuntime {
             mcp_pool: self.mcp_pool.clone(),
             step_api_timeout: self.step_api_timeout,
             speech_output_dir: self.speech_output_dir.clone(),
+            todos: self.todos.clone(),
         }
     }
 
@@ -1701,6 +1823,8 @@ impl SubAgent {
             nickname: self.nickname.clone(),
             status: self.status.clone(),
             worker_status: None,
+            parent_run_id: None,
+            spawn_depth: 0,
             result: self.result.clone(),
             steps_taken: self.steps_taken,
             checkpoint: self.checkpoint.clone(),
@@ -1725,6 +1849,8 @@ pub struct SubAgentManager {
     state_path: Option<PathBuf>,
     max_steps: u32,
     max_agents: usize,
+    max_admitted_agents: usize,
+    default_token_budget: Option<u64>,
     running_heartbeat_timeout: Duration,
     /// Stable id assigned at manager construction (#405). Stamped on
     /// every agent the manager spawns; agents loaded from the
@@ -1761,6 +1887,8 @@ impl SubAgentManager {
             state_path: None,
             max_steps: DEFAULT_MAX_STEPS,
             max_agents,
+            max_admitted_agents: max_agents,
+            default_token_budget: None,
             running_heartbeat_timeout: Duration::from_secs(
                 crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS,
             ),
@@ -1780,6 +1908,23 @@ impl SubAgentManager {
     #[must_use]
     pub fn with_launch_concurrency(mut self, limit: usize) -> Self {
         self.launch_gate = Arc::new(Semaphore::new(limit.clamp(1, self.max_agents)));
+        self
+    }
+
+    /// Set the total queued + running admission ceiling for this manager.
+    /// The value is always at least the instantaneous concurrency cap.
+    #[must_use]
+    pub fn with_admission_limit(mut self, max_admitted: usize) -> Self {
+        self.max_admitted_agents =
+            max_admitted.clamp(self.max_agents, crate::config::MAX_SUBAGENT_ADMISSION);
+        self
+    }
+
+    /// Set the default aggregate token budget for root sub-agent runs.
+    /// `None` and `Some(0)` both preserve unlimited legacy behavior.
+    #[must_use]
+    pub fn with_default_token_budget(mut self, budget: Option<u64>) -> Self {
+        self.default_token_budget = positive_token_budget(budget);
         self
     }
 
@@ -1812,6 +1957,35 @@ impl SubAgentManager {
             timeout
         };
         self
+    }
+
+    /// Apply live runtime limits. The launch semaphore is replaced only when
+    /// no sub-agent is currently running, because active tasks may still hold
+    /// permits from the previous semaphore.
+    pub fn update_runtime_limits(
+        &mut self,
+        max_agents: usize,
+        max_admitted_agents: usize,
+        running_heartbeat_timeout: Duration,
+        launch_concurrency: usize,
+        default_token_budget: Option<u64>,
+    ) -> bool {
+        self.max_agents = max_agents.clamp(1, crate::config::MAX_SUBAGENTS);
+        self.max_admitted_agents =
+            max_admitted_agents.clamp(self.max_agents, crate::config::MAX_SUBAGENT_ADMISSION);
+        self.default_token_budget = positive_token_budget(default_token_budget);
+        self.running_heartbeat_timeout = if running_heartbeat_timeout.is_zero() {
+            Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS)
+        } else {
+            running_heartbeat_timeout
+        };
+        if self.running_count() == 0 {
+            self.launch_gate =
+                Arc::new(Semaphore::new(launch_concurrency.clamp(1, self.max_agents)));
+            true
+        } else {
+            false
+        }
     }
 
     fn persist_state(&self) -> Result<()> {
@@ -1990,6 +2164,7 @@ impl SubAgentManager {
             self.worker_records
                 .insert(worker.spec.worker_id.clone(), worker);
         }
+        self.refresh_all_budget_scopes();
         self.prune_worker_records();
 
         Ok(())
@@ -2041,6 +2216,139 @@ impl SubAgentManager {
 
     pub fn get_worker_record(&self, worker_id: &str) -> Option<AgentWorkerRecord> {
         self.worker_records.get(worker_id).cloned()
+    }
+
+    fn aggregate_budget_spent(&self, scope_id: &str) -> u64 {
+        self.worker_records
+            .values()
+            .filter(|record| record.usage.budget_scope.as_deref() == Some(scope_id))
+            .fold(0_u64, |total, record| {
+                total.saturating_add(record.usage.total_tokens.unwrap_or(0))
+            })
+    }
+
+    fn inherited_budget_scope(&self, parent_run_id: Option<&str>) -> Option<(String, u64)> {
+        let parent = self.worker_records.get(parent_run_id?)?;
+        let limit = parent.usage.token_budget?;
+        let scope_id = parent
+            .usage
+            .budget_scope
+            .clone()
+            .unwrap_or_else(|| parent.spec.worker_id.clone());
+        Some((scope_id, limit))
+    }
+
+    fn resolve_spawn_budget_scope(
+        &self,
+        worker_id: &str,
+        parent_run_id: Option<&str>,
+        requested_budget: Option<u64>,
+    ) -> Result<Option<AgentUsageBudgetScope>> {
+        let scope = if let Some(limit) = positive_token_budget(requested_budget) {
+            Some((worker_id.to_string(), limit))
+        } else if let Some(parent_scope) = self.inherited_budget_scope(parent_run_id) {
+            Some(parent_scope)
+        } else {
+            self.default_token_budget
+                .map(|limit| (worker_id.to_string(), limit))
+        };
+
+        let Some((scope_id, limit)) = scope else {
+            return Ok(None);
+        };
+        let spent = self.aggregate_budget_spent(&scope_id);
+        let remaining = limit.saturating_sub(spent);
+        if remaining < MIN_SUBAGENT_SPAWN_TOKEN_RESERVE {
+            return Err(anyhow!(
+                "Sub-agent token budget exhausted for scope {scope_id}: {spent}/{limit} tokens spent, {remaining} remaining. Wait for the parent/Workflow to summarize results or start a new agent run with an explicit token_budget override."
+            ));
+        }
+        Ok(Some(AgentUsageBudgetScope {
+            scope_id,
+            limit,
+            spent,
+            remaining,
+        }))
+    }
+
+    fn attach_budget_scope(&mut self, worker_id: &str, scope: AgentUsageBudgetScope) {
+        let Some(record) = self.worker_records.get_mut(worker_id) else {
+            return;
+        };
+        record.usage.token_budget = Some(scope.limit);
+        record.usage.budget_scope = Some(scope.scope_id.clone());
+        record.usage.budget_spent_tokens = Some(scope.spent);
+        record.usage.budget_remaining_tokens = Some(scope.remaining);
+        refresh_usage_note(&mut record.usage);
+        self.refresh_budget_scope(&scope.scope_id);
+    }
+
+    fn refresh_budget_scope(&mut self, scope_id: &str) {
+        let Some(limit) = self
+            .worker_records
+            .values()
+            .find(|record| record.usage.budget_scope.as_deref() == Some(scope_id))
+            .and_then(|record| record.usage.token_budget)
+        else {
+            return;
+        };
+        let spent = self.aggregate_budget_spent(scope_id);
+        let remaining = limit.saturating_sub(spent);
+        for record in self.worker_records.values_mut() {
+            if record.usage.budget_scope.as_deref() == Some(scope_id) {
+                record.usage.token_budget = Some(limit);
+                record.usage.budget_spent_tokens = Some(spent);
+                record.usage.budget_remaining_tokens = Some(remaining);
+                refresh_usage_note(&mut record.usage);
+            }
+        }
+    }
+
+    fn refresh_all_budget_scopes(&mut self) {
+        let scope_ids = self
+            .worker_records
+            .values()
+            .filter_map(|record| record.usage.budget_scope.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for scope_id in scope_ids {
+            self.refresh_budget_scope(&scope_id);
+        }
+    }
+
+    fn record_worker_usage(&mut self, worker_id: &str, usage: &Usage) {
+        let now_ms = epoch_millis_now();
+        let total_delta = usage_total_tokens(usage);
+        let Some(record) = self.worker_records.get_mut(worker_id) else {
+            return;
+        };
+        record.updated_at_ms = now_ms;
+        record.usage.input_tokens = Some(
+            record
+                .usage
+                .input_tokens
+                .unwrap_or(0)
+                .saturating_add(u64::from(usage.input_tokens)),
+        );
+        record.usage.output_tokens = Some(
+            record
+                .usage
+                .output_tokens
+                .unwrap_or(0)
+                .saturating_add(u64::from(usage.output_tokens)),
+        );
+        record.usage.total_tokens = Some(
+            record
+                .usage
+                .total_tokens
+                .unwrap_or(0)
+                .saturating_add(total_delta),
+        );
+        let scope_id = record.usage.budget_scope.clone();
+        refresh_usage_note(&mut record.usage);
+        if let Some(scope_id) = scope_id {
+            self.refresh_budget_scope(&scope_id);
+        }
+        self.persist_state_debounced();
     }
 
     fn push_worker_event(
@@ -2118,6 +2426,7 @@ impl SubAgentManager {
             SubAgentStatus::Failed(err) => Some(err.clone()),
             SubAgentStatus::Interrupted(reason) => Some(reason.clone()),
             SubAgentStatus::Cancelled => Some("cancelled".to_string()),
+            SubAgentStatus::BudgetExhausted => Some("token budget exhausted".to_string()),
             SubAgentStatus::Running => Some("running".to_string()),
         };
         self.record_worker_event(worker_id, status, message, Some(result.steps_taken), None);
@@ -2170,8 +2479,44 @@ impl SubAgentManager {
         }
     }
 
+    pub fn cancel_agent(&mut self, agent_ref: &str) -> Result<SubAgentResult> {
+        let agent_id = self.resolve_agent_ref(agent_ref)?;
+        let snapshot = {
+            let agent = self
+                .agents
+                .get_mut(&agent_id)
+                .ok_or_else(|| anyhow!("Agent {agent_id} not found"))?;
+            if agent.status != SubAgentStatus::Running {
+                return Ok(agent.snapshot());
+            }
+            agent.status = SubAgentStatus::Cancelled;
+            agent.result = Some("Cancelled by parent request.".to_string());
+            release_resident_leases_for(&agent.id);
+            if let Some(handle) = agent.task_handle.take() {
+                handle.abort();
+            }
+            agent.input_tx = None;
+            agent.snapshot()
+        };
+        self.record_worker_event(
+            &agent_id,
+            AgentWorkerStatus::Cancelled,
+            snapshot.result.clone(),
+            Some(snapshot.steps_taken),
+            None,
+        );
+        self.persist_state_best_effort();
+        Ok(snapshot)
+    }
+
     /// Count running agents.
     pub fn running_count(&self) -> usize {
+        self.admitted_count()
+    }
+
+    /// Count live sub-agents that have been admitted, including queued
+    /// workers waiting on the launch gate.
+    pub fn admitted_count(&self) -> usize {
         self.agents
             .values()
             .filter(|agent| {
@@ -2189,6 +2534,41 @@ impl SubAgentManager {
                 !self.running_heartbeat_timed_out(agent)
             })
             .count()
+    }
+
+    /// Count admitted workers that are currently waiting for the launch gate.
+    pub fn queued_count(&self) -> usize {
+        self.agents
+            .values()
+            .filter(|agent| {
+                agent.status == SubAgentStatus::Running
+                    && agent.task_handle.is_some()
+                    && !self.running_heartbeat_timed_out(agent)
+                    && self
+                        .worker_records
+                        .get(&agent.id)
+                        .is_some_and(|record| record.status == AgentWorkerStatus::Queued)
+            })
+            .count()
+    }
+
+    /// Count admitted workers not currently in the queued launch state.
+    pub fn active_count(&self) -> usize {
+        self.admitted_count().saturating_sub(self.queued_count())
+    }
+
+    fn check_admission_capacity(&self) -> Result<()> {
+        let admitted = self.admitted_count();
+        if admitted >= self.max_admitted_agents {
+            return Err(anyhow!(
+                "Sub-agent admission limit reached (max_admitted {}, admitted {}, running {}, queued {}). Wait for queued/running agents to finish, cancel unneeded agents, or raise [subagents] max_admitted for this Workflow.",
+                self.max_admitted_agents,
+                admitted,
+                self.active_count(),
+                self.queued_count()
+            ));
+        }
+        Ok(())
     }
 
     fn running_heartbeat_timed_out(&self, agent: &SubAgent) -> bool {
@@ -2263,19 +2643,18 @@ impl SubAgentManager {
     ) -> Result<SubAgentResult> {
         self.cleanup(COMPLETED_AGENT_RETENTION);
 
-        if self.running_count() >= self.max_agents {
-            return Err(anyhow!(
-                "Sub-agent limit reached (max {}, running {}). Cancel, close, or wait for an existing agent to finish. Consider issuing multiple tool calls in one turn (the dispatcher runs them in parallel) for parallel one-shot work.",
-                self.max_agents,
-                self.running_count()
-            ));
-        }
+        self.check_admission_capacity()?;
 
         if let Some(model) = options.model.as_deref() {
             runtime.model = model.to_string();
         }
         let effective_model = runtime.model.clone();
         let agent_id = format!("agent_{}", &Uuid::new_v4().to_string()[..8]);
+        let budget_scope = self.resolve_spawn_budget_scope(
+            &agent_id,
+            runtime.parent_agent_id.as_deref(),
+            options.token_budget,
+        )?;
         let active_names: std::collections::HashSet<String> = self
             .agents
             .values()
@@ -2348,7 +2727,7 @@ impl SubAgentManager {
         let worker_spec = AgentWorkerSpec {
             worker_id: agent_id.clone(),
             run_id: agent_id.clone(),
-            parent_run_id: None,
+            parent_run_id: runtime.parent_agent_id.clone(),
             session_name: Some(agent.session_name.clone()),
             objective: assignment.objective.clone(),
             role: assignment.role.clone(),
@@ -2370,11 +2749,16 @@ impl SubAgentManager {
             max_spawn_depth: runtime.max_spawn_depth,
         };
         self.register_worker(worker_spec);
+        if let Some(scope) = budget_scope {
+            self.attach_budget_scope(&agent_id, scope);
+        }
 
         if let Some(event_tx) = runtime.event_tx.clone() {
             let _ = event_tx.try_send(Event::AgentSpawned {
                 id: agent_id.clone(),
                 prompt: prompt.clone(),
+                parent_run_id: runtime.parent_agent_id.clone(),
+                spawn_depth: runtime.spawn_depth,
             });
         }
 
@@ -2390,6 +2774,7 @@ impl SubAgentManager {
             fork_context: options.fork_context,
             started_at,
             max_steps,
+            token_budget: options.token_budget,
             input_rx,
             launch_gate,
         };
@@ -2416,6 +2801,32 @@ impl SubAgentManager {
             .get(agent_id)
             .ok_or_else(|| anyhow!("Agent {agent_id} not found"))?;
         Ok(agent.snapshot())
+    }
+
+    pub fn get_result_by_ref(&self, agent_ref: &str) -> Result<SubAgentResult> {
+        let agent_id = self.resolve_agent_ref(agent_ref)?;
+        self.get_result(&agent_id)
+    }
+
+    pub fn terminal_results_excluding(
+        &self,
+        delivered_ids: &std::collections::HashSet<String>,
+    ) -> Vec<SubAgentResult> {
+        let mut results = self
+            .agents
+            .values()
+            .filter(|agent| agent.status != SubAgentStatus::Running)
+            .filter(|agent| agent.session_boot_id == self.current_session_boot_id)
+            .filter(|agent| {
+                self.worker_records
+                    .get(&agent.id)
+                    .is_none_or(|record| record.spec.parent_run_id.is_none())
+            })
+            .filter(|agent| !delivered_ids.contains(&agent.id))
+            .map(SubAgent::snapshot)
+            .collect::<Vec<_>>();
+        results.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+        results
     }
 
     /// Resolve either a durable agent id or a model-facing session name.
@@ -2450,10 +2861,14 @@ impl SubAgentManager {
     fn snapshot_for_listing(&self, agent: &SubAgent) -> SubAgentResult {
         let mut snap = agent.snapshot();
         snap.from_prior_session = self.is_from_prior_session(agent);
-        snap.worker_status = self
-            .worker_records
-            .get(&agent.id)
-            .map(|record| record.status);
+        if let Some(record) = self.worker_records.get(&agent.id) {
+            snap.worker_status = Some(record.status);
+            snap.parent_run_id = record
+                .parent_run_id
+                .clone()
+                .or_else(|| record.spec.parent_run_id.clone());
+            snap.spawn_depth = record.spec.spawn_depth;
+        }
         snap
     }
 
@@ -2932,8 +3347,10 @@ pub fn new_shared_subagent_manager(workspace: PathBuf, max_agents: usize) -> Sha
     new_shared_subagent_manager_with_timeout(
         workspace,
         max_agents,
+        max_agents,
         Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS),
         max_agents,
+        None,
     )
 }
 
@@ -2943,14 +3360,18 @@ pub fn new_shared_subagent_manager(workspace: PathBuf, max_agents: usize) -> Sha
 pub fn new_shared_subagent_manager_with_timeout(
     workspace: PathBuf,
     max_agents: usize,
+    max_admitted_agents: usize,
     running_heartbeat_timeout: Duration,
     launch_concurrency: usize,
+    default_token_budget: Option<u64>,
 ) -> SharedSubAgentManager {
     let max_agents = max_agents.clamp(1, MAX_SUBAGENTS);
     let state_path = default_state_path(&workspace);
     let mut manager = SubAgentManager::new(workspace, max_agents)
+        .with_admission_limit(max_admitted_agents)
         .with_running_heartbeat_timeout(running_heartbeat_timeout)
         .with_launch_concurrency(launch_concurrency)
+        .with_default_token_budget(default_token_budget)
         .with_state_path(state_path);
     if let Err(err) = manager.load_state() {
         // Routed through tracing instead of stderr — see comment in
@@ -2975,6 +3396,36 @@ impl AgentTool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentToolAction {
+    Start,
+    Status,
+    Peek,
+    Cancel,
+}
+
+fn parse_agent_tool_action(input: &Value) -> Result<AgentToolAction, ToolError> {
+    let Some(action) = optional_input_str(input, &["action", "op"]) else {
+        return Ok(AgentToolAction::Start);
+    };
+    match action.trim().to_ascii_lowercase().as_str() {
+        "" | "start" | "spawn" | "run" => Ok(AgentToolAction::Start),
+        "status" | "list" | "inspect" => Ok(AgentToolAction::Status),
+        "peek" | "progress" => Ok(AgentToolAction::Peek),
+        "cancel" | "stop" | "abort" => Ok(AgentToolAction::Cancel),
+        other => Err(ToolError::invalid_input(format!(
+            "Invalid agent action '{other}'. Use start, status, peek, or cancel."
+        ))),
+    }
+}
+
+fn parse_agent_ref(input: &Value) -> Option<String> {
+    optional_input_str(input, &["agent_id", "id", "session_name", "name"])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 #[async_trait]
 impl ToolSpec for AgentTool {
     fn name(&self) -> &'static str {
@@ -2983,9 +3434,10 @@ impl ToolSpec for AgentTool {
 
     fn description(&self) -> &'static str {
         concat!(
-            "Start one focused child agent task. Use this only for independent work that benefits from a clean context. ",
+            "Start, inspect, peek at, or cancel focused child agent tasks through one surface. Use start only for independent work that benefits from a clean context. ",
+            "For several independent targets, call agent separately for each target; CodeWhale runs or queues them under runtime capacity and provider rate-limit backpressure. ",
             "The child runs in the background and reports back automatically when finished; keep tiny reads/searches local. ",
-            "Returns a session projection with the generated agent_id and transcript_handle for UI/debug inspection."
+            "Use action=status or action=peek with agent_id to inspect progress, and action=cancel with agent_id to stop a running child. Returns session projections with transcript_handle for UI/debug inspection."
         )
     }
 
@@ -2993,13 +3445,26 @@ impl ToolSpec for AgentTool {
         json!({
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["start", "status", "peek", "cancel"],
+                    "description": "start (default) launches a child. status lists current children or inspects agent_id. peek is status for one child. cancel stops a running child by agent_id."
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Agent id or session name for action=status, action=peek, or action=cancel."
+                },
+                "include_archived": {
+                    "type": "boolean",
+                    "description": "For action=status without agent_id, include prior-session completed agents."
+                },
                 "name": {
                     "type": "string",
-                    "description": "Optional stable session name. Defaults to the generated agent_id."
+                    "description": "For action=start, optional stable session name. For status/peek/cancel, accepted as an alias for agent_id."
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Focused task for the child agent"
+                    "description": "Focused task for the child agent. Prefer a compact Subagent Brief with QUESTION, SCOPE, ALREADY_KNOWN, EFFORT, STOP_CONDITION, and OUTPUT."
                 },
                 "type": {
                     "type": "string",
@@ -3008,7 +3473,7 @@ impl ToolSpec for AgentTool {
                 "model_strength": {
                     "type": "string",
                     "enum": ["same", "faster"],
-                    "description": "Optional child model strength. Use same (default) when the child should be as capable as the current model. Use faster for type=explore, read-only lookup/search, status, or other low-risk tasks that can run on a smaller/faster same-family sibling; CodeWhale maps known families such as DeepSeek V4 Pro to Flash and GLM-5.2 to GLM-5.1. No hidden auto-downgrade happens."
+                    "description": "Optional child model strength. Use same when the child should be as capable as the current model. Use faster for type=explore, read-only lookup/search, status, or other low-risk tasks that can run on a smaller/faster same-family sibling; CodeWhale maps known families such as DeepSeek V4 Pro to Flash and GLM-5.2 to GLM-5-Turbo. type=explore defaults to faster unless you pass model_strength or model explicitly. No hidden auto-downgrade happens."
                 },
                 "model": {
                     "type": "string",
@@ -3021,7 +3486,23 @@ impl ToolSpec for AgentTool {
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Optional working directory for the child; must be inside the parent workspace"
+                    "description": "Optional pre-existing working directory for the child; must be inside the parent workspace. Prefer worktree=true for isolated parallel edit tasks."
+                },
+                "worktree": {
+                    "type": "boolean",
+                    "description": "When true, create a fresh git worktree and branch for this child before it starts. Use for parallel edit tasks that must not collide with the parent checkout."
+                },
+                "worktree_branch": {
+                    "type": "string",
+                    "description": "Optional branch name for worktree=true. Defaults to codex/agent-<name>-<id>."
+                },
+                "worktree_base": {
+                    "type": "string",
+                    "description": "Optional git ref to branch the worktree from. Defaults to HEAD in the parent checkout."
+                },
+                "worktree_path": {
+                    "type": "string",
+                    "description": "Optional worktree checkout path. Relative paths are created under the default sibling .codewhale-worktrees directory, not inside the parent checkout."
                 },
                 "fork_context": {
                     "type": "boolean",
@@ -3032,9 +3513,14 @@ impl ToolSpec for AgentTool {
                     "minimum": 0,
                     "maximum": 3,
                     "description": "Optional remaining nested-agent depth budget for this child. Defaults to the configured runtime budget."
+                },
+                "token_budget": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional aggregate token budget for this child and descendants. When unset, the child inherits the parent budget pool or the configured root default."
                 }
             },
-            "required": ["prompt"]
+            "required": []
         })
     }
 
@@ -3050,6 +3536,22 @@ impl ToolSpec for AgentTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        let action = parse_agent_tool_action(&input)?;
+        match action {
+            AgentToolAction::Start => {}
+            AgentToolAction::Status | AgentToolAction::Peek => {
+                return inspect_agent_from_input(
+                    &input,
+                    self.manager.clone(),
+                    context,
+                    matches!(action, AgentToolAction::Peek),
+                )
+                .await;
+            }
+            AgentToolAction::Cancel => {
+                return cancel_agent_from_input(&input, self.manager.clone(), context).await;
+            }
+        }
         let snapshot =
             spawn_subagent_from_input(input, self.manager.clone(), self.runtime.clone()).await?;
         let worker_record = {
@@ -3069,6 +3571,95 @@ impl ToolSpec for AgentTool {
     }
 }
 
+async fn inspect_agent_from_input(
+    input: &Value,
+    manager: SharedSubAgentManager,
+    context: &ToolContext,
+    peek: bool,
+) -> Result<ToolResult, ToolError> {
+    let include_archived =
+        parse_optional_bool(input, &["include_archived", "includeArchived"]).unwrap_or(false);
+
+    if let Some(agent_ref) = parse_agent_ref(input) {
+        let (snapshot, worker_record) = {
+            let manager = manager.read().await;
+            let snapshot = manager
+                .get_result_by_ref(&agent_ref)
+                .map_err(|err| ToolError::invalid_input(err.to_string()))?;
+            let worker_record = manager.get_worker_record(&snapshot.agent_id);
+            (snapshot, worker_record)
+        };
+        let projection =
+            subagent_session_projection(snapshot, include_archived, context, worker_record).await;
+        let mut tool_result = ToolResult::json(&projection)
+            .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+        tool_result.metadata = Some(json!({
+            "action": if peek { "peek" } else { "status" },
+            "status": projection.status,
+            "terminal": projection.terminal,
+            "agent_id": projection.agent_id,
+        }));
+        return Ok(tool_result);
+    }
+
+    let snapshots = {
+        let manager = manager.read().await;
+        manager
+            .list_filtered(include_archived)
+            .into_iter()
+            .map(|snapshot| {
+                let worker_record = manager.get_worker_record(&snapshot.agent_id);
+                (snapshot, worker_record)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut projections = Vec::with_capacity(snapshots.len());
+    for (snapshot, worker_record) in snapshots {
+        projections.push(
+            subagent_session_projection(snapshot, include_archived, context, worker_record).await,
+        );
+    }
+    let payload = json!({
+        "action": if peek { "peek" } else { "status" },
+        "count": projections.len(),
+        "agents": projections,
+    });
+    let mut tool_result =
+        ToolResult::json(&payload).map_err(|err| ToolError::execution_failed(err.to_string()))?;
+    tool_result.metadata = Some(json!({
+        "action": if peek { "peek" } else { "status" },
+        "count": payload["count"],
+    }));
+    Ok(tool_result)
+}
+
+async fn cancel_agent_from_input(
+    input: &Value,
+    manager: SharedSubAgentManager,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let agent_ref = parse_agent_ref(input).ok_or_else(|| ToolError::missing_field("agent_id"))?;
+    let (snapshot, worker_record) = {
+        let mut manager = manager.write().await;
+        let snapshot = manager
+            .cancel_agent(&agent_ref)
+            .map_err(|err| ToolError::invalid_input(err.to_string()))?;
+        let worker_record = manager.get_worker_record(&snapshot.agent_id);
+        (snapshot, worker_record)
+    };
+    let projection = subagent_session_projection(snapshot, false, context, worker_record).await;
+    let mut tool_result = ToolResult::json(&projection)
+        .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+    tool_result.metadata = Some(json!({
+        "action": "cancel",
+        "status": projection.status,
+        "terminal": projection.terminal,
+        "agent_id": projection.agent_id,
+    }));
+    Ok(tool_result)
+}
+
 async fn spawn_subagent_from_input(
     input: Value,
     manager: SharedSubAgentManager,
@@ -3079,45 +3670,33 @@ async fn spawn_subagent_from_input(
     if runtime.would_exceed_depth() {
         return Err(ToolError::execution_failed(format!(
             "Sub-agent depth limit reached (current depth {}, max {}). \
-             Increase via [runtime] max_spawn_depth in config.toml.",
+             Increase via [subagents] max_depth in config.toml.",
             runtime.spawn_depth, runtime.max_spawn_depth
         )));
     }
 
-    let validated_cwd = if let Some(requested_cwd) = spawn_request.cwd.as_ref() {
-        let parent_workspace = &runtime.context.workspace;
-        let resolved = if requested_cwd.is_absolute() {
-            requested_cwd.clone()
-        } else {
-            parent_workspace.join(requested_cwd)
-        };
-        let canonical = resolved.canonicalize().map_err(|e| {
-            ToolError::invalid_input(format!(
-                "Invalid cwd '{}': {e} (path may not exist yet — create the worktree first)",
-                requested_cwd.display()
-            ))
-        })?;
-        let workspace_canonical = parent_workspace
-            .canonicalize()
-            .unwrap_or_else(|_| parent_workspace.clone());
-        if !canonical.starts_with(&workspace_canonical) {
-            return Err(ToolError::invalid_input(format!(
-                "cwd must be inside the parent workspace: {} is not under {}",
-                canonical.display(),
-                workspace_canonical.display()
-            )));
-        }
-        Some(canonical)
-    } else {
-        None
-    };
+    if let Some(remaining) = crate::retry_status::rate_limit_remaining() {
+        let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+        return Err(ToolError::execution_failed(format!(
+            "Provider is rate-limiting; sub-agent spawning is paused for {seconds}s. \
+             Wait for the current backoff window before starting new agent work."
+        )));
+    }
+
+    if spawn_request.worktree.is_some() {
+        let manager_guard = manager.read().await;
+        manager_guard
+            .check_admission_capacity()
+            .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+    }
+    let child_workspace = prepare_child_workspace(&runtime.context.workspace, &spawn_request)?;
 
     let mut child_runtime = runtime.background_runtime();
     if let Some(max_depth) = spawn_request.max_depth {
         child_runtime.max_spawn_depth = child_runtime.spawn_depth.saturating_add(max_depth);
     }
-    if let Some(cwd) = validated_cwd {
-        child_runtime.context.workspace = cwd;
+    if let Some(workspace) = child_workspace {
+        child_runtime.context.workspace = workspace;
     }
     let configured_model = match spawn_request.model.clone() {
         Some(model) => Some(normalize_requested_subagent_model(
@@ -3192,6 +3771,7 @@ async fn spawn_subagent_from_input(
                 model_route: Some(model_route),
                 nickname: None,
                 fork_context: spawn_request.fork_context,
+                token_budget: spawn_request.token_budget,
             },
         )
         .map_err(|e| ToolError::execution_failed(format!("Failed to spawn sub-agent: {e}")))?;
@@ -3312,6 +3892,12 @@ struct SubAgentTask {
     fork_context: bool,
     started_at: Instant,
     max_steps: u32,
+    /// Per-worker token cap sourced from the spawn request's `token_budget`
+    /// (the explicit `max_tokens`/`tokenBudget` override). `None` means no
+    /// per-worker limit; the worker still obeys the scope admission gate.
+    /// When set, the worker stops with `BudgetExhausted` once its accumulated
+    /// model tokens exceed this value. Independent of the scope budget (#3319).
+    token_budget: Option<u64>,
     input_rx: mpsc::UnboundedReceiver<SubAgentInput>,
     /// Interactive launch gate (#3095). `Some` only for direct (depth-1)
     /// children: the task acquires a permit before its first model step and
@@ -3353,6 +3939,7 @@ async fn run_subagent_task(task: SubAgentTask) {
         task.fork_context,
         task.started_at,
         task.max_steps,
+        task.token_budget,
         task.input_rx,
     )
     .await;
@@ -3365,10 +3952,18 @@ async fn run_subagent_task(task: SubAgentTask) {
     // text.
     let model_id = task.runtime.model.clone();
     let (summary, sentinel) = match &result {
-        Ok(res) => (
-            summarize_subagent_result(res),
-            subagent_done_sentinel(&task.agent_id, res),
-        ),
+        Ok(res) => {
+            // Issue #2652: the child's free-text result is its self-report, not
+            // verified evidence. Stamp it with a provenance marker: a soft
+            // "re-verify" note when short, or a head+tail truncation (reusing
+            // the tool-output vocabulary) when it exceeds the wire budget. The
+            // resulting `truncated` flag is carried in the sentinel so the
+            // parent model can branch on `summary_kind`.
+            let raw = summarize_subagent_result(res);
+            let (summary, truncated) = stamp_subagent_summary(&raw);
+            let sentinel = subagent_done_sentinel(&task.agent_id, res, truncated);
+            (summary, sentinel)
+        }
         Err(err) => {
             let annotated = annotate_child_model_error(&err.to_string(), &model_id);
             (
@@ -3459,21 +4054,24 @@ async fn record_queued_launch_progress(task: &SubAgentTask) {
         task.runtime.mailbox.as_ref(),
         &task.agent_id,
         SUBAGENT_QUEUED_LAUNCH_REASON.to_string(),
+        task.runtime.parent_agent_id.clone(),
+        task.runtime.spawn_depth,
     );
 }
 
-/// Notify the engine's parent turn loop that a direct child finished
-/// (issue #756). Returns `true` if a send was attempted, `false` if the
-/// notification was skipped because this isn't a direct child or no channel
-/// is wired. Skips silently when the channel sender has no receiver — the
-/// engine outlives the runtime, so a dropped receiver means we're shutting
-/// down anyway.
+/// Notify this runtime's immediate parent that the child finished (issue
+/// #756). Root-spawned children send to the engine turn loop. Nested children
+/// send to the parent sub-agent's local inbox, which is swapped into the
+/// runtime used by that parent's `agent` tool. Returns `true` if a send was
+/// attempted, `false` if this is the engine itself or no channel is wired.
+/// Skips silently when the channel sender has no receiver — the receiver may
+/// have ended because the parent turn/agent already completed.
 pub(crate) fn emit_parent_completion(
     runtime: &SubAgentRuntime,
     agent_id: &str,
     payload: &str,
 ) -> bool {
-    if runtime.spawn_depth != 1 {
+    if runtime.spawn_depth == 0 {
         return false;
     }
     let Some(tx) = runtime.parent_completion_tx.as_ref() else {
@@ -3486,6 +4084,19 @@ pub(crate) fn emit_parent_completion(
     true
 }
 
+pub(crate) fn subagent_completion_from_result(result: &SubAgentResult) -> SubAgentCompletion {
+    let raw = summarize_subagent_result(result);
+    let (summary, truncated) = stamp_subagent_summary(&raw);
+    let sentinel = match &result.status {
+        SubAgentStatus::Failed(error) => subagent_failed_sentinel(&result.agent_id, error),
+        _ => subagent_done_sentinel(&result.agent_id, result, truncated),
+    };
+    SubAgentCompletion {
+        agent_id: result.agent_id.clone(),
+        payload: format!("{summary}\n{sentinel}"),
+    }
+}
+
 /// Build a `<codewhale:subagent.done>` JSON sentinel for a successful child.
 /// Intended to surface in the parent's transcript so the model recognizes
 /// child completion.
@@ -3494,7 +4105,12 @@ pub(crate) fn emit_parent_completion(
 /// line immediately before the sentinel; duplicating it here bloats the next
 /// parent request's cache-miss tail. Wall-clock duration is useful UI
 /// telemetry, but it is volatile and not useful for model coordination.
-fn subagent_done_sentinel(agent_id: &str, res: &SubAgentResult) -> String {
+///
+/// `truncated` reflects whether the previous-line summary was length-gated by
+/// [`stamp_subagent_summary`] (issue #2652); it surfaces as `summary_kind` so
+/// the parent model can tell a complete self-report from a clipped one and
+/// verify material claims accordingly.
+fn subagent_done_sentinel(agent_id: &str, res: &SubAgentResult, truncated: bool) -> String {
     let mut payload = json!({
         "agent_id": agent_id,
         // Whale name — a stable, human-friendly handle the orchestrator can use
@@ -3503,6 +4119,9 @@ fn subagent_done_sentinel(agent_id: &str, res: &SubAgentResult) -> String {
         "agent_type": res.agent_type.as_str(),
         "status": subagent_status_name(&res.status),
         "summary_location": "previous_line",
+        // issue #2652: lets the parent branch on whether the previous-line
+        // summary is the full child report or a head+tail excerpt.
+        "summary_kind": if truncated { "truncated" } else { "complete" },
     });
     if let Some(needs_input) = res.needs_input.clone() {
         payload["needs_input"] = json!(needs_input);
@@ -3645,6 +4264,103 @@ fn needs_input_for_interrupted_checkpoint(
     }
 }
 
+#[derive(Debug)]
+enum SubAgentApiRequestFailure {
+    Fatal(anyhow::Error),
+    Interrupted {
+        reason: String,
+        checkpoint_reason: &'static str,
+    },
+}
+
+fn subagent_transient_provider_retry_delay(retry_number: u32) -> Duration {
+    let multiplier = 1u32
+        .checked_shl(retry_number.saturating_sub(1))
+        .unwrap_or(4);
+    SUBAGENT_TRANSIENT_PROVIDER_INITIAL_BACKOFF.saturating_mul(multiplier.min(4))
+}
+
+fn is_transient_subagent_provider_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    [
+        "did not receive response headers",
+        "response headers",
+        "stream request",
+        "request timed out",
+        "operation timed out",
+        "deadline has elapsed",
+        "connection reset",
+        "connection closed",
+        "connection aborted",
+        "temporarily unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "service unavailable",
+        "502",
+        "503",
+        "504",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+async fn request_subagent_model_response_with_retries(
+    runtime: &SubAgentRuntime,
+    agent_id: &str,
+    steps: u32,
+    max_steps: u32,
+    request: MessageRequest,
+) -> std::result::Result<MessageResponse, SubAgentApiRequestFailure> {
+    let mut transient_failures = 0u32;
+
+    loop {
+        match tokio::time::timeout(
+            runtime.step_api_timeout,
+            runtime.client.create_message(request.clone()),
+        )
+        .await
+        {
+            Ok(Ok(response)) => return Ok(response),
+            Ok(Err(err)) if is_transient_subagent_provider_error(&err) => {
+                if transient_failures >= SUBAGENT_TRANSIENT_PROVIDER_MAX_RETRIES {
+                    let attempts = transient_failures.saturating_add(1);
+                    return Err(SubAgentApiRequestFailure::Interrupted {
+                        reason: format!(
+                            "Transient provider failure after {attempts} API attempt(s): {err}; checkpoint preserved for continuation"
+                        ),
+                        checkpoint_reason: "api_transient_provider_failure",
+                    });
+                }
+
+                transient_failures = transient_failures.saturating_add(1);
+                let delay = subagent_transient_provider_retry_delay(transient_failures);
+                record_agent_progress(
+                    runtime,
+                    agent_id,
+                    format!(
+                        "{}: transient provider failure; retrying API request {}/{} in {}ms ({err})",
+                        format_step_counter(steps, max_steps),
+                        transient_failures,
+                        SUBAGENT_TRANSIENT_PROVIDER_MAX_RETRIES,
+                        delay.as_millis(),
+                    ),
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Ok(Err(err)) => return Err(SubAgentApiRequestFailure::Fatal(err)),
+            Err(_) => {
+                return Err(SubAgentApiRequestFailure::Interrupted {
+                    reason: format!(
+                        "API call timed out after {}ms; checkpoint preserved for continuation",
+                        runtime.step_api_timeout.as_millis()
+                    ),
+                    checkpoint_reason: "api_timeout",
+                });
+            }
+        }
+    }
+}
+
 fn record_agent_progress(runtime: &SubAgentRuntime, agent_id: &str, message: impl Into<String>) {
     let message = message.into();
     if let Ok(mut manager) = runtime.manager.try_write() {
@@ -3656,7 +4372,64 @@ fn record_agent_progress(runtime: &SubAgentRuntime, agent_id: &str, message: imp
         runtime.mailbox.as_ref(),
         agent_id,
         message,
+        runtime.parent_agent_id.clone(),
+        runtime.spawn_depth,
     );
+}
+
+fn runtime_for_nested_agent_tools(
+    runtime: &SubAgentRuntime,
+    parent_agent_id: &str,
+    fork_context: SubAgentForkContext,
+) -> (SubAgentRuntime, mpsc::UnboundedReceiver<SubAgentCompletion>) {
+    let (child_completion_tx, child_completion_rx) =
+        mpsc::unbounded_channel::<SubAgentCompletion>();
+    let runtime_for_tools = runtime
+        .clone()
+        .with_parent_completion_tx(child_completion_tx)
+        .with_fork_context(fork_context);
+    let runtime_for_tools = SubAgentRuntime {
+        parent_agent_id: Some(parent_agent_id.to_string()),
+        ..runtime_for_tools
+    };
+    (runtime_for_tools, child_completion_rx)
+}
+
+fn drain_child_completion_events(
+    child_completion_rx: &mut mpsc::UnboundedReceiver<SubAgentCompletion>,
+) -> Vec<SubAgentCompletion> {
+    let mut completions = Vec::new();
+    while let Ok(completion) = child_completion_rx.try_recv() {
+        completions.push(completion);
+    }
+    completions
+}
+
+fn child_completion_runtime_message(completions: &[SubAgentCompletion]) -> Message {
+    let mut text = String::from(
+        "<codewhale:runtime_event kind=\"child_subagent_completion\" visibility=\"internal\">\n\
+This is an internal runtime event, not user input. One or more child sub-agents \
+you spawned have finished. Treat each child summary as an unverified self-report: \
+if you rely on it, cite the child agent_id and the EVIDENCE lines it provided, \
+and distinguish that from evidence you personally verified.\n",
+    );
+    for completion in completions {
+        text.push_str("\n--- child sub-agent completion ---\n");
+        text.push_str("agent_id: ");
+        text.push_str(&completion.agent_id);
+        text.push('\n');
+        text.push_str(&completion.payload);
+        text.push('\n');
+    }
+    text.push_str("</codewhale:runtime_event>");
+
+    Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text,
+            cache_control: None,
+        }],
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3670,6 +4443,7 @@ async fn run_subagent(
     fork_context: bool,
     started_at: Instant,
     max_steps: u32,
+    token_budget: Option<u64>,
     mut input_rx: mpsc::UnboundedReceiver<SubAgentInput>,
 ) -> Result<SubAgentResult> {
     let system_prompt = build_subagent_system_prompt(&agent_type, &assignment);
@@ -3680,16 +4454,30 @@ async fn run_subagent(
     let request_system = subagent_request_system_prompt(&system_prompt, fork_context);
     let mut messages =
         build_initial_subagent_messages(&prompt, &assignment, &agent_type, fork_context);
-    let runtime_for_tools = runtime.clone().with_fork_context(SubAgentForkContext {
-        system: Some(request_system.clone()),
-        messages: messages.clone(),
-        structured_state_block: None,
-    });
-    let tool_registry = SubAgentToolRegistry::new(
+    let (runtime_for_tools, mut child_completion_rx) = runtime_for_nested_agent_tools(
+        runtime,
+        &agent_id,
+        SubAgentForkContext {
+            system: Some(request_system.clone()),
+            messages: messages.clone(),
+            structured_state_block: None,
+        },
+    );
+    let tool_registry = SubAgentToolRegistry::new_with_owner(
         runtime_for_tools,
         agent_type.clone(),
+        agent_id.clone(),
+        assignment
+            .role
+            .as_deref()
+            .filter(|role| !role.trim().is_empty())
+            .unwrap_or(agent_type.as_str())
+            .to_string(),
         allowed_tools.clone(),
-        Arc::new(Mutex::new(TodoList::new())),
+        // Share the parent's todo list so child checklist updates are visible
+        // in the Work sidebar live. Previously each child got a fresh isolated
+        // TodoList — parent never saw child progress until completion.
+        runtime.todos.clone(),
         Arc::new(Mutex::new(PlanState::default())),
     );
     let unavailable_tools = tool_registry.unavailable_allowed_tools();
@@ -3714,6 +4502,7 @@ async fn run_subagent(
     let mut pending_inputs: VecDeque<SubAgentInput> = VecDeque::new();
     let mut consecutive_truncated_responses = 0;
     let mut latest_checkpoint: Option<SubAgentCheckpoint> = None;
+    let mut tokens_used: u64 = 0;
 
     for _step in 0..max_steps {
         // Cooperative cancellation: bail if this session's token was cancelled
@@ -3764,6 +4553,8 @@ async fn run_subagent(
                 nickname: None,
                 status,
                 worker_status: None,
+                parent_run_id: runtime.parent_agent_id.clone(),
+                spawn_depth: runtime.spawn_depth,
                 result: None,
                 steps_taken: steps,
                 checkpoint: latest_checkpoint.clone(),
@@ -3800,6 +4591,20 @@ async fn run_subagent(
                     }],
                 });
             }
+        }
+
+        let child_completions = drain_child_completion_events(&mut child_completion_rx);
+        if !child_completions.is_empty() {
+            let count = child_completions.len();
+            record_agent_progress(
+                runtime,
+                &agent_id,
+                format!(
+                    "{}: received {count} child sub-agent completion(s)",
+                    format_step_counter(steps, max_steps)
+                ),
+            );
+            messages.push(child_completion_runtime_message(&child_completions));
         }
 
         let request = MessageRequest {
@@ -3873,6 +4678,8 @@ async fn run_subagent(
                     nickname: None,
                     status,
                     worker_status: None,
+                    parent_run_id: runtime.parent_agent_id.clone(),
+                    spawn_depth: runtime.spawn_depth,
                     result: None,
                     steps_taken: steps,
                     checkpoint: latest_checkpoint.clone(),
@@ -3881,18 +4688,21 @@ async fn run_subagent(
                     from_prior_session: false,
                 });
             }
-            api = tokio::time::timeout(runtime.step_api_timeout, runtime.client.create_message(request)) => {
+            api = request_subagent_model_response_with_retries(
+                runtime,
+                &agent_id,
+                steps,
+                max_steps,
+                request,
+            ) => {
                 match api {
-                    Ok(response) => response?,
-                    Err(_) => {
-                        let reason = format!(
-                            "API call timed out after {}ms; checkpoint preserved for continuation",
-                            runtime.step_api_timeout.as_millis()
-                        );
+                    Ok(response) => response,
+                    Err(SubAgentApiRequestFailure::Fatal(err)) => return Err(err),
+                    Err(SubAgentApiRequestFailure::Interrupted { reason, checkpoint_reason }) => {
                         let checkpoint = checkpoint_subagent_progress(
                             runtime,
                             &agent_id,
-                            "api_timeout",
+                            checkpoint_reason,
                             &messages,
                             steps,
                             true,
@@ -3961,6 +4771,91 @@ async fn run_subagent(
                 response.model.clone(),
                 response.usage.clone(),
             ));
+        }
+        {
+            let mut manager = runtime.manager.write().await;
+            manager.record_worker_usage(&agent_id, &response.usage);
+        }
+
+        // Per-worker token-budget enforcement (#3321): stop a single runaway
+        // worker once its accumulated model tokens exceed its own cap. This
+        // complements — and does not double-count — the scope-level admission
+        // gate (#3319), which bounds aggregate fan-out across siblings. The
+        // local accumulator mirrors the manager's `record.usage.total_tokens`
+        // (both derive from `response.usage`), so the scope accounting stays
+        // consistent and is never inflated by this check.
+        tokens_used = tokens_used.saturating_add(usage_total_tokens(&response.usage));
+        if let Some(budget) = token_budget {
+            if tokens_used > budget {
+                record_agent_progress(
+                    runtime,
+                    &agent_id,
+                    format!(
+                        "{}: token budget exhausted ({tokens_used}/{budget})",
+                        format_step_counter(steps, max_steps)
+                    ),
+                );
+                if let Some(mb) = runtime.mailbox.as_ref() {
+                    let _ = mb.send(MailboxMessage::Cancelled {
+                        agent_id: agent_id.clone(),
+                    });
+                }
+                let status = SubAgentStatus::BudgetExhausted;
+                let duration_ms =
+                    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                latest_checkpoint = Some(
+                    checkpoint_subagent_progress(
+                        runtime,
+                        &agent_id,
+                        "token_budget_exhausted",
+                        &messages,
+                        steps,
+                        true,
+                    )
+                    .await,
+                );
+                insert_subagent_full_transcript_handle(
+                    runtime,
+                    &agent_id,
+                    &agent_type,
+                    &assignment,
+                    &status,
+                    final_result.as_ref(),
+                    latest_checkpoint.as_ref(),
+                    &messages,
+                    steps,
+                    duration_ms,
+                    fork_context_enabled,
+                )
+                .await;
+                return Ok(SubAgentResult {
+                    name: agent_id.clone(),
+                    agent_id: agent_id.clone(),
+                    context_mode: if fork_context_enabled {
+                        "forked"
+                    } else {
+                        "fresh"
+                    }
+                    .to_string(),
+                    fork_context: fork_context_enabled,
+                    workspace: Some(runtime.context.workspace.clone()),
+                    git_branch: current_git_branch(&runtime.context.workspace),
+                    agent_type: agent_type.clone(),
+                    assignment: assignment.clone(),
+                    model: runtime.model.clone(),
+                    nickname: None,
+                    status,
+                    worker_status: None,
+                    parent_run_id: runtime.parent_agent_id.clone(),
+                    spawn_depth: runtime.spawn_depth,
+                    result: final_result.clone(),
+                    steps_taken: steps,
+                    checkpoint: latest_checkpoint.clone(),
+                    needs_input: None,
+                    duration_ms,
+                    from_prior_session: false,
+                });
+            }
         }
 
         for block in &response.content {
@@ -4033,6 +4928,31 @@ async fn run_subagent(
         reset_truncated_subagent_responses(&mut consecutive_truncated_responses);
 
         if tool_uses.is_empty() {
+            let child_completions = drain_child_completion_events(&mut child_completion_rx);
+            if !child_completions.is_empty() {
+                let count = child_completions.len();
+                record_agent_progress(
+                    runtime,
+                    &agent_id,
+                    format!(
+                        "{}: resuming with {count} child sub-agent completion(s)",
+                        format_step_counter(steps, max_steps)
+                    ),
+                );
+                messages.push(child_completion_runtime_message(&child_completions));
+                latest_checkpoint = Some(
+                    checkpoint_subagent_progress(
+                        runtime,
+                        &agent_id,
+                        "after_tail_child_subagent_completion",
+                        &messages,
+                        steps,
+                        true,
+                    )
+                    .await,
+                );
+                continue;
+            }
             while let Ok(input) = input_rx.try_recv() {
                 if input.interrupt {
                     pending_inputs.clear();
@@ -4176,6 +5096,8 @@ async fn run_subagent(
         nickname: None,
         status,
         worker_status: None,
+        parent_run_id: runtime.parent_agent_id.clone(),
+        spawn_depth: runtime.spawn_depth,
         result: final_result,
         steps_taken: steps,
         checkpoint: latest_checkpoint,
@@ -4377,11 +5299,30 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         });
 
     let cwd = parse_optional_cwd(input)?;
+    let worktree = parse_optional_worktree_request(input)?;
+    if cwd.is_some() && worktree.is_some() {
+        return Err(ToolError::invalid_input(
+            "Use either cwd or worktree isolation, not both".to_string(),
+        ));
+    }
     let model = parse_optional_subagent_model(input, "model")?;
     let model_strength = optional_input_str(input, &["model_strength", "modelStrength"])
         .map(SubAgentModelStrength::parse)
         .transpose()?
-        .unwrap_or(SubAgentModelStrength::Same);
+        .unwrap_or_else(|| {
+            // Default model strength. `type: "explore"` defaults to Faster for
+            // bounded read-only lookup/search/status work — the cheap, fast
+            // same-family sibling is exactly the lossy-breadth job a child
+            // should run. Every other role (and any call that supplies an
+            // explicit `model`) stays conservative at Same. Explicit
+            // model_strength above already wins via .parse(); explicit `model`
+            // wins downstream in assignment_model_route regardless of strength.
+            if agent_type == SubAgentType::Explore && model.is_none() {
+                SubAgentModelStrength::Faster
+            } else {
+                SubAgentModelStrength::Same
+            }
+        });
     let thinking = optional_input_str(input, &["thinking", "reasoning_effort", "reasoningEffort"])
         .map(SubAgentThinking::parse)
         .transpose()?
@@ -4416,6 +5357,8 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
                 })
         })
         .transpose()?;
+    let token_budget =
+        parse_optional_positive_u64(input, &["token_budget", "tokenBudget", "max_tokens"])?;
 
     Ok(SpawnRequest {
         session_name,
@@ -4427,9 +5370,11 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         model_strength,
         thinking,
         cwd,
+        worktree,
         resident_file,
         fork_context,
         max_depth,
+        token_budget,
     })
 }
 
@@ -4459,6 +5404,26 @@ fn parse_optional_bool(input: &Value, names: &[&str]) -> Option<bool> {
         .iter()
         .find_map(|name| input.get(*name))
         .and_then(Value::as_bool)
+}
+
+fn parse_optional_positive_u64(input: &Value, names: &[&str]) -> Result<Option<u64>, ToolError> {
+    for name in names {
+        let Some(value) = input.get(*name) else {
+            continue;
+        };
+        let Some(parsed) = value.as_u64() else {
+            return Err(ToolError::invalid_input(format!(
+                "{name} must be a positive integer token count"
+            )));
+        };
+        if parsed == 0 {
+            return Err(ToolError::invalid_input(format!(
+                "{name} must be greater than zero; omit it to inherit or disable the budget"
+            )));
+        }
+        return Ok(Some(parsed));
+    }
+    Ok(None)
 }
 
 fn with_default_fork_context(mut input: Value, default: bool) -> Value {
@@ -4670,7 +5635,18 @@ fn subagent_reasoning_effort_for_request(
                 .to_string(),
         ),
         SubAgentThinking::Inherit if requested_fast_lane => {
-            Some(ReasoningEffort::Off.as_setting().to_string())
+            // Faster/explore lane: cheaper reasoning by default. The OpenAI Codex
+            // (GPT-5.5) adapter has no true "off" on the wire (it collapses off
+            // to low), so we resolve Low honestly for that provider instead of
+            // emitting an off that is silently rewritten. Explicit thinking
+            // passed by the caller already won via the arms above.
+            let provider = runtime.client.api_provider();
+            let effort = if matches!(provider, crate::config::ApiProvider::OpenaiCodex) {
+                ReasoningEffort::Low
+            } else {
+                ReasoningEffort::Off
+            };
+            Some(effort.as_setting().to_string())
         }
         SubAgentThinking::Inherit => fallback_subagent_reasoning_effort(runtime, prompt),
     }
@@ -4722,6 +5698,329 @@ fn parse_optional_cwd(input: &Value) -> Result<Option<PathBuf>, ToolError> {
     }
 }
 
+fn parse_optional_worktree_request(
+    input: &Value,
+) -> Result<Option<SubAgentWorktreeRequest>, ToolError> {
+    let worktree_flag =
+        parse_optional_bool_strict(input, &["worktree", "isolate_worktree", "isolateWorktree"])?;
+    let isolation = optional_input_str(input, &["isolation"])
+        .map(|value| value.trim().to_ascii_lowercase().replace(['_', '-'], ""));
+    let isolation_wants_worktree = match isolation.as_deref() {
+        None | Some("") | Some("none") | Some("shared") => false,
+        Some("worktree") | Some("gitworktree") => true,
+        Some(other) => {
+            return Err(ToolError::invalid_input(format!(
+                "isolation must be 'worktree' or 'none' (got '{other}')"
+            )));
+        }
+    };
+
+    let branch = optional_input_str(
+        input,
+        &[
+            "worktree_branch",
+            "worktreeBranch",
+            "branch_name",
+            "branchName",
+            "branch",
+        ],
+    )
+    .map(str::to_string);
+    let path = optional_input_str(
+        input,
+        &[
+            "worktree_path",
+            "worktreePath",
+            "worktree_dir",
+            "worktreeDir",
+        ],
+    )
+    .map(PathBuf::from);
+    let base_ref = optional_input_str(
+        input,
+        &["worktree_base", "worktreeBase", "base_ref", "baseRef"],
+    )
+    .map(str::to_string);
+
+    let has_worktree_details = branch.is_some() || path.is_some() || base_ref.is_some();
+    if worktree_flag == Some(false) && (isolation_wants_worktree || has_worktree_details) {
+        return Err(ToolError::invalid_input(
+            "worktree=false conflicts with worktree isolation options".to_string(),
+        ));
+    }
+    if worktree_flag.unwrap_or(false) || isolation_wants_worktree || has_worktree_details {
+        Ok(Some(SubAgentWorktreeRequest {
+            branch,
+            path,
+            base_ref,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn parse_optional_bool_strict(input: &Value, names: &[&str]) -> Result<Option<bool>, ToolError> {
+    for name in names {
+        let Some(value) = input.get(*name) else {
+            continue;
+        };
+        return value.as_bool().map(Some).ok_or_else(|| {
+            ToolError::invalid_input(format!("{name} must be a boolean when provided"))
+        });
+    }
+    Ok(None)
+}
+
+fn prepare_child_workspace(
+    parent_workspace: &Path,
+    request: &SpawnRequest,
+) -> Result<Option<PathBuf>, ToolError> {
+    if let Some(requested_cwd) = request.cwd.as_ref() {
+        return validate_existing_child_cwd(parent_workspace, requested_cwd).map(Some);
+    }
+    if let Some(worktree) = request.worktree.as_ref() {
+        return create_isolated_worktree(
+            parent_workspace,
+            worktree,
+            request.session_name.as_deref(),
+            &request.agent_type,
+        )
+        .map(Some);
+    }
+    Ok(None)
+}
+
+fn validate_existing_child_cwd(
+    parent_workspace: &Path,
+    requested_cwd: &Path,
+) -> Result<PathBuf, ToolError> {
+    let resolved = if requested_cwd.is_absolute() {
+        requested_cwd.to_path_buf()
+    } else {
+        parent_workspace.join(requested_cwd)
+    };
+    let canonical = resolved.canonicalize().map_err(|e| {
+        ToolError::invalid_input(format!(
+            "Invalid cwd '{}': {e} (path may not exist yet — use worktree=true to let CodeWhale create an isolated checkout)",
+            requested_cwd.display()
+        ))
+    })?;
+    let workspace_canonical = parent_workspace
+        .canonicalize()
+        .unwrap_or_else(|_| parent_workspace.to_path_buf());
+    if !canonical.starts_with(&workspace_canonical) {
+        return Err(ToolError::invalid_input(format!(
+            "cwd must be inside the parent workspace: {} is not under {}",
+            canonical.display(),
+            workspace_canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn create_isolated_worktree(
+    parent_workspace: &Path,
+    request: &SubAgentWorktreeRequest,
+    session_name: Option<&str>,
+    agent_type: &SubAgentType,
+) -> Result<PathBuf, ToolError> {
+    let repo_root = git_repo_root(parent_workspace)?;
+    let branch = request
+        .branch
+        .clone()
+        .unwrap_or_else(|| default_worktree_branch(session_name, agent_type));
+    validate_git_branch_name(&repo_root, &branch)?;
+
+    let base_ref = request
+        .base_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("HEAD")
+        .to_string();
+    let worktree_path = resolve_worktree_path(&repo_root, &branch, request.path.as_ref())?;
+    if let Some(parent) = worktree_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            ToolError::execution_failed(format!(
+                "Failed to create worktree parent '{}': {err}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let path_arg = worktree_path.to_string_lossy().to_string();
+    let args = vec![
+        "worktree".to_string(),
+        "add".to_string(),
+        "-b".to_string(),
+        branch,
+        path_arg,
+        base_ref,
+    ];
+    run_git_checked(&repo_root, &args, "create sub-agent worktree")?;
+    worktree_path.canonicalize().map_err(|err| {
+        ToolError::execution_failed(format!(
+            "Created worktree path '{}' could not be resolved: {err}",
+            worktree_path.display()
+        ))
+    })
+}
+
+fn git_repo_root(workspace: &Path) -> Result<PathBuf, ToolError> {
+    let output = run_git_checked(
+        workspace,
+        &["rev-parse".to_string(), "--show-toplevel".to_string()],
+        "resolve git repository root",
+    )?;
+    let root = output.trim();
+    if root.is_empty() {
+        return Err(ToolError::invalid_input(
+            "worktree=true requires a git repository workspace".to_string(),
+        ));
+    }
+    Ok(PathBuf::from(root))
+}
+
+fn validate_git_branch_name(repo_root: &Path, branch: &str) -> Result<(), ToolError> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err(ToolError::invalid_input(
+            "worktree_branch cannot be blank".to_string(),
+        ));
+    }
+    run_git_checked(
+        repo_root,
+        &[
+            "check-ref-format".to_string(),
+            "--branch".to_string(),
+            branch.to_string(),
+        ],
+        "validate sub-agent worktree branch",
+    )
+    .map(|_| ())
+    .map_err(|err| ToolError::invalid_input(format!("Invalid worktree_branch '{branch}': {err}")))
+}
+
+fn default_worktree_branch(session_name: Option<&str>, agent_type: &SubAgentType) -> String {
+    let seed = session_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| agent_type.as_str());
+    format!(
+        "codex/agent-{}-{}",
+        sanitize_worktree_slug(seed),
+        &Uuid::new_v4().to_string()[..8]
+    )
+}
+
+fn resolve_worktree_path(
+    repo_root: &Path,
+    branch: &str,
+    requested_path: Option<&PathBuf>,
+) -> Result<PathBuf, ToolError> {
+    let default_root = default_worktree_root(repo_root);
+    let path = match requested_path {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => {
+            let resolved = normalize_path_lexically(&default_root.join(path));
+            if !resolved.starts_with(&default_root) {
+                return Err(ToolError::invalid_input(format!(
+                    "relative worktree_path '{}' must stay under {}",
+                    path.display(),
+                    default_root.display()
+                )));
+            }
+            resolved
+        }
+        None => default_root.join(sanitize_worktree_slug(branch)),
+    };
+    let normalized = normalize_path_lexically(&path);
+    let repo_canonical = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    if normalized.starts_with(&repo_canonical) {
+        return Err(ToolError::invalid_input(format!(
+            "worktree_path must not be inside the parent checkout: {} is under {}",
+            normalized.display(),
+            repo_canonical.display()
+        )));
+    }
+    Ok(normalized)
+}
+
+fn default_worktree_root(repo_root: &Path) -> PathBuf {
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_worktree_slug)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "repo".to_string());
+    let parent = repo_root.parent().unwrap_or(repo_root);
+    normalize_path_lexically(&parent.join(SUBAGENT_WORKTREE_ROOT_DIR).join(repo_name))
+}
+
+fn sanitize_worktree_slug(input: &str) -> String {
+    let mut slug = String::new();
+    for ch in input.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else if matches!(ch, '-' | '_' | '.') {
+            ch
+        } else {
+            '-'
+        };
+        if normalized == '-' && slug.ends_with('-') {
+            continue;
+        }
+        slug.push(normalized);
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches(['-', '.', '_']).to_string();
+    if slug.is_empty() {
+        "task".to_string()
+    } else {
+        slug
+    }
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn run_git_checked(workspace: &Path, args: &[String], action: &str) -> Result<String, ToolError> {
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = Git::output(&arg_refs, workspace).map_err(|err| {
+        ToolError::execution_failed(format!("Failed to {action}: could not run git: {err}"))
+    })?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("git exited with status {}", output.status)
+    };
+    Err(ToolError::execution_failed(format!(
+        "Failed to {action}: {detail}"
+    )))
+}
+
 /// Resolve a user-supplied role/agent_role value to a canonical role string.
 ///
 /// This must accept the full set that [`SubAgentType::from_str`] accepts, plus
@@ -4763,6 +6062,7 @@ fn worker_status_from_subagent_status(status: &SubAgentStatus) -> AgentWorkerSta
         SubAgentStatus::Completed => AgentWorkerStatus::Completed,
         SubAgentStatus::Failed(_) => AgentWorkerStatus::Failed,
         SubAgentStatus::Cancelled => AgentWorkerStatus::Cancelled,
+        SubAgentStatus::BudgetExhausted => AgentWorkerStatus::Failed,
         SubAgentStatus::Interrupted(_) => AgentWorkerStatus::Interrupted,
     }
 }
@@ -4852,6 +6152,8 @@ fn emit_agent_progress(
     mailbox: Option<&Mailbox>,
     agent_id: &str,
     status: String,
+    parent_run_id: Option<String>,
+    spawn_depth: u32,
 ) {
     if let Some(mb) = mailbox {
         let _ = mb.send(MailboxMessage::progress(agent_id, status.clone()));
@@ -4860,6 +6162,8 @@ fn emit_agent_progress(
         let _ = event_tx.try_send(Event::AgentProgress {
             id: agent_id.to_string(),
             status,
+            parent_run_id,
+            spawn_depth,
         });
     }
 }
@@ -4917,6 +6221,8 @@ struct SubAgentToolRegistry {
     /// the child without the parent runtime being auto-approved (#1828, #1833).
     agent_type: SubAgentType,
     can_spawn_child: bool,
+    owner_agent_id: String,
+    owner_agent_name: String,
     registry: ToolRegistry,
 }
 
@@ -4924,6 +6230,26 @@ impl SubAgentToolRegistry {
     fn new(
         runtime: SubAgentRuntime,
         agent_type: SubAgentType,
+        explicit_allowed_tools: Option<Vec<String>>,
+        todo_list: SharedTodoList,
+        plan_state: SharedPlanState,
+    ) -> Self {
+        Self::new_with_owner(
+            runtime,
+            agent_type,
+            "agent_unknown".to_string(),
+            "sub-agent".to_string(),
+            explicit_allowed_tools,
+            todo_list,
+            plan_state,
+        )
+    }
+
+    fn new_with_owner(
+        runtime: SubAgentRuntime,
+        agent_type: SubAgentType,
+        owner_agent_id: String,
+        owner_agent_name: String,
         explicit_allowed_tools: Option<Vec<String>>,
         todo_list: SharedTodoList,
         plan_state: SharedPlanState,
@@ -4955,6 +6281,8 @@ impl SubAgentToolRegistry {
             auto_approve: runtime.context.auto_approve,
             agent_type,
             can_spawn_child,
+            owner_agent_id,
+            owner_agent_name,
             registry,
         }
     }
@@ -5075,9 +6403,15 @@ impl SubAgentToolRegistry {
             }
         }
         reject_subagent_terminal_takeover(name, &input)?;
+        let context = self
+            .registry
+            .context()
+            .clone()
+            .with_owner_agent(self.owner_agent_id.clone(), self.owner_agent_name.clone());
         self.registry
-            .execute(name, input)
+            .execute_full_with_context(name, input, Some(&context))
             .await
+            .map(|result| result.content)
             .map_err(|e| anyhow!(e))
     }
 }
@@ -5178,6 +6512,60 @@ fn annotate_child_model_error(err: &str, model: &str) -> String {
     }
 }
 
+/// Char budget above which a sub-agent summary is treated as a large dump and
+/// head+tail truncated. Mirrors `TOOL_RESULT_SENT_CHAR_BUDGET` in
+/// `crates/tui/src/client/chat.rs:702` so sub-agent summaries use the same
+/// threshold as regular tool outputs. Duplicated locally to avoid coupling the
+/// sub-agent module to the wire-compaction internals.
+const SUBAGENT_SUMMARY_CHAR_BUDGET: usize = 12_000;
+/// Head/tail slice sizes when truncating; mirror the wire constants
+/// (`TOOL_RESULT_HEAD_CHARS`/`TOOL_RESULT_TAIL_CHARS`, chat.rs:703-704).
+const SUBAGENT_SUMMARY_HEAD_CHARS: usize = 4_000;
+const SUBAGENT_SUMMARY_TAIL_CHARS: usize = 4_000;
+
+/// One-line provenance suffix reinforcing that a sub-agent summary is a
+/// self-report (issue #2652). Appended only when the summary was NOT
+/// length-truncated, so every summary carries exactly one boundary marker.
+const SUBAGENT_SELF_REPORT_NOTE: &str = "\n[Sub-agent self-report — re-verify material claims (read changed files, \
+run the relevant tests) before relying on it.]";
+
+/// Stamp a sub-agent summary with a provenance/clip marker (issue #2652).
+///
+/// Returns `(stamped_summary, truncated)`:
+/// - When the raw summary is within the budget, append the soft self-report
+///   note and report `truncated: false`.
+/// - When it exceeds the budget, keep a head+tail slice and stamp it with the
+///   existing `[Output truncated ...]` vocabulary (reused from tool-output
+///   truncation), adapted to be honest that the elided middle is NOT in the
+///   spillover store — there is no `retrieve_tool_result` handle for
+///   sub-agent summaries. Report `truncated: true`.
+///
+/// Every summary therefore gets exactly one boundary marker, never both.
+fn stamp_subagent_summary(raw: &str) -> (String, bool) {
+    let total = raw.chars().count();
+    if total <= SUBAGENT_SUMMARY_CHAR_BUDGET {
+        return (format!("{raw}{SUBAGENT_SELF_REPORT_NOTE}"), false);
+    }
+    let chars: Vec<char> = raw.chars().collect();
+    let head: String = chars.iter().take(SUBAGENT_SUMMARY_HEAD_CHARS).collect();
+    let tail: String = chars
+        .iter()
+        .skip(total.saturating_sub(SUBAGENT_SUMMARY_TAIL_CHARS))
+        .collect();
+    let omitted = total
+        .saturating_sub(SUBAGENT_SUMMARY_HEAD_CHARS)
+        .saturating_sub(SUBAGENT_SUMMARY_TAIL_CHARS);
+    let stamped = format!(
+        "{head}\n\n[Sub-agent summary truncated: {head_chars} + {tail_chars} of {total} \
+chars shown. This is the child's self-report; the elided middle ({omitted} chars) is not in \
+the spillover store and cannot be retrieved via retrieve_tool_result. Re-open the child or \
+read changed files directly to verify material claims.]\n\n{tail}",
+        head_chars = SUBAGENT_SUMMARY_HEAD_CHARS,
+        tail_chars = SUBAGENT_SUMMARY_TAIL_CHARS,
+    );
+    (stamped, true)
+}
+
 fn summarize_subagent_result(result: &SubAgentResult) -> String {
     if let Some(needs_input) = result.needs_input.as_ref() {
         return format!("Needs input: {}", needs_input.question);
@@ -5187,6 +6575,7 @@ fn summarize_subagent_result(result: &SubAgentResult) -> String {
         (SubAgentStatus::Completed, None) => "Completed (no output)".to_string(),
         (SubAgentStatus::Interrupted(error), _) => format!("Interrupted: {error}"),
         (SubAgentStatus::Cancelled, _) => "Cancelled".to_string(),
+        (SubAgentStatus::BudgetExhausted, _) => "Token budget exhausted".to_string(),
         (SubAgentStatus::Failed(error), _) => format!("Failed: {error}"),
         (SubAgentStatus::Running, _) => "Running".to_string(),
     }
@@ -5199,6 +6588,7 @@ fn subagent_status_name(status: &SubAgentStatus) -> &'static str {
         SubAgentStatus::Interrupted(_) => "interrupted",
         SubAgentStatus::Failed(_) => "failed",
         SubAgentStatus::Cancelled => "cancelled",
+        SubAgentStatus::BudgetExhausted => "budget_exhausted",
     }
 }
 
@@ -5209,14 +6599,16 @@ const GENERAL_AGENT_INTRO: &str = concat!(
     "Stay inside the assigned scope; put adjacent work under RISKS/BLOCKERS.\n",
     "For genuinely multi-step work, track progress with `checklist_write` (and `update_plan` for complex strategy); skip it for short, focused tasks.\n",
     "**Stop quickly on failure**: if the same tool call fails 2 times in a row, stop retrying and return what you have so far with a one-line note explaining what's missing. Do not loop on impossible queries (e.g. external API unreachable, rate-limited, or returning empty).\n",
-    "**Bounded effort**: prefer one focused attempt over many speculative retries. If you cannot complete the task with available data within 3-5 tool calls, return your current partial findings — the parent agent can compensate with its own knowledge.\n\n"
+    "For implementer or repair-style work, keep going within the assigned scope; checkpoint before broadening the task or after repeated failures instead of forcing a tiny tool-call cap.\n\n"
 );
 
 const EXPLORE_AGENT_INTRO: &str = concat!(
     "You are a trusted exploration sub-agent (role: `explore`). Your job is to map the relevant code quickly and stay strictly read-only.\n",
+    "Default to `EFFORT: quick`: aim for about 3-5 tool calls unless the brief explicitly asks for more.\n",
     "Orient first: confirm the workspace/project root, read relevant AGENTS.md/README guidance when the tree is unfamiliar, then search only the likely scope.\n",
     "Use list_dir/file_search, grep_files, and read_file; use RLM only for long inputs or many semantic slices, not basic path discovery.\n",
-    "DeepSeek V4 can hold broad evidence, but your value is compressed reconnaissance: cite `path:line-range` for each finding and stop once evidence is sufficient.\n",
+    "Honor QUESTION, SCOPE, ALREADY_KNOWN, and STOP_CONDITION. Do not repeat ALREADY_KNOWN work unless evidence contradicts it; do not broaden once QUESTION is answered.\n",
+    "DeepSeek V4 can hold broad evidence, but your value is compressed reconnaissance: cite `path:line-range` for each finding and stop once evidence is sufficient. Return partial findings if the next step would be speculative or duplicative.\n",
     "CHANGES will almost always be \"None.\" for an explorer.\n\n"
 );
 
@@ -5231,6 +6623,7 @@ const REVIEW_AGENT_INTRO: &str = concat!(
     "You are a trusted code review sub-agent (role: `review`). Your job is to find and report severity-scored issues, and stay strictly read-only.\n",
     "Read the diff/files, grep sibling patterns/tests, then order EVIDENCE by severity.\n",
     "Use BLOCKER/MAJOR/MINOR/NIT and include path:line-range plus suggested fix.\n",
+    "You may use more tool calls than quick exploration, but stop after decisive evidence instead of widening the review forever.\n",
     "If no MAJOR+ issues exist, say so plainly in SUMMARY.\n",
     "CHANGES will almost always be \"None.\" for a reviewer.\n\n"
 );
@@ -5244,6 +6637,7 @@ const IMPLEMENTER_AGENT_INTRO: &str = concat!(
     "You are a trusted implementation sub-agent (role: `implementer`). Your job is to land the assigned change with minimal surrounding edits.\n",
     "Read target files before editing; prefer edit_file for narrow changes and apply_patch for hunks.\n",
     "Run relevant verification after edit batches; write needed tests with the implementation.\n",
+    "You are not limited to an explorer-style 3-5 tool-call cap. Checkpoint before expanding scope or after repeated failures, then continue only inside the assigned brief.\n",
     "CHANGES is load-bearing: list every modified file with a one-line why.\n\n"
 );
 
@@ -5251,6 +6645,7 @@ const VERIFIER_AGENT_INTRO: &str = concat!(
     "You are a trusted verification sub-agent (role: `verifier`). Your job is to run the requested gates and report results, and stay read-only.\n",
     "Report PASS/FAIL/FLAKY at the top of SUMMARY with exact command evidence.\n",
     "Capture failing assertion and file:line; put obvious fixes under RISKS.\n",
+    "You may use more tool calls than quick exploration, but stop after decisive pass/fail evidence.\n",
     "CHANGES will almost always be \"None.\" for a verifier.\n\n"
 );
 
