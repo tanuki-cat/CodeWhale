@@ -2083,6 +2083,25 @@ mod tests {
     }
 
     #[test]
+    fn render_pins_options_when_content_overflows_short_card() {
+        // Regression: a tall body (long description, impacts, multi-line
+        // command, ask-rule preview) must never push the interactive options
+        // off the bottom of the card. Render into a deliberately short area
+        // and assert the option rows and the selection hint are still drawn.
+        let view = ApprovalView::new(destructive_request());
+        let lines = render_lines(&view, 100, 12);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Enter selected option"),
+            "selection hint clipped on short card:\n{joined}"
+        );
+        assert!(
+            joined.contains("Esc"),
+            "abort option clipped on short card:\n{joined}"
+        );
+    }
+
+    #[test]
     fn render_takeover_card_fills_most_of_area() {
         // The card should be wider than the old 65-cell popup whenever
         // the terminal can hold it; this guards against a regression

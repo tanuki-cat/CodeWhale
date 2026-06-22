@@ -1378,7 +1378,11 @@ impl Renderable for ApprovalWidget<'_> {
             }
         }
 
-        lines.push(Line::from(""));
+        // Action block (options + selection hint). Built and rendered
+        // separately so it can be pinned to the bottom of the card and never
+        // clipped by a long description or multi-line command above it.
+        let mut action_lines: Vec<Line<'static>> = Vec::new();
+        action_lines.push(Line::from(""));
 
         let options = approval_options_for(risk, locale);
 
@@ -1401,13 +1405,13 @@ impl Renderable for ApprovalWidget<'_> {
                 ),
                 Span::styled(opt.label.to_string(), option_style),
             ];
-            lines.push(Line::from(spans));
+            action_lines.push(Line::from(spans));
         }
 
         // Footer: Enter commits the highlighted row; y/a/d remain direct
         // shortcuts for users who do not want to move the selection.
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
+        action_lines.push(Line::from(""));
+        action_lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
                 selection_hint_prefix(locale),
@@ -1446,13 +1450,42 @@ impl Renderable for ApprovalWidget<'_> {
             .style(Style::default().bg(palette::DEEPSEEK_INK))
             .padding(Padding::uniform(1));
 
-        // Render the card body inside the block, then paint the warm
-        // accent rail on the destructive variant. The rail uses a
-        // single-cell column so it doesn't shift the body layout.
-        let paragraph = Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false });
-        paragraph.render(card_area, buf);
+        // Pin the action block to the bottom of the card. The options are the
+        // only interactive part of the modal, so they must stay visible no
+        // matter how tall the body above them is; the informational content is
+        // allowed to clip instead. Previously content and options were one
+        // Paragraph that clipped from the bottom, so a long description or a
+        // multi-line command pushed the controls off-screen entirely (the
+        // modal looked like it had no options).
+        let inner = block.inner(card_area);
+        block.render(card_area, buf);
+
+        let action_height = (action_lines.len() as u16).min(inner.height);
+        let content_height = inner.height.saturating_sub(action_height);
+
+        if content_height > 0 {
+            let content_area = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: content_height,
+            };
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .render(content_area, buf);
+        }
+
+        if action_height > 0 {
+            let action_area = Rect {
+                x: inner.x,
+                y: inner.y.saturating_add(content_height),
+                width: inner.width,
+                height: action_height,
+            };
+            // No wrap: one option/hint per row so the reserved height matches
+            // exactly and the controls can never overflow their region.
+            Paragraph::new(action_lines).render(action_area, buf);
+        }
 
         if matches!(risk, RiskLevel::Destructive) {
             paint_left_rail(card_area, buf, palette_colors.accent);
