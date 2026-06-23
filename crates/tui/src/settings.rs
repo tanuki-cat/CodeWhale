@@ -256,6 +256,15 @@ pub struct Settings {
     pub show_tool_details: bool,
     /// UI locale: auto, en, ja, zh-Hans, pt-BR, es-419
     pub locale: String,
+    /// Persisted `/translate` toggle: `off` (default) never post-translates
+    /// model output; `on` always translates English output into the resolved
+    /// locale; `auto` translates only when the resolved locale is non-English.
+    /// Loaded into `App::translation_enabled` at startup; `/translate` flips it
+    /// at runtime and writes the resulting on/off state back here. This is the
+    /// deterministic counterpart to the soft `locale` system-prompt directive —
+    /// it catches `reasoning_content` that drifts to English regardless of the
+    /// configured locale.
+    pub translation: String,
     /// Named UI theme. Accepts `"system"` (follow terminal background),
     /// `"dark"`, `"light"`, `"grayscale"`, or one of the community
     /// presets: `"catppuccin-mocha"`, `"tokyo-night"`, `"dracula"`,
@@ -374,6 +383,7 @@ impl Default for Settings {
             show_thinking: true,
             show_tool_details: true,
             locale: "auto".to_string(),
+            translation: "off".to_string(),
             theme: "system".to_string(),
             background_color: None,
             composer_density: "comfortable".to_string(),
@@ -460,6 +470,7 @@ impl Settings {
             s.locale = normalize_configured_locale(&s.locale)
                 .unwrap_or("en")
                 .to_string();
+            s.translation = normalize_translation(&s.translation).to_string();
             s.background_color = normalize_optional_background_color(s.background_color.as_deref());
             s.theme = normalize_settings_theme(&s.theme).to_string();
             s.default_model = s.default_model.as_deref().and_then(normalize_default_model);
@@ -676,6 +687,15 @@ impl Settings {
                 };
                 self.locale = locale.to_string();
             }
+            "translation" | "translate" => {
+                let normalized = normalize_translation(value);
+                if !["auto", "on", "off"].contains(&normalized) {
+                    anyhow::bail!(
+                        "Failed to update setting: invalid translation '{value}'. Expected: auto, on, off."
+                    );
+                }
+                self.translation = normalized.to_string();
+            }
             "theme" => {
                 let Some(id) = crate::palette::ThemeId::from_name(value) else {
                     anyhow::bail!(
@@ -871,6 +891,7 @@ impl Settings {
         lines.push(format!("  show_thinking:      {}", self.show_thinking));
         lines.push(format!("  show_tool_details:  {}", self.show_tool_details));
         lines.push(format!("  locale:            {}", self.locale));
+        lines.push(format!("  translation:        {}", self.translation));
         lines.push(format!("  theme:              {}", self.theme));
         lines.push(format!(
             "  background_color:   {}",
@@ -975,6 +996,10 @@ impl Settings {
             (
                 "locale",
                 "UI locale and default model language: auto, en, ja, zh-Hans, pt-BR, es-419",
+            ),
+            (
+                "translation",
+                "Persisted /translate (deterministically post-translate model output → locale): auto, on, off (default off; auto = on when locale is non-English)",
             ),
             (
                 "theme",
@@ -1105,6 +1130,19 @@ impl Settings {
     #[must_use]
     pub fn synchronized_output_enabled(&self) -> bool {
         !self.synchronized_output.eq_ignore_ascii_case("off")
+    }
+
+    /// Resolve the persisted `translation` setting into the boolean start
+    /// state for `App::translation_enabled`. `auto` enables translation only
+    /// when the resolved UI locale is non-English — English users never pay
+    /// the post-hoc translation cost — while `on`/`off` are explicit. Unknown
+    /// values are treated as `off` so a malformed file degrades safely.
+    pub fn translation_enabled_default(&self, locale: crate::localization::Locale) -> bool {
+        match self.translation.as_str() {
+            "on" => true,
+            "auto" => !matches!(locale, crate::localization::Locale::En),
+            _ => false,
+        }
     }
 }
 
@@ -1326,6 +1364,20 @@ fn normalize_status_indicator(value: &str) -> &str {
 /// Unknown values fall through unchanged so the parser in `set` can
 /// surface a clear error.
 fn normalize_synchronized_output(value: &str) -> &str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" | "default" => "auto",
+        "on" | "true" | "yes" | "1" | "enabled" => "on",
+        "off" | "false" | "no" | "0" | "disabled" => "off",
+        _ => value,
+    }
+}
+
+/// Normalize the `translation` setting. Accepts the canonical
+/// `"auto"` / `"on"` / `"off"` plus the usual truthy/falsey spellings.
+/// Unknown values fall through unchanged so the parser in `set` can surface a
+/// clear error and load-time normalization leaves them for
+/// [`Settings::translation_enabled_default`] to treat as `off`.
+fn normalize_translation(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
         "auto" | "default" => "auto",
         "on" | "true" | "yes" | "1" | "enabled" => "on",
@@ -1586,6 +1638,37 @@ mod tests {
             .set("locale", "ar")
             .expect_err("Arabic is planned, not shipped");
         assert!(err.to_string().contains("invalid locale"));
+    }
+
+    #[test]
+    fn translation_setting_normalizes_and_resolves_start_state() {
+        use crate::localization::Locale;
+
+        let mut settings = Settings::default();
+        // Default is off — no translation cost for anyone out of the box.
+        assert_eq!(settings.translation, "off");
+        assert!(!settings.translation_enabled_default(Locale::ZhHans));
+        assert!(!settings.translation_enabled_default(Locale::En));
+
+        // `on` is explicit and locale-independent.
+        settings.set("translation", "ON").expect("set on");
+        assert_eq!(settings.translation, "on");
+        assert!(settings.translation_enabled_default(Locale::En));
+
+        // `auto` (also reachable via the `translate` alias) tracks the locale:
+        // enabled for non-English, off for English so en users never pay.
+        settings.set("translate", "auto").expect("set auto");
+        assert_eq!(settings.translation, "auto");
+        assert!(settings.translation_enabled_default(Locale::ZhHans));
+        assert!(!settings.translation_enabled_default(Locale::En));
+
+        settings.set("translation", "off").expect("set off");
+        assert!(!settings.translation_enabled_default(Locale::ZhHans));
+
+        let err = settings
+            .set("translation", "frenchify")
+            .expect_err("unknown value rejected");
+        assert!(err.to_string().contains("invalid translation"));
     }
 
     #[test]

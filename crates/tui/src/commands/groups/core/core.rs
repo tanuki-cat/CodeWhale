@@ -471,6 +471,7 @@ pub fn home_dashboard(app: &mut App) -> CommandResult {
 /// reaches the user.
 pub fn translate(app: &mut App) -> CommandResult {
     app.translation_enabled = !app.translation_enabled;
+    app.persist_translation_enabled(app.translation_enabled);
     let locale = app.ui_locale;
     if app.translation_enabled {
         CommandResult::message(tr(locale, MessageId::CmdTranslateOn))

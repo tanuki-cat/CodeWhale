@@ -24,9 +24,11 @@ pub struct PromptSessionContext<'a> {
     /// disk I/O happens inside the prompt builder, so the workspace-
     /// static portion of the system prompt stays cache-friendly.
     pub locale_tag: &'a str,
-    /// When true, a ## Language Output Requirement block is appended
-    /// to the system prompt instructing the model to respond in
-    /// the resolved session locale.
+    /// When true, a ## Language Output Requirement block is appended to the
+    /// system prompt instructing the model to natively produce output in the
+    /// resolved session locale. When [`Self::show_thinking`] is also true the
+    /// directive explicitly covers `reasoning_content`, so it doubles as the
+    /// prompt-level reducer for the `/translate` post-hoc translation layer.
     pub translation_enabled: bool,
     /// Active model identifier used to resolve the model-fact templates
     /// ({context_window_note} and friends). v4's constitution is
@@ -86,21 +88,56 @@ const INSTRUCTIONS_FILE_MAX_BYTES: usize = 100 * 1024;
 /// natural-language output — explanations, summaries, conversation.
 /// Code identifiers, untranslatable technical terms, and explicitly
 /// requested English code blocks are exempt.
-fn translation_output_instruction(locale_tag: &str) -> String {
+///
+/// This is the prompt-level half of the `/translate` feature: it asks the
+/// model to *natively* produce target-language output so the post-hoc
+/// translation layer (`tui::translation`) has less English drift to catch.
+/// The two are complementary — the prompt rule reduces translation volume
+/// (latency + token cost), the post-hoc layer guarantees the result even
+/// when the model ignores the rule.
+///
+/// When `show_thinking` is true the directive explicitly covers
+/// `reasoning_content` (the user *sees* the thinking blocks, so English
+/// reasoning is just as much a display defect as an English reply, and
+/// reasoning traces are exactly what drifts to English). When thinking is
+/// hidden we keep the directive scoped to the final reply — localizing
+/// invisible thinking only burns tokens, and a separate
+/// [`hidden_thinking_language_instruction`] already governs that case.
+fn translation_output_instruction(locale_tag: &str, show_thinking: bool) -> String {
     let target_language = translation_target_language_for_tag(locale_tag);
+    let scope = if show_thinking {
+        "all responses — including your `reasoning_content` (internal thinking) and your final reply"
+    } else {
+        "all responses"
+    };
+    let drift_guard = if show_thinking {
+        format!(
+            "Even when the task context (code, error logs, file names, search \
+results) is English, keep thinking and replying in {target_language}; do not \
+let accumulated English context drift your `reasoning_content` back to English. "
+        )
+    } else {
+        String::new()
+    };
+    let display_scope = if show_thinking {
+        "any English prose — in your thinking or your reply —"
+    } else {
+        "any English prose in your response"
+    };
     format!(
         "\
 ## Language Output Requirement\n\
 \n\
-The user requires all responses in {target_language}. \
-Always respond in {target_language} — use natural, professional language for all \
+The user requires {scope} in {target_language}. \
+Always write in {target_language} — use natural, professional language for all \
 explanations, code comments, summaries, and conversational turns. \
-Only output English for:\n\
+{drift_guard}Only output English for:\n\
 - Code identifiers (variable names, function names, file paths)\n\
+- Tool names, environment variables, command-line flags, and URLs\n\
 - Technical terms that lack a standard translation in {target_language}\n\
 - Code blocks the user explicitly requests in English\n\n\
 This is a hard display requirement: the user does not read English, \
-so any English prose in your response will block their decision-making."
+so {display_scope} will block their decision-making."
     )
 }
 
@@ -1103,7 +1140,10 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
     if session_context.translation_enabled {
         full_prompt = format!(
             "{full_prompt}\n\n{}",
-            translation_output_instruction(session_context.locale_tag)
+            translation_output_instruction(
+                session_context.locale_tag,
+                session_context.show_thinking
+            )
         );
     }
 
@@ -1884,6 +1924,34 @@ mod tests {
             "pt preamble must call out pt-BR explicitly"
         );
         assert!(pt.contains("reasoning_content"));
+    }
+
+    #[test]
+    fn translation_instruction_scopes_reasoning_only_when_thinking_is_shown() {
+        // Fusion contract (Approach 1 ⊕ Approach 2): when thinking is visible,
+        // enabling /translate must also write a prompt-level rule that pulls
+        // `reasoning_content` into the target language, so the model thinks
+        // natively and the post-hoc layer has less drift to translate. This is
+        // a load-bearing semantic, not prose wording — assert it like the
+        // locale-preamble tests above do.
+        let shown = translation_output_instruction("zh-Hans", true);
+        assert!(
+            shown.contains("简体中文") || shown.contains("Simplified Chinese"),
+            "must name the target language: {shown:?}"
+        );
+        assert!(
+            shown.contains("reasoning_content"),
+            "thinking-shown directive must scope reasoning_content: {shown:?}"
+        );
+
+        // When thinking is hidden, localizing it only burns tokens and would
+        // collide with `hidden_thinking_language_instruction`; the directive
+        // must stay scoped to the visible reply.
+        let hidden = translation_output_instruction("zh-Hans", false);
+        assert!(
+            !hidden.contains("reasoning_content"),
+            "thinking-hidden directive must not scope reasoning_content: {hidden:?}"
+        );
     }
 
     #[test]

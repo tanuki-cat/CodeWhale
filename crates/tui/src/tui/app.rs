@@ -2471,7 +2471,7 @@ impl App {
             current_session_id: None,
             session_artifacts: Vec::new(),
             trust_mode: initial_mode == AppMode::Yolo,
-            translation_enabled: false,
+            translation_enabled: settings.translation_enabled_default(ui_locale),
             status_items: config
                 .tui
                 .as_ref()
@@ -2641,6 +2641,23 @@ impl App {
         self.ui_locale = crate::localization::resolve_locale(&settings.locale);
         self.needs_redraw = true;
         Ok(())
+    }
+
+    /// Persist the runtime `/translate` toggle to settings.toml so the choice
+    /// survives restarts. Mirrors [`Self::set_locale_from_onboarding`]: `App`
+    /// doesn't keep `Settings` resident, so this loads, rewrites the
+    /// `translation` key, and saves. Best-effort — a failed write is logged but
+    /// never blocks the in-session toggle, and an explicit `/translate` always
+    /// collapses a prior `auto` into the chosen on/off state.
+    pub fn persist_translation_enabled(&self, enabled: bool) {
+        let value = if enabled { "on" } else { "off" };
+        let mut settings = Settings::load().unwrap_or_else(|_| Settings::default());
+        if let Err(err) = settings
+            .set("translation", value)
+            .and_then(|()| settings.save())
+        {
+            tracing::warn!("Failed to persist /translate state: {err:#}");
+        }
     }
 
     /// Locale tag currently persisted in settings.toml (or
