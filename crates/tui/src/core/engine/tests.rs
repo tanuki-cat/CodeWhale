@@ -1,17 +1,19 @@
 use super::*;
 
 use super::context::{COMPACTION_SUMMARY_MARKER, TURN_MAX_OUTPUT_TOKENS};
+use super::turn_loop::registered_tool_approval_required;
 use crate::config::ApiProvider;
 use crate::models::SystemBlock;
 use crate::test_support::lock_test_env;
 use crate::tools::plan::{PlanItemArg, PlanSnapshot, StepStatus};
 use crate::tools::spec::ToolCapability;
+use crate::tools::todo::{TodoItem, TodoListSnapshot, TodoStatus};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 const WORKING_SET_SUMMARY_MARKER: &str = "## Repo Working Set";
@@ -61,6 +63,93 @@ fn subagent_mailbox_keeps_lifecycle_events_reliable() {
             model: "model".to_string(),
             usage: Usage::default(),
         }
+    ));
+}
+
+#[test]
+fn subagent_mailbox_samples_best_effort_events_per_agent() {
+    use crate::tools::subagent::MailboxMessage;
+
+    let mut last_sent_at = HashMap::new();
+    let start = Instant::now();
+    let first = MailboxMessage::ToolCallStarted {
+        agent_id: "agent_a".to_string(),
+        tool_name: "exec_shell".to_string(),
+        step: 1,
+    };
+    let second = MailboxMessage::ToolCallCompleted {
+        agent_id: "agent_a".to_string(),
+        tool_name: "exec_shell".to_string(),
+        step: 1,
+        ok: true,
+    };
+    let other_agent = MailboxMessage::ToolCallCompleted {
+        agent_id: "agent_b".to_string(),
+        tool_name: "exec_shell".to_string(),
+        step: 1,
+        ok: true,
+    };
+
+    assert!(subagent_mailbox_best_effort_send_permitted(
+        &mut last_sent_at,
+        &first,
+        start,
+    ));
+    assert!(
+        !subagent_mailbox_best_effort_send_permitted(
+            &mut last_sent_at,
+            &second,
+            start + Duration::from_millis(10),
+        ),
+        "same-agent telemetry inside the sampling window is dropped"
+    );
+    assert!(
+        subagent_mailbox_best_effort_send_permitted(
+            &mut last_sent_at,
+            &other_agent,
+            start + Duration::from_millis(10),
+        ),
+        "sampling is per agent, so one busy child cannot hide another"
+    );
+    assert!(
+        subagent_mailbox_best_effort_send_permitted(
+            &mut last_sent_at,
+            &second,
+            start + SUBAGENT_MAILBOX_BEST_EFFORT_MIN_INTERVAL,
+        ),
+        "the next same-agent update is allowed after the interval"
+    );
+}
+
+#[test]
+fn subagent_mailbox_never_samples_lifecycle_or_usage_events() {
+    use crate::models::Usage;
+    use crate::tools::subagent::{MailboxMessage, SubAgentType};
+
+    let mut last_sent_at = HashMap::new();
+    let start = Instant::now();
+
+    assert!(subagent_mailbox_best_effort_send_permitted(
+        &mut last_sent_at,
+        &MailboxMessage::started("agent_a", SubAgentType::Explore),
+        start,
+    ));
+    assert!(subagent_mailbox_best_effort_send_permitted(
+        &mut last_sent_at,
+        &MailboxMessage::Completed {
+            agent_id: "agent_a".to_string(),
+            summary: "done".to_string(),
+        },
+        start,
+    ));
+    assert!(subagent_mailbox_best_effort_send_permitted(
+        &mut last_sent_at,
+        &MailboxMessage::TokenUsage {
+            agent_id: "agent_a".to_string(),
+            model: "model".to_string(),
+            usage: Usage::default(),
+        },
+        start,
     ));
 }
 
@@ -169,6 +258,46 @@ fn structured_state_block_includes_rich_plan_artifact() {
     assert!(block.contains("Verification plan: Run focused tests"));
     assert!(block.contains("Handoff packet: Next agent should inspect replay"));
     assert!(block.contains("- [~] Render rich artifact"));
+}
+
+#[test]
+fn structured_state_block_uses_checklist_as_work_surface() {
+    let state = StructuredState {
+        mode_label: "Agent".to_string(),
+        workspace: PathBuf::from("/workspace/codewhale"),
+        cwd: Some(PathBuf::from("/workspace/codewhale")),
+        working_set_summary: None,
+        todo_snapshot: Some(TodoListSnapshot {
+            items: vec![
+                TodoItem {
+                    id: 1,
+                    content: "Wire Fleet progress projection".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    id: 2,
+                    content: "Run focused gates".to_string(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+            completion_pct: 0,
+            in_progress_id: Some(1),
+        }),
+        plan_snapshot: Some(PlanSnapshot {
+            objective: Some("Keep strategy separate".to_string()),
+            ..PlanSnapshot::default()
+        }),
+        subagent_snapshots: Vec::new(),
+    };
+
+    let block = state.to_system_block().expect("fork state block");
+
+    assert!(block.contains("### Work"));
+    assert!(block.contains("Checklist (0% complete)"));
+    assert!(block.contains("- [~] Wire Fleet progress projection"));
+    assert!(block.contains("Strategy metadata"));
+    assert!(block.contains("Objective: Keep strategy separate"));
+    assert!(!block.contains("Todo list"));
 }
 
 #[test]
@@ -295,6 +424,222 @@ fn ask_rule_engine(command: &str) -> codewhale_execpolicy::ExecPolicyEngine {
     ])
 }
 
+fn file_ask_rule_engine(tool: &str, path: &str) -> codewhale_execpolicy::ExecPolicyEngine {
+    codewhale_execpolicy::ExecPolicyEngine::with_rulesets(vec![
+        codewhale_execpolicy::Ruleset::user(vec![], vec![]).with_ask_rules(vec![
+            codewhale_execpolicy::ToolAskRule::file_path(tool, path),
+        ]),
+    ])
+}
+
+#[test]
+fn auto_review_policy_forces_prompt_for_publish_like_actions() {
+    let (decision, audit) = auto_review_plan_decision(
+        &crate::tui::auto_review::AutoReviewPolicy::default(),
+        "git_push",
+        &json!({"remote": "origin", "branch": "main"}),
+        crate::tui::auto_review::RunOrigin::Interactive,
+        crate::tui::approval::ApprovalMode::Auto,
+        Some("push the release branch"),
+        true,
+        false,
+    );
+
+    assert_eq!(
+        decision,
+        AutoReviewPlanDecision::ForcePrompt(
+            "Auto-review policy requires approval: publish-like actions require a durable review step"
+                .to_string()
+        )
+    );
+    assert_eq!(audit["decision"], "hold_for_review");
+    assert_eq!(audit["action_kind"], "publish");
+}
+
+#[test]
+fn auto_review_policy_forces_prompt_for_shell_git_push() {
+    let (decision, audit) = auto_review_plan_decision(
+        &crate::tui::auto_review::AutoReviewPolicy::default(),
+        "exec_shell",
+        &json!({"command": "git push origin main"}),
+        crate::tui::auto_review::RunOrigin::Interactive,
+        crate::tui::approval::ApprovalMode::Auto,
+        Some("push the release branch"),
+        true,
+        false,
+    );
+
+    assert_eq!(
+        decision,
+        AutoReviewPlanDecision::ForcePrompt(
+            "Auto-review policy requires approval: publish-like actions require a durable review step"
+                .to_string()
+        )
+    );
+    assert_eq!(audit["decision"], "hold_for_review");
+    assert_eq!(audit["action_kind"], "publish");
+}
+
+#[test]
+fn auto_review_policy_blocks_hold_when_approval_is_never() {
+    let (decision, audit) = auto_review_plan_decision(
+        &crate::tui::auto_review::AutoReviewPolicy::default(),
+        "github_publish_release",
+        &json!({"tag": "v0.8.64"}),
+        crate::tui::auto_review::RunOrigin::Interactive,
+        crate::tui::approval::ApprovalMode::Never,
+        Some("publish release"),
+        true,
+        false,
+    );
+
+    assert_eq!(
+        decision,
+        AutoReviewPlanDecision::Block(
+            "Auto-review policy requires approval: publish-like actions require a durable review step"
+                .to_string()
+        )
+    );
+    assert_eq!(audit["approval_mode"], "NEVER");
+    assert_eq!(audit["decision"], "hold_for_review");
+}
+
+#[test]
+fn rlm_eval_required_approval_ignores_generic_auto_approve() {
+    assert!(registered_tool_approval_required(
+        "rlm_eval",
+        ApprovalRequirement::Required,
+        true
+    ));
+}
+
+#[test]
+fn generic_required_tools_keep_auto_approve_behavior() {
+    assert!(!registered_tool_approval_required(
+        "exec_shell",
+        ApprovalRequirement::Required,
+        true
+    ));
+    assert!(registered_tool_approval_required(
+        "exec_shell",
+        ApprovalRequirement::Required,
+        false
+    ));
+}
+
+#[test]
+fn auto_review_policy_does_not_change_generic_destructive_auto_approval_yet() {
+    let (decision, audit) = auto_review_plan_decision(
+        &crate::tui::auto_review::AutoReviewPolicy::default(),
+        "exec_shell",
+        &json!({"command": "cargo test"}),
+        crate::tui::auto_review::RunOrigin::Interactive,
+        crate::tui::approval::ApprovalMode::Auto,
+        Some("run tests"),
+        true,
+        false,
+    );
+
+    assert_eq!(decision, AutoReviewPlanDecision::NoChange);
+    assert_eq!(audit["decision"], "ask_user");
+    assert_eq!(audit["risk"], "destructive");
+}
+
+#[test]
+fn auto_review_run_origin_marks_detached_tools_as_background() {
+    assert_eq!(
+        auto_review_run_origin_for_plan(false),
+        crate::tui::auto_review::RunOrigin::Interactive
+    );
+    assert_eq!(
+        auto_review_run_origin_for_plan(true),
+        crate::tui::auto_review::RunOrigin::Background
+    );
+}
+
+#[test]
+fn auto_review_policy_holds_background_destructive_auto_approval() {
+    let (decision, audit) = auto_review_plan_decision(
+        &crate::tui::auto_review::AutoReviewPolicy::default(),
+        "exec_shell",
+        &json!({"command": "cargo test", "background": true}),
+        crate::tui::auto_review::RunOrigin::Background,
+        crate::tui::approval::ApprovalMode::Auto,
+        Some("run tests in the background"),
+        true,
+        false,
+    );
+
+    assert_eq!(
+        decision,
+        AutoReviewPlanDecision::ForcePrompt(
+            "Auto-review policy requires approval: destructive background/headless actions cannot auto-approve"
+                .to_string()
+        )
+    );
+    assert_eq!(audit["run_origin"], "background");
+    assert_eq!(audit["decision"], "hold_for_review");
+}
+
+#[test]
+fn auto_review_policy_blocks_background_hold_when_approval_is_never() {
+    let (decision, audit) = auto_review_plan_decision(
+        &crate::tui::auto_review::AutoReviewPolicy::default(),
+        "exec_shell",
+        &json!({"command": "cargo test", "background": true}),
+        crate::tui::auto_review::RunOrigin::Background,
+        crate::tui::approval::ApprovalMode::Never,
+        Some("run tests in the background"),
+        true,
+        false,
+    );
+
+    assert_eq!(
+        decision,
+        AutoReviewPlanDecision::Block(
+            "Auto-review policy requires approval: destructive background/headless actions cannot auto-approve"
+                .to_string()
+        )
+    );
+    assert_eq!(audit["approval_mode"], "NEVER");
+    assert_eq!(audit["run_origin"], "background");
+}
+
+#[test]
+fn auto_review_plan_decision_uses_configured_policy() {
+    let policy = crate::tui::auto_review::AutoReviewPolicy {
+        block_rules: vec![
+            crate::tui::auto_review::AutoReviewRule::block(
+                "configured-shell-block",
+                "shell requires maintainer review",
+            )
+            .action_kind(crate::tui::auto_review::ToolActionKind::Shell),
+        ],
+        ..Default::default()
+    };
+
+    let (decision, audit) = auto_review_plan_decision(
+        &policy,
+        "exec_shell",
+        &json!({"command": "cargo test"}),
+        crate::tui::auto_review::RunOrigin::Interactive,
+        crate::tui::approval::ApprovalMode::Auto,
+        Some("run tests"),
+        true,
+        false,
+    );
+
+    assert_eq!(
+        decision,
+        AutoReviewPlanDecision::Block(
+            "Auto-review policy blocked tool 'exec_shell': shell requires maintainer review"
+                .to_string()
+        )
+    );
+    assert_eq!(audit["decision"], "block");
+    assert_eq!(audit["rule_id"], "configured-shell-block");
+}
+
 #[test]
 fn exec_shell_ask_rule_decision_prompts_for_matching_auto_command() {
     let config = EngineConfig {
@@ -312,7 +657,7 @@ fn exec_shell_ask_rule_decision_prompts_for_matching_auto_command() {
 
     assert_eq!(
         decision,
-        Some(ExecShellAskRuleDecision::Prompt(
+        Some(ToolAskRuleDecision::Prompt(
             "Typed ask rule 'tool=exec_shell command=cargo test' requires approval.".to_string()
         ))
     );
@@ -335,7 +680,7 @@ fn exec_shell_ask_rule_decision_blocks_matching_never_command() {
 
     assert_eq!(
         decision,
-        Some(ExecShellAskRuleDecision::Block(
+        Some(ToolAskRuleDecision::Block(
             "Typed ask rule 'tool=exec_shell command=cargo test' requires approval, but approval policy is never.".to_string()
         ))
     );
@@ -352,6 +697,71 @@ fn exec_shell_ask_rule_decision_ignores_unmatched_command() {
         &config,
         "exec_shell",
         &json!({"command": "git status"}),
+        Path::new("/repo"),
+        crate::tui::approval::ApprovalMode::Auto,
+    );
+
+    assert_eq!(decision, None);
+}
+
+#[test]
+fn file_ask_rule_decision_prompts_for_matching_read_path() {
+    let config = EngineConfig {
+        exec_policy_engine: file_ask_rule_engine("read_file", "secrets/api_key.txt"),
+        ..EngineConfig::default()
+    };
+
+    let decision = file_tool_ask_rule_decision(
+        &config,
+        "read_file",
+        &json!({"path": "secrets/api_key.txt"}),
+        Path::new("/repo"),
+        crate::tui::approval::ApprovalMode::Auto,
+    );
+
+    assert_eq!(
+        decision,
+        Some(ToolAskRuleDecision::Prompt(
+            "Typed ask rule 'tool=read_file path=secrets/api_key.txt' requires approval."
+                .to_string()
+        ))
+    );
+}
+
+#[test]
+fn file_ask_rule_decision_blocks_matching_read_path_when_approval_is_never() {
+    let config = EngineConfig {
+        exec_policy_engine: file_ask_rule_engine("read_file", "secrets/api_key.txt"),
+        ..EngineConfig::default()
+    };
+
+    let decision = file_tool_ask_rule_decision(
+        &config,
+        "read_file",
+        &json!({"path": "secrets/api_key.txt"}),
+        Path::new("/repo"),
+        crate::tui::approval::ApprovalMode::Never,
+    );
+
+    assert_eq!(
+        decision,
+        Some(ToolAskRuleDecision::Block(
+            "Typed ask rule 'tool=read_file path=secrets/api_key.txt' requires approval, but approval policy is never.".to_string()
+        ))
+    );
+}
+
+#[test]
+fn file_ask_rule_decision_ignores_unmatched_path() {
+    let config = EngineConfig {
+        exec_policy_engine: file_ask_rule_engine("read_file", "secrets/api_key.txt"),
+        ..EngineConfig::default()
+    };
+
+    let decision = file_tool_ask_rule_decision(
+        &config,
+        "read_file",
+        &json!({"path": "docs/readme.md"}),
         Path::new("/repo"),
         crate::tui::approval::ApprovalMode::Auto,
     );
@@ -856,10 +1266,14 @@ fn non_yolo_mode_retains_default_defer_policy() {
     assert!(!should_default_defer_tool("run_tests", &always_load));
     assert!(!should_default_defer_tool("agent", &always_load));
     assert!(!should_default_defer_tool("read_file", &always_load));
+    assert!(!should_default_defer_tool(
+        "wait_for_dev_server",
+        &always_load
+    ));
     assert!(!should_default_defer_tool("web_search", &always_load));
     assert!(!should_default_defer_tool("write_file", &always_load));
-    assert!(!should_default_defer_tool("task_shell_start", &always_load));
-    assert!(!should_default_defer_tool("task_shell_wait", &always_load));
+    assert!(should_default_defer_tool("task_shell_start", &always_load));
+    assert!(should_default_defer_tool("task_shell_wait", &always_load));
     assert!(should_default_defer_tool("git_blame", &always_load));
 }
 
@@ -893,6 +1307,72 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
     assert_eq!(defer_loading("project_map"), Some(true));
     assert_eq!(defer_loading("list_mcp_resources"), Some(false));
     assert_eq!(defer_loading("mcp_server_write"), Some(true));
+}
+
+#[test]
+fn capability_compact_surface_defers_nonessential_core_tools() {
+    let always_load = HashSet::new();
+    let catalog = build_model_tool_catalog_with_surface(
+        vec![
+            api_tool("agent"),
+            api_tool("grep_files"),
+            api_tool("read_file"),
+            api_tool("run_tests"),
+            api_tool(TOOL_SEARCH_NAME),
+            api_tool("update_plan"),
+            api_tool("web_search"),
+            api_tool("write_file"),
+        ],
+        vec![api_tool("list_mcp_resources"), api_tool("mcp_server_write")],
+        AppMode::Agent,
+        &always_load,
+        crate::model_profile::ToolSurfaceBudget::Compact,
+    );
+
+    let defer_loading = |name: &str| {
+        catalog
+            .iter()
+            .find(|tool| tool.name == name)
+            .and_then(|tool| tool.defer_loading)
+    };
+
+    assert_eq!(defer_loading("read_file"), Some(false));
+    assert_eq!(defer_loading("grep_files"), Some(false));
+    assert_eq!(defer_loading("update_plan"), Some(false));
+    assert_eq!(defer_loading("write_file"), Some(false));
+    assert_eq!(defer_loading(TOOL_SEARCH_NAME), Some(false));
+    assert_eq!(defer_loading("list_mcp_resources"), Some(false));
+    assert_eq!(defer_loading("agent"), Some(true));
+    assert_eq!(defer_loading("run_tests"), Some(true));
+    assert_eq!(defer_loading("web_search"), Some(true));
+    assert_eq!(defer_loading("mcp_server_write"), Some(true));
+}
+
+#[test]
+fn capability_full_surface_preserves_default_core_tools() {
+    let always_load = HashSet::new();
+    let catalog = build_model_tool_catalog_with_surface(
+        vec![
+            api_tool("agent"),
+            api_tool("read_file"),
+            api_tool("run_tests"),
+        ],
+        Vec::new(),
+        AppMode::Agent,
+        &always_load,
+        crate::model_profile::ToolSurfaceBudget::Full,
+    );
+
+    for name in ["agent", "read_file", "run_tests"] {
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.defer_loading),
+            Some(false),
+            "{name} should stay eager on full tool surfaces"
+        );
+    }
 }
 
 #[test]
@@ -1024,7 +1504,7 @@ fn agent_catalog_advertises_and_searches_core_action_tools() {
 
         let mut active = initial_active_tools(&catalog);
         let result = execute_tool_search(
-            TOOL_SEARCH_BM25_NAME,
+            TOOL_SEARCH_NAME,
             &json!({ "query": tool_name }),
             &catalog,
             &mut active,
@@ -1080,7 +1560,7 @@ fn tool_search_reports_known_core_action_tool_when_current_catalog_omits_it() {
     let mut active = initial_active_tools(&catalog);
 
     let result = execute_tool_search(
-        TOOL_SEARCH_BM25_NAME,
+        TOOL_SEARCH_NAME,
         &json!({ "query": "exec_shell" }),
         &catalog,
         &mut active,
@@ -2778,11 +3258,48 @@ fn non_external_provenance_cannot_inherit_yolo_auto_approval() {
 }
 
 #[test]
-fn review_only_external_input_keeps_explicit_mode_with_advisory_hint() {
-    // Review-only wording must never silently override an explicitly chosen
-    // mode (Yolo/Agent) or strip its tools. The heuristic should only surface
-    // an advisory hint suggesting `/mode plan` for strict read-only tools.
+fn self_generated_fake_approvals_cannot_authorize_work() {
+    let non_external_origins = [
+        UserInputProvenance::Runtime,
+        UserInputProvenance::SubAgentHandoff,
+        UserInputProvenance::ImportedTranscript,
+        UserInputProvenance::MemoryRecall,
+        UserInputProvenance::AssistantGenerated,
+    ];
 
+    for provenance in non_external_origins {
+        for content in ["改吧", "嗯"] {
+            let policy = effective_input_policy(
+                provenance,
+                AppMode::Yolo,
+                content,
+                true,
+                true,
+                true,
+                crate::tui::approval::ApprovalMode::Auto,
+            );
+
+            assert_eq!(policy.mode, AppMode::Agent, "{provenance:?} {content}");
+            assert!(!policy.trust_mode, "{provenance:?} {content}");
+            assert!(!policy.auto_approve, "{provenance:?} {content}");
+            assert_eq!(
+                policy.approval_mode,
+                crate::tui::approval::ApprovalMode::Suggest,
+                "{provenance:?} {content}"
+            );
+            assert!(
+                policy
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("not external user input")),
+                "{provenance:?} {content}"
+            );
+        }
+    }
+}
+
+#[test]
+fn review_only_external_input_gets_read_only_policy_until_write_is_explicit() {
     let agent = effective_input_policy(
         UserInputProvenance::ExternalUser,
         AppMode::Agent,
@@ -2792,16 +3309,16 @@ fn review_only_external_input_keeps_explicit_mode_with_advisory_hint() {
         true,
         crate::tui::approval::ApprovalMode::Auto,
     );
-    assert_eq!(agent.mode, AppMode::Agent);
+    assert_eq!(agent.mode, AppMode::Plan);
     assert!(agent.allow_shell);
-    assert!(agent.trust_mode);
-    assert!(agent.auto_approve);
+    assert!(!agent.trust_mode);
+    assert!(!agent.auto_approve);
     assert!(matches!(
         agent.approval_mode,
-        crate::tui::approval::ApprovalMode::Auto
+        crate::tui::approval::ApprovalMode::Suggest
     ));
     assert!(agent.status.as_deref().is_some_and(|status| {
-        status.contains("Keeping your current mode") && status.contains("/mode plan")
+        status.contains("read-only Plan tools") && status.contains("explicit fix/edit/commit")
     }));
 
     let yolo = effective_input_policy(
@@ -2813,17 +3330,29 @@ fn review_only_external_input_keeps_explicit_mode_with_advisory_hint() {
         true,
         crate::tui::approval::ApprovalMode::Auto,
     );
-    assert_eq!(yolo.mode, AppMode::Yolo);
+    assert_eq!(yolo.mode, AppMode::Plan);
     assert!(yolo.allow_shell);
-    assert!(yolo.trust_mode);
-    assert!(yolo.auto_approve);
+    assert!(!yolo.trust_mode);
+    assert!(!yolo.auto_approve);
     assert!(matches!(
         yolo.approval_mode,
-        crate::tui::approval::ApprovalMode::Auto
+        crate::tui::approval::ApprovalMode::Suggest
     ));
     assert!(yolo.status.as_deref().is_some_and(|status| {
-        status.contains("Keeping your current mode") && status.contains("/mode plan")
+        status.contains("read-only Plan tools") && status.contains("explicit fix/edit/commit")
     }));
+
+    let explicit_write = effective_input_policy(
+        UserInputProvenance::ExternalUser,
+        AppMode::Agent,
+        "检查外卖模块并修复缺少的多语言注入",
+        true,
+        false,
+        false,
+        crate::tui::approval::ApprovalMode::Suggest,
+    );
+    assert_eq!(explicit_write.mode, AppMode::Agent);
+    assert!(explicit_write.status.is_none());
 }
 
 #[test]
@@ -3289,7 +3818,7 @@ fn tool_search_activates_discovered_deferred_tools() {
     ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
     let mut active = initial_active_tools(&catalog);
     let result = execute_tool_search(
-        TOOL_SEARCH_BM25_NAME,
+        TOOL_SEARCH_NAME,
         &json!({"query":"read file"}),
         &catalog,
         &mut active,
@@ -3331,11 +3860,11 @@ fn tool_search_reference_count(result: &ToolResult) -> usize {
 fn tool_search_defaults_to_twenty_results_for_regex_and_bm25() {
     let catalog = tool_search_catalog_with_matches(25);
 
-    for tool_name in [TOOL_SEARCH_REGEX_NAME, TOOL_SEARCH_BM25_NAME] {
+    for match_kind in ["regex", "bm25"] {
         let mut active = initial_active_tools(&catalog);
         let result = execute_tool_search(
-            tool_name,
-            &json!({"query":"matching"}),
+            TOOL_SEARCH_NAME,
+            &json!({"query":"matching","match":match_kind}),
             &catalog,
             &mut active,
         )
@@ -3351,7 +3880,7 @@ fn tool_search_respects_and_caps_max_results() {
 
     let mut active = initial_active_tools(&catalog);
     let limited = execute_tool_search(
-        TOOL_SEARCH_BM25_NAME,
+        TOOL_SEARCH_NAME,
         &json!({"query":"matching","max_results":7}),
         &catalog,
         &mut active,
@@ -3361,8 +3890,8 @@ fn tool_search_respects_and_caps_max_results() {
 
     let mut active = initial_active_tools(&catalog);
     let capped = execute_tool_search(
-        TOOL_SEARCH_REGEX_NAME,
-        &json!({"query":"matching","max_results":999}),
+        TOOL_SEARCH_NAME,
+        &json!({"query":"matching","match":"regex","max_results":999}),
         &catalog,
         &mut active,
     )
@@ -3376,17 +3905,16 @@ fn tool_search_schema_exposes_max_results_default_and_cap() {
     let always_load = HashSet::new();
     ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
 
-    for tool_name in [TOOL_SEARCH_REGEX_NAME, TOOL_SEARCH_BM25_NAME] {
-        let tool = catalog
-            .iter()
-            .find(|tool| tool.name == tool_name)
-            .expect("tool search definition exists");
-        let schema = &tool.input_schema["properties"]["max_results"];
+    let tool = catalog
+        .iter()
+        .find(|tool| tool.name == TOOL_SEARCH_NAME)
+        .expect("tool search definition exists");
+    let schema = &tool.input_schema["properties"]["max_results"];
 
-        assert_eq!(schema["default"], 20);
-        assert_eq!(schema["maximum"], 100);
-        assert_eq!(schema["minimum"], 1);
-    }
+    assert_eq!(schema["default"], 20);
+    assert_eq!(schema["maximum"], 100);
+    assert_eq!(schema["minimum"], 1);
+    assert_eq!(tool.input_schema["properties"]["match"]["default"], "bm25");
 }
 
 #[tokio::test]
@@ -3397,6 +3925,29 @@ async fn code_execution_runs_python_and_returns_result_payload() {
             .await
             .expect("code execution should run");
     assert!(result.content.contains("hello from code exec"));
+    assert!(result.content.contains("return_code"));
+}
+
+#[tokio::test]
+async fn code_execution_runs_through_common_executor_after_approval_gate() {
+    let tmp = tempdir().expect("tempdir");
+    let (tx_event, _rx_event) = mpsc::channel(8);
+    let result = Engine::execute_tool_with_lock(
+        Arc::new(RwLock::new(())),
+        false,
+        false,
+        tx_event,
+        CODE_EXECUTION_TOOL_NAME.to_string(),
+        json!({"code":"print('common executor code exec')"}),
+        tmp.path().to_path_buf(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("code_execution should run through common executor");
+
+    assert!(result.content.contains("common executor code exec"));
     assert!(result.content.contains("return_code"));
 }
 
@@ -3478,7 +4029,7 @@ fn missing_tool_error_message_offers_suggestions() {
     let message = missing_tool_error_message("reed_file", &catalog);
     assert!(message.contains("Did you mean:"));
     assert!(message.contains("read_file"));
-    assert!(message.contains(TOOL_SEARCH_BM25_NAME));
+    assert!(message.contains(TOOL_SEARCH_NAME));
 }
 
 #[test]
@@ -3497,7 +4048,7 @@ fn missing_tool_error_message_includes_discovery_guidance_when_no_match() {
 
     let message = missing_tool_error_message("totally_unknown_tool", &catalog);
     assert!(message.contains("not available in the current tool catalog"));
-    assert!(message.contains(TOOL_SEARCH_BM25_NAME));
+    assert!(message.contains(TOOL_SEARCH_NAME));
 }
 
 #[test]
@@ -3530,10 +4081,7 @@ fn missing_shell_tool_error_message_names_allow_shell_gate() {
         );
         assert!(!message.contains("YOLO"), "{tool_name}: {message}");
         assert!(!message.contains("auto-approve"), "{tool_name}: {message}");
-        assert!(
-            message.contains(TOOL_SEARCH_BM25_NAME),
-            "{tool_name}: {message}"
-        );
+        assert!(message.contains(TOOL_SEARCH_NAME), "{tool_name}: {message}");
     }
 }
 
@@ -3552,7 +4100,7 @@ fn missing_shell_tool_error_message_keeps_allow_shell_hint_with_suggestions() {
     assert!(message.contains("Agent mode"));
     assert!(!message.contains("YOLO"));
     assert!(!message.contains("auto-approve"));
-    assert!(message.contains(TOOL_SEARCH_BM25_NAME));
+    assert!(message.contains(TOOL_SEARCH_NAME));
 }
 
 #[test]
@@ -3628,6 +4176,27 @@ fn filter_tool_call_delta_strips_function_calls_marker() {
     assert!(!visible.contains("</function_calls>"));
     assert!(visible.contains("head"));
     assert!(visible.contains("tail"));
+}
+
+#[test]
+fn filter_tool_call_delta_strips_siliconflow_v4_dsml_content_fixture() {
+    // #2900: a SiliconFlow CN `deepseek-ai/DeepSeek-V4-Pro` stream can leak
+    // DSML/function-call markup through the ordinary content channel. Keep it
+    // out of visible assistant text; do not reinterpret `<function_calls>` as
+    // an executable legacy text tool call.
+    let mut in_block = false;
+    let visible_a = filter_tool_call_delta(
+        "visible prefix <function_calls>\n{\"name\":\"exec_shell\",\"arguments\":{\"cmd\":\"echo leaked\"}}",
+        &mut in_block,
+    );
+    assert!(in_block);
+    assert_eq!(visible_a, "visible prefix ");
+
+    let visible_b = filter_tool_call_delta("\n</function_calls> visible suffix", &mut in_block);
+    assert!(!in_block);
+    assert_eq!(visible_b, " visible suffix");
+    assert!(!visible_b.contains("exec_shell"));
+    assert!(!visible_b.contains("<function_calls>"));
 }
 
 #[test]

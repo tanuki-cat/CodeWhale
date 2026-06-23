@@ -69,7 +69,10 @@ pub fn provider(app: &mut App, args: Option<&str>) -> CommandResult {
         Some(raw) if provider_passes_model_through(target) => Some(raw.trim().to_string()),
         Some(raw) => {
             let expanded = expand_model_alias_for_provider(target, raw);
-            let normalized = if matches!(target, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+            let normalized = if matches!(
+                target,
+                ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Together
+            ) {
                 normalize_model_name_for_provider(target, &expanded)
             } else {
                 normalize_model_name(&expanded)
@@ -151,6 +154,7 @@ fn expand_model_alias_for_provider(provider: ApiProvider, name: &str) -> String 
     if matches!(provider, ApiProvider::XiaomiMimo) {
         return match lower.as_str() {
             "pro" | "mimo" => "mimo-v2.5-pro".to_string(),
+            "ultraspeed" | "pro-ultraspeed" => "mimo-v2.5-pro-ultraspeed".to_string(),
             "text" | "omni" | "v2.5-omni" => "mimo-v2.5".to_string(),
             "tts" | "speech" | "mimo-tts" => "mimo-v2.5-tts".to_string(),
             "voicedesign" | "voice-design" | "mimo-voice-design" => {
@@ -173,7 +177,7 @@ fn expand_model_alias_for_provider(provider: ApiProvider, name: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, DEFAULT_TOGETHER_FLASH_MODEL, DEFAULT_TOGETHER_MODEL};
     use crate::tui::app::TuiOptions;
     use std::path::PathBuf;
 
@@ -279,6 +283,8 @@ mod tests {
     fn switch_to_xiaomi_mimo_accepts_chat_shorthands() {
         let mut app = create_test_app();
         for (input, expected) in [
+            ("xiaomi-mimo pro-ultraspeed", "mimo-v2.5-pro-ultraspeed"),
+            ("xiaomi-mimo ultraspeed", "mimo-v2.5-pro-ultraspeed"),
             ("xiaomi-mimo omni", "mimo-v2.5"),
             ("xiaomi-mimo v2.5-omni", "mimo-v2.5"),
         ] {
@@ -314,6 +320,32 @@ mod tests {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider, ApiProvider::WanjieArk);
                 assert_eq!(model.as_deref(), Some("account-model-id"));
+            }
+            other => panic!("expected SwitchProvider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn switch_to_openai_preserves_dashscope_model_id() {
+        let mut app = create_test_app();
+        let result = provider(&mut app, Some("openai qwen-plus"));
+        match result.action {
+            Some(AppAction::SwitchProvider { provider, model }) => {
+                assert_eq!(provider, ApiProvider::Openai);
+                assert_eq!(model.as_deref(), Some("qwen-plus"));
+            }
+            other => panic!("expected SwitchProvider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn switch_to_qianfan_preserves_model_id() {
+        let mut app = create_test_app();
+        let result = provider(&mut app, Some("qianfan custom-qianfan-service-id"));
+        match result.action {
+            Some(AppAction::SwitchProvider { provider, model }) => {
+                assert_eq!(provider, ApiProvider::Qianfan);
+                assert_eq!(model.as_deref(), Some("custom-qianfan-service-id"));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }
@@ -366,6 +398,28 @@ mod tests {
             Some(AppAction::SwitchProvider { provider, model }) => {
                 assert_eq!(provider, ApiProvider::SiliconflowCn);
                 assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+            }
+            other => panic!("expected SwitchProvider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn switch_to_together_accepts_provider_owned_deepseek_aliases() {
+        let mut app = create_test_app();
+        let result = provider(&mut app, Some("together deepseek-v4-pro"));
+        match result.action {
+            Some(AppAction::SwitchProvider { provider, model }) => {
+                assert_eq!(provider, ApiProvider::Together);
+                assert_eq!(model.as_deref(), Some(DEFAULT_TOGETHER_MODEL));
+            }
+            other => panic!("expected SwitchProvider, got {other:?}"),
+        }
+
+        let result = provider(&mut app, Some("together flash"));
+        match result.action {
+            Some(AppAction::SwitchProvider { provider, model }) => {
+                assert_eq!(provider, ApiProvider::Together);
+                assert_eq!(model.as_deref(), Some(DEFAULT_TOGETHER_FLASH_MODEL));
             }
             other => panic!("expected SwitchProvider, got {other:?}"),
         }

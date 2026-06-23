@@ -9,36 +9,6 @@ use super::*;
 use crate::core::ops::UserInputProvenance;
 use crate::prompt_zones::PinnedPrefix;
 
-fn loop_guard_block_tool_result(
-    tool_name: &str,
-    message: String,
-    kind: AttemptBlockKind,
-) -> ToolResult {
-    if loop_guard_block_is_guidance(tool_name) {
-        return ToolResult::success(message).with_metadata(json!({
-            "loop_guard": kind.as_str(),
-            "loop_guard_guidance": true,
-            "executed": false,
-        }));
-    }
-
-    ToolResult::error(message).with_metadata(json!({"loop_guard": kind.as_str()}))
-}
-
-fn loop_guard_block_is_guidance(tool_name: &str) -> bool {
-    let normalized = tool_name.to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "grep_files"
-            | "file_search"
-            | "list_dir"
-            | "web_search"
-            | "fetch_url"
-            | "tool_search_tool_regex"
-            | "tool_search_tool_bm25"
-    ) || normalized.contains("search")
-}
-
 const MAX_APPROVAL_INTENT_SUMMARY_CHARS: usize = 2_000;
 
 fn approval_intent_summary(text: &str) -> Option<String> {
@@ -56,6 +26,24 @@ fn approval_intent_summary(text: &str) -> Option<String> {
         summary.push_str("...");
     }
     Some(summary)
+}
+
+pub(super) fn registered_tool_approval_required(
+    tool_name: &str,
+    requirement: ApprovalRequirement,
+    auto_approve: bool,
+) -> bool {
+    if requirement == ApprovalRequirement::Auto {
+        return false;
+    }
+    if registered_tool_requires_non_bypassable_approval(tool_name) {
+        return true;
+    }
+    !auto_approve
+}
+
+fn registered_tool_requires_non_bypassable_approval(tool_name: &str) -> bool {
+    matches!(tool_name, "rlm_eval")
 }
 
 impl Engine {
@@ -151,7 +139,6 @@ impl Engine {
             }
         }
         let mut active_tool_names = initial_active_tools(&tool_catalog);
-        let mut loop_guard = LoopGuard::default();
         let mut goal_continuations_this_turn = 0u32;
 
         // Outer stream-retry counter: when the chunked-transfer connection
@@ -1547,9 +1534,11 @@ impl Engine {
                 } else if let Some(registry) = tool_registry
                     && let Some(spec) = registry.get(&tool_name)
                 {
-                    approval_required = spec.approval_requirement_for(&tool_input)
-                        != ApprovalRequirement::Auto
-                        && !registry.context().auto_approve;
+                    approval_required = registered_tool_approval_required(
+                        &tool_name,
+                        spec.approval_requirement_for(&tool_input),
+                        registry.context().auto_approve,
+                    );
                     approval_description = spec.description().to_string();
                     supports_parallel = spec.supports_parallel_for(&tool_input);
                     read_only = spec.is_read_only_for(&tool_input);
@@ -1582,22 +1571,63 @@ impl Engine {
                     approval_required = true;
                 }
 
-                if blocked_error.is_none()
-                    && let Some(decision) = exec_shell_ask_rule_decision(
+                if blocked_error.is_none() {
+                    let ask_rule_decision = exec_shell_ask_rule_decision(
                         &self.config,
                         &tool_name,
                         &tool_input,
                         &self.session.workspace,
                         self.session.approval_mode,
                     )
-                {
+                    .or_else(|| {
+                        file_tool_ask_rule_decision(
+                            &self.config,
+                            &tool_name,
+                            &tool_input,
+                            &self.session.workspace,
+                            self.session.approval_mode,
+                        )
+                    });
+                    if let Some(decision) = ask_rule_decision {
+                        match decision {
+                            ToolAskRuleDecision::Prompt(reason) => {
+                                approval_required = true;
+                                approval_description = reason;
+                                approval_force_prompt = true;
+                            }
+                            ToolAskRuleDecision::Block(reason) => {
+                                approval_required = false;
+                                approval_force_prompt = false;
+                                blocked_error = Some(ToolError::permission_denied(reason));
+                            }
+                        }
+                    }
+                }
+
+                if blocked_error.is_none() {
+                    let (decision, audit_event) = auto_review_plan_decision(
+                        &self.config.auto_review_policy,
+                        &tool_name,
+                        &tool_input,
+                        auto_review_run_origin_for_plan(detached_start),
+                        self.session.approval_mode,
+                        None,
+                        crate::config::is_workspace_trusted(&self.session.workspace),
+                        false,
+                    );
+                    emit_tool_audit(json!({
+                        "event": "tool.auto_review_decision",
+                        "tool_id": tool_id.clone(),
+                        "auto_review": audit_event,
+                    }));
                     match decision {
-                        ExecShellAskRuleDecision::Prompt(reason) => {
+                        AutoReviewPlanDecision::NoChange => {}
+                        AutoReviewPlanDecision::ForcePrompt(reason) => {
                             approval_required = true;
                             approval_description = reason;
                             approval_force_prompt = true;
                         }
-                        ExecShellAskRuleDecision::Block(reason) => {
+                        AutoReviewPlanDecision::Block(reason) => {
                             approval_required = false;
                             approval_force_prompt = false;
                             blocked_error = Some(ToolError::permission_denied(reason));
@@ -1627,15 +1657,6 @@ impl Engine {
                         let _ = self.tx_event.send(Event::status(status)).await;
                     }
                     guard_result = Some(result);
-                }
-
-                if blocked_error.is_none()
-                    && guard_result.is_none()
-                    && let AttemptDecision::Block { kind, message } =
-                        loop_guard.record_attempt(&tool_name, &tool_input, read_only)
-                {
-                    crate::logging::warn(message.clone());
-                    guard_result = Some(loop_guard_block_tool_result(&tool_name, message, kind));
                 }
 
                 plans.push(ToolExecutionPlan {
@@ -1801,6 +1822,7 @@ impl Engine {
                         let session_id = self.session.id.clone();
                         let started_at = Instant::now();
                         let shell_permits = shell_permits.clone();
+                        let workspace = self.session.workspace.clone();
 
                         tool_tasks.push(async move {
                             let _shell_permit = if plan.name == "exec_shell" {
@@ -1815,6 +1837,7 @@ impl Engine {
                                 tx_event.clone(),
                                 plan.name.clone(),
                                 plan.input.clone(),
+                                workspace,
                                 registry,
                                 mcp_pool,
                                 None,
@@ -1923,58 +1946,6 @@ impl Engine {
                                     tool_exec_lock.clone(),
                                 )
                                 .await;
-
-                            let _ = self
-                                .tx_event
-                                .send(Event::ToolCallComplete {
-                                    id: tool_id.clone(),
-                                    name: tool_name.clone(),
-                                    result: result.clone(),
-                                })
-                                .await;
-
-                            outcomes[plan.index] = Some(ToolExecOutcome {
-                                index: plan.index,
-                                id: tool_id,
-                                name: tool_name,
-                                input: tool_input,
-                                started_at,
-                                result,
-                            });
-                            continue;
-                        }
-
-                        if tool_name == CODE_EXECUTION_TOOL_NAME {
-                            let started_at = Instant::now();
-                            let result =
-                                execute_code_execution_tool(&tool_input, &self.session.workspace)
-                                    .await;
-
-                            let _ = self
-                                .tx_event
-                                .send(Event::ToolCallComplete {
-                                    id: tool_id.clone(),
-                                    name: tool_name.clone(),
-                                    result: result.clone(),
-                                })
-                                .await;
-
-                            outcomes[plan.index] = Some(ToolExecOutcome {
-                                index: plan.index,
-                                id: tool_id,
-                                name: tool_name,
-                                input: tool_input,
-                                started_at,
-                                result,
-                            });
-                            continue;
-                        }
-
-                        if tool_name == JS_EXECUTION_TOOL_NAME {
-                            let started_at = Instant::now();
-                            let result =
-                                execute_js_execution_tool(&tool_input, &self.session.workspace)
-                                    .await;
 
                             let _ = self
                                 .tx_event
@@ -2172,6 +2143,7 @@ impl Engine {
                                 self.tx_event.clone(),
                                 tool_name.clone(),
                                 tool_input.clone(),
+                                self.session.workspace.clone(),
                                 tool_registry,
                                 mcp_pool.clone(),
                                 context_override,
@@ -2231,7 +2203,6 @@ impl Engine {
             // denial that should not.
             let mut step_error_categories: Vec<ErrorCategory> = Vec::new();
             let mut stop_after_plan_tool = false;
-            let mut loop_guard_halt: Option<String> = None;
 
             for outcome in outcomes.into_iter().flatten() {
                 let tool_input = outcome.input.clone();
@@ -2241,16 +2212,6 @@ impl Engine {
 
                 match outcome.result {
                     Ok(output) => {
-                        match loop_guard.record_outcome(&outcome.name, output.success) {
-                            OutcomeDecision::Continue => {}
-                            OutcomeDecision::Warn(message) => {
-                                crate::logging::warn(message.clone());
-                                let _ = self.tx_event.send(Event::status(message)).await;
-                            }
-                            OutcomeDecision::Halt(message) => {
-                                loop_guard_halt.get_or_insert(message);
-                            }
-                        }
                         emit_tool_audit(json!({
                             "event": "tool.result",
                             "tool_id": outcome.id.clone(),
@@ -2305,16 +2266,6 @@ impl Engine {
                         .await;
                     }
                     Err(e) => {
-                        match loop_guard.record_outcome(&outcome.name, false) {
-                            OutcomeDecision::Continue => {}
-                            OutcomeDecision::Warn(message) => {
-                                crate::logging::warn(message.clone());
-                                let _ = self.tx_event.send(Event::status(message)).await;
-                            }
-                            OutcomeDecision::Halt(message) => {
-                                loop_guard_halt.get_or_insert(message);
-                            }
-                        }
                         let envelope: ErrorEnvelope = e.clone().into();
                         emit_tool_audit(json!({
                             "event": "tool.result",
@@ -2352,14 +2303,6 @@ impl Engine {
             }
 
             if stop_after_plan_tool {
-                break;
-            }
-
-            if let Some(message) = loop_guard_halt {
-                crate::logging::warn(message.clone());
-                let _ = self.tx_event.send(Event::status(message.clone())).await;
-                // 设置 turn_error 以确保最终返回 TurnOutcomeStatus::Failed 而非 Completed
-                turn_error = Some(message);
                 break;
             }
 
@@ -3102,57 +3045,6 @@ mod tests {
         assert!(
             current_tool_indices.is_empty(),
             "all entries must drain after their Stops"
-        );
-    }
-
-    #[test]
-    fn loop_guard_block_tool_result_counts_as_failure() {
-        let result = loop_guard_block_tool_result(
-            "edit_file",
-            "Blocked: repeated call".to_string(),
-            AttemptBlockKind::IdenticalToolCall,
-        );
-
-        assert!(
-            !result.success,
-            "LoopGuard blocks must count as tool failures so repeated blocked calls can trip halt handling"
-        );
-        assert_eq!(
-            result
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("loop_guard"))
-                .and_then(|v| v.as_str()),
-            Some("identical_tool_call")
-        );
-    }
-
-    #[test]
-    fn loop_guard_search_block_tool_result_is_guidance() {
-        let result = loop_guard_block_tool_result(
-            "grep_files",
-            "Stop calling `grep_files`; use current evidence.".to_string(),
-            AttemptBlockKind::NoProgressToolLoop,
-        );
-
-        assert!(
-            result.success,
-            "read-only search loop blocks should guide the model without feeding the failure loop"
-        );
-        let metadata = result.metadata.as_ref().expect("metadata");
-        assert_eq!(
-            metadata.get("loop_guard").and_then(|v| v.as_str()),
-            Some("no_progress_tool_loop")
-        );
-        assert_eq!(
-            metadata
-                .get("loop_guard_guidance")
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            metadata.get("executed").and_then(|v| v.as_bool()),
-            Some(false)
         );
     }
 

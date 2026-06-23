@@ -35,7 +35,7 @@ chosen over the available shell equivalent. Companion to `crates/tui/src/prompts
 |---|---|
 | `grep_files` | Regex search file contents within the workspace; structured matches + context lines. Pure-Rust (`regex` crate), no `rg`/`grep` shell-out. |
 | `file_search` | Fuzzy-match filenames (not contents). Use when you know roughly the name. |
-| `web_search` | DuckDuckGo by default with Bing fallback; Bing, Tavily, Bocha, Metaso, and Baidu are selectable in config. Ranked snippets + `ref_id` for citation. |
+| `web_search` | DuckDuckGo by default with Bing fallback; Bing, Tavily, Bocha, Metaso, SearXNG, Baidu, Volcengine, and Sofya are selectable in config. Ranked snippets + `ref_id` for citation. |
 | `fetch_url` | Direct HTTP GET on a known URL. Faster than `web_search` when the link is already known. HTML stripped to text by default. |
 
 ### Shell
@@ -72,10 +72,15 @@ Shell permission policy is evaluated by `crates/execpolicy`. Deny prefixes are
 checked before trusted prefixes and block matching commands regardless of layer.
 Trusted prefixes only skip approval in modes that permit trust shortcuts. Typed
 ask records are currently a narrow foundation: when one matches under
-`AskForApproval::Never`, the command is rejected because the runtime cannot ask
-the user; existing allow/deny behavior is otherwise unchanged. The TUI runtime
-loads ask-only records from the sibling `permissions.toml` file and applies
-matching `exec_shell` command ask-rules before Auto/session approval shortcuts.
+`AskForApproval::Never`, the invocation is rejected because the runtime cannot
+ask the user; existing allow/deny behavior is otherwise unchanged. The TUI
+runtime loads ask-only records from the sibling `permissions.toml` file and
+applies matching `exec_shell` command ask-rules and explicit file-path ask-rules
+before Auto/session approval shortcuts. In an `exec_shell` approval card, `S`
+approves once and saves an ask rule containing that command; only `exec_shell`
+cards support the shortcut, and saved command rules use existing arity-aware
+prefix matching. File-path ask rules can be authored in `permissions.toml` and
+matched at runtime, but cannot yet be saved from the approval UI.
 
 ### MCP manager and palette discovery
 

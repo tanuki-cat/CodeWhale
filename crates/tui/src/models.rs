@@ -15,7 +15,7 @@ pub const DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS: u32 = 1_000_000;
 /// [`compaction_threshold_for_model`] (#664).
 pub const DEFAULT_COMPACTION_TOKEN_THRESHOLD: usize = 102_400;
 const COMPACTION_THRESHOLD_PERCENT: u32 = 80;
-pub const DEFAULT_AUTO_COMPACT_MAX_CONTEXT_WINDOW_TOKENS: u32 = 262_144;
+pub const DEFAULT_AUTO_COMPACT_MAX_CONTEXT_WINDOW_TOKENS: u32 = DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS;
 
 // === Core Message Types ===
 
@@ -313,9 +313,11 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         "nvidia/nemotron-3-ultra-550b-a55b" | "nvidia/nemotron-3-ultra-550b-a55b:free" => {
             Some(1_000_000)
         }
-        "xiaomi/mimo-v2.5-pro" | "xiaomi/mimo-v2.5" | "mimo-v2.5-pro" | "mimo-v2.5" => {
-            Some(1_000_000)
-        }
+        "xiaomi/mimo-v2.5-pro"
+        | "xiaomi/mimo-v2.5"
+        | "mimo-v2.5-pro"
+        | "mimo-v2.5-pro-ultraspeed"
+        | "mimo-v2.5" => Some(1_000_000),
         "mimo-v2.5-asr"
         | "mimo-v2.5-tts"
         | "mimo-v2.5-tts-voicedesign"
@@ -353,9 +355,11 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
         "qwen/qwen3.6-flash" | "qwen/qwen3.6-max-preview" | "qwen/qwen3.6-plus" => Some(65_536),
         "z-ai/glm-5.1" | "z-ai/glm-5.2" | "z-ai/glm-5-turbo" | "glm-5.1" | "glm-5.2"
         | "glm-5-turbo" => Some(131_072),
-        "xiaomi/mimo-v2.5-pro" | "xiaomi/mimo-v2.5" | "mimo-v2.5-pro" | "mimo-v2.5" => {
-            Some(131_072)
-        }
+        "xiaomi/mimo-v2.5-pro"
+        | "xiaomi/mimo-v2.5"
+        | "mimo-v2.5-pro"
+        | "mimo-v2.5-pro-ultraspeed"
+        | "mimo-v2.5" => Some(131_072),
         "mimo-v2.5-asr" => Some(2_048),
         "mimo-v2.5-tts"
         | "mimo-v2.5-tts-voicedesign"
@@ -425,6 +429,7 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "xiaomi/mimo-v2.5-pro"
             | "xiaomi/mimo-v2.5"
             | "mimo-v2.5-pro"
+            | "mimo-v2.5-pro-ultraspeed"
             | "mimo-v2.5"
             | "z-ai/glm-5.1"
             | "z-ai/glm-5.2"
@@ -434,6 +439,12 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "glm-5-turbo"
     ) || is_openai_gpt_55_api_model(&lower)
         || is_openai_codex_model(&lower)
+}
+
+#[must_use]
+pub(crate) fn model_is_openai_reasoning_family(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    is_openai_gpt_55_api_model(&lower) || is_openai_codex_model(&lower)
 }
 
 fn is_openai_gpt_55_api_model(model_lower: &str) -> bool {
@@ -526,9 +537,8 @@ pub fn compaction_threshold_for_model_at_percent(model: &str, percent: f64) -> u
 }
 
 /// Whether auto-compaction should be enabled when the user did not explicitly
-/// configure it. V4-class 1M models keep the prefix-cache-friendly opt-in
-/// behavior; 256K-class and smaller known models need automatic pressure
-/// relief near the context wall.
+/// configure it. v0.8.64 defaults automatic continuity on for known model
+/// windows up to the V4 1M class while keeping unknown model ids opt-in.
 #[must_use]
 pub fn auto_compact_default_for_model(model: &str) -> bool {
     context_window_for_model(model)
@@ -675,6 +685,7 @@ mod tests {
             (concat!("qwen/", "qwen3.6-plus"), 1_000_000),
             (concat!("xiaomi/", "mimo-v2.5-pro"), 1_000_000),
             ("mimo-v2.5-pro", 1_000_000),
+            ("mimo-v2.5-pro-ultraspeed", 1_000_000),
             ("mimo-v2.5", 1_000_000),
             ("minimax/minimax-m3", 1_000_000),
             ("minimax/minimax-2.7", 204_800),
@@ -818,6 +829,10 @@ mod tests {
             Some(131_072)
         );
         assert_eq!(max_output_tokens_for_model("mimo-v2.5-pro"), Some(131_072));
+        assert_eq!(
+            max_output_tokens_for_model("mimo-v2.5-pro-ultraspeed"),
+            Some(131_072)
+        );
         assert_eq!(max_output_tokens_for_model("mimo-v2.5"), Some(131_072));
         assert_eq!(
             max_output_tokens_for_model("minimax/minimax-m3"),
@@ -922,11 +937,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_compaction_defaults_on_for_256k_class_models_only() {
+    fn auto_compaction_defaults_on_for_known_supported_model_windows() {
         assert!(auto_compact_default_for_model("trinity-large-thinking"));
         assert!(auto_compact_default_for_model("deepseek-v3.2-128k"));
-        assert!(!auto_compact_default_for_model("deepseek-v4-pro"));
-        assert!(!auto_compact_default_for_model("mimo-v2.5-pro"));
+        assert!(auto_compact_default_for_model("deepseek-v4-pro"));
+        assert!(auto_compact_default_for_model("mimo-v2.5-pro"));
         assert!(!auto_compact_default_for_model("unknown-model"));
     }
 }

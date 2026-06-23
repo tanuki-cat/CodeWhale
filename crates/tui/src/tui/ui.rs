@@ -178,7 +178,7 @@ const TOOL_HANG_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(900);
 // the per-tool spinner pulse — keep this fast enough that the spout reads as
 // motion (~12 fps) instead of teleport-frames.
 const UI_STATUS_ANIMATION_MS: u64 = 80;
-pub(crate) const SIDEBAR_VISIBLE_MIN_WIDTH: u16 = 100;
+pub(crate) const SIDEBAR_VISIBLE_MIN_WIDTH: u16 = 64;
 const DEFAULT_TERMINAL_PROBE_TIMEOUT_MS: u64 = 500;
 const PERIODIC_FULL_REPAINT_EVERY_N: u64 = 50;
 const TURN_META_PREFIX: &str = "<turn_meta>";
@@ -1123,11 +1123,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         mcp_config_path: config.mcp_config_path(),
         skills_dir: app.skills_dir.clone(),
         skills_scan_codewhale_only: app.skills_scan_codewhale_only,
-        instructions: config
-            .instructions_paths()
-            .into_iter()
-            .map(Into::into)
-            .collect(),
+        instructions: configured_instruction_sources(config),
         project_context_pack_enabled: config.project_context_pack_enabled(),
         translation_enabled: app.translation_enabled,
         show_thinking: app.show_thinking,
@@ -1148,6 +1144,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         launch_concurrency: config.launch_concurrency_for_provider(provider),
         subagents_enabled: config.subagents_enabled_for_provider(provider),
         features: config.features(),
+        auto_review_policy: config.auto_review_policy(),
         compaction: app.compaction_config(),
         todos: app.todos.clone(),
         plan_state: app.plan_state.clone(),
@@ -1201,6 +1198,38 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         workspace_follow_symlinks: app.workspace_follow_symlinks,
         exec_policy_engine: config.exec_policy_engine.clone(),
     }
+}
+
+fn configured_instruction_sources(config: &Config) -> Vec<prompts::InstructionSource> {
+    config
+        .instructions_paths()
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+fn build_app_system_prompt(app: &App, config: &Config) -> SystemPrompt {
+    let instructions = configured_instruction_sources(config);
+    prompts::system_prompt_for_mode_with_context_skills_and_session(
+        &app.workspace,
+        None,
+        None,
+        Some(&instructions),
+        prompts::PromptSessionContext {
+            user_memory_block: None,
+            goal_objective: app.hunt.quarry.as_deref(),
+            project_context_pack_enabled: config.project_context_pack_enabled(),
+            locale_tag: app.ui_locale.tag(),
+            translation_enabled: app.translation_enabled,
+            model_id: &app.model,
+            context_window_override: Some(
+                provider_capability(app.api_provider, &app.model).context_window,
+            ),
+            show_thinking: app.show_thinking,
+            verbosity: app.verbosity.as_deref(),
+            skills_scan_codewhale_only: app.skills_scan_codewhale_only,
+        },
+    )
 }
 
 /// How long after a task finishes it should still appear in the Work
@@ -2295,8 +2324,8 @@ async fn run_event_loop(
                         // composer receipt), regardless of notification method
                         // or platform.
                         if status == crate::core::events::TurnOutcomeStatus::Completed {
-                            // SlopLedger completion-gate: after every completed
-                            // turn, check whether there are unresolved slop entries
+                            // Debt ledger completion-gate: after every completed
+                            // turn, check whether there are unresolved entries
                             // the agent should address before claiming the task is
                             // done (#2127). This runs autonomously — no tool call
                             // required — so the agent can't forget to check.
@@ -2306,7 +2335,7 @@ async fn run_event_loop(
                             {
                                 let short = gate_msg.lines().nth(4).unwrap_or("review before done");
                                 app.push_status_toast(
-                                    format!("⚠️ SlopLedger: {short}"),
+                                    format!("⚠️ Debt ledger: {short}"),
                                     crate::tui::app::StatusToastLevel::Warning,
                                     Some(12_000),
                                 );
@@ -6105,28 +6134,7 @@ async fn dispatch_user_message(
         .map(|selection| selection.provider)
         .unwrap_or(app.api_provider);
     let message_index = app.api_messages.len();
-    app.system_prompt = Some(
-        prompts::system_prompt_for_mode_with_context_skills_and_session(
-            &app.workspace,
-            None,
-            None,
-            None,
-            prompts::PromptSessionContext {
-                user_memory_block: None,
-                goal_objective: app.hunt.quarry.as_deref(),
-                project_context_pack_enabled: config.project_context_pack_enabled(),
-                locale_tag: app.ui_locale.tag(),
-                translation_enabled: app.translation_enabled,
-                model_id: &app.model,
-                context_window_override: Some(
-                    provider_capability(app.api_provider, &app.model).context_window,
-                ),
-                show_thinking: app.show_thinking,
-                verbosity: app.verbosity.as_deref(),
-                skills_scan_codewhale_only: app.skills_scan_codewhale_only,
-            },
-        ),
-    );
+    app.system_prompt = Some(build_app_system_prompt(app, config));
     app.add_message(HistoryCell::User {
         content: message.display.clone(),
     });
@@ -6779,9 +6787,9 @@ async fn switch_provider(
         target.as_str(),
     );
     switch_summary.push(char::from(10));
-    switch_summary.push_str(&format!("Model: {} → {}", previous_model, new_model));
+    switch_summary.push_str(&format!("Model: {previous_model} → {new_model}"));
     switch_summary.push(char::from(10));
-    switch_summary.push_str(&format!("Endpoint: {}", new_endpoint));
+    switch_summary.push_str(&format!("Endpoint: {new_endpoint}"));
     if let Some(ref warning) = persist_warning {
         switch_summary.push(char::from(10));
         switch_summary.push_str(warning);
@@ -8301,6 +8309,7 @@ fn render(f: &mut Frame, app: &mut App) {
             crate::config::ApiProvider::Huggingface => Some("HF"),
             crate::config::ApiProvider::Deepinfra => Some("DeepInfra"),
             crate::config::ApiProvider::Together => Some("Together"),
+            crate::config::ApiProvider::Qianfan => Some("Qianfan"),
             crate::config::ApiProvider::OpenaiCodex => Some("Codex"),
             crate::config::ApiProvider::Zai => Some("Z.ai"),
             crate::config::ApiProvider::Stepfun => Some("StepFun"),
@@ -8879,20 +8888,22 @@ async fn handle_view_events(
                         if !recovered {
                             app.status_message = Some(format!(
                                 "Session loaded (ID: {})",
-                                &session_id[..8.min(session_id.len())]
+                                crate::session_manager::truncate_id(&session_id)
                             ));
                         }
                     }
                     Err(err) => {
-                        app.status_message =
-                            Some(format!("Failed to load session {session_id}: {err}"));
+                        app.status_message = Some(format!(
+                            "Failed to load session {}: {err}",
+                            crate::session_manager::truncate_id(&session_id)
+                        ));
                     }
                 }
             }
             ViewEvent::SessionDeleted { session_id, title } => {
                 app.status_message = Some(format!(
                     "Deleted session {} ({})",
-                    &session_id[..8.min(session_id.len())],
+                    crate::session_manager::truncate_id(&session_id),
                     title
                 ));
             }
@@ -9433,6 +9444,7 @@ async fn apply_provider_picker_api_key(
             ApiProvider::Huggingface => &mut providers.huggingface,
             ApiProvider::Deepinfra => &mut providers.deepinfra,
             ApiProvider::Together => &mut providers.together,
+            ApiProvider::Qianfan => &mut providers.qianfan,
             ApiProvider::OpenaiCodex => &mut providers.openai_codex,
             ApiProvider::Anthropic => &mut providers.anthropic,
             ApiProvider::Zai => &mut providers.zai,
@@ -9497,6 +9509,7 @@ fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, 
         ApiProvider::Huggingface => &mut providers.huggingface,
         ApiProvider::Deepinfra => &mut providers.deepinfra,
         ApiProvider::Together => &mut providers.together,
+        ApiProvider::Qianfan => &mut providers.qianfan,
         ApiProvider::OpenaiCodex => &mut providers.openai_codex,
         ApiProvider::Anthropic => &mut providers.anthropic,
         ApiProvider::Zai => &mut providers.zai,

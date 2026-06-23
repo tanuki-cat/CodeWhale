@@ -1044,7 +1044,7 @@ mod tests {
         let view = ModelPickerView::new(&app);
         let model_ids = view.visible_model_ids();
 
-        for expected in ["mimo-v2.5-pro", "mimo-v2.5"] {
+        for expected in ["mimo-v2.5-pro", "mimo-v2.5-pro-ultraspeed", "mimo-v2.5"] {
             assert!(model_ids.contains(&expected), "missing {expected}");
         }
         for deprecated in ["mimo-v2-pro", "mimo-v2-omni", "mimo-v2-flash"] {
@@ -1171,6 +1171,12 @@ mod tests {
             .insert("deepseek".to_string(), "deepseek-v4-pro".to_string());
         app.provider_models
             .insert("moonshot".to_string(), "kimi-k2.6".to_string());
+        app.provider_models
+            .insert("openai".to_string(), "qwen-plus".to_string());
+        app.provider_models.insert(
+            "qianfan".to_string(),
+            "custom-qianfan-service-id".to_string(),
+        );
 
         let view = ModelPickerView::new(&app);
         let model_ids = view.visible_model_ids();
@@ -1180,6 +1186,8 @@ mod tests {
         // Cross-provider saved models are now visible.
         assert!(model_ids.contains(&"deepseek-v4-pro"));
         assert!(model_ids.contains(&"kimi-k2.6"));
+        assert!(model_ids.contains(&"qwen-plus"));
+        assert!(model_ids.contains(&"custom-qianfan-service-id"));
         assert!(!view.show_custom_model_row);
 
         // Each cross-provider row carries its own provider so applying it
@@ -1192,6 +1200,24 @@ mod tests {
         assert_eq!(
             deepseek_row.provider,
             Some(crate::config::ApiProvider::Deepseek)
+        );
+        let dashscope_row = view
+            .visible_model_rows()
+            .iter()
+            .find(|row| row.id == "qwen-plus")
+            .expect("qwen-plus row present");
+        assert_eq!(
+            dashscope_row.provider,
+            Some(crate::config::ApiProvider::Openai)
+        );
+        let qianfan_row = view
+            .visible_model_rows()
+            .iter()
+            .find(|row| row.id == "custom-qianfan-service-id")
+            .expect("custom Qianfan row present");
+        assert_eq!(
+            qianfan_row.provider,
+            Some(crate::config::ApiProvider::Qianfan)
         );
 
         // Active-provider model must appear before any cross-provider tail row.
