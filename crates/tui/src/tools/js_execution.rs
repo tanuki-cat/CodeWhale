@@ -282,6 +282,10 @@ mod tests {
         );
     }
 
+    // The env mutex and `CODEWHALE_JS_SECRET_LEAK_TEST` guard must stay alive
+    // until the child spawns inside `execute_js_execution_tool(...).await`, so
+    // the std `MutexGuard` is intentionally held across the await point.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn execute_js_does_not_inherit_parent_secret_env() {
         if !node_present() {
