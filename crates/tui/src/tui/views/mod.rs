@@ -1249,6 +1249,7 @@ fn config_hint_for_key(key: &str) -> &'static str {
         "tool_collapse" => "compact | expanded | calm",
         "theme" => "system | dark | light | grayscale",
         "locale" => "auto | en | ja | zh-Hans | pt-BR",
+        "translation" => "auto | on | off (auto = on when locale is non-English)",
         "background_color" => "#RRGGBB | default",
         "base_url" => "global DeepSeek/root fallback; e.g. https://api.deepseek.com/beta",
         "provider_url" => {

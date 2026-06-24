@@ -175,6 +175,9 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
         }
         "stream_chunk_timeout_secs" => Some(app.stream_chunk_timeout_secs.to_string()),
         "locale" | "language" => Some(locale_display(app.ui_locale).to_string()),
+        "translation" | "translate" => Settings::load()
+            .ok()
+            .map(|settings| settings.translation.clone()),
         "theme" | "ui_theme" => {
             Some(crate::palette::theme_label_for_mode(app.ui_theme.mode).to_string())
         }
@@ -1412,6 +1415,13 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             app.mark_history_updated();
             app.needs_redraw = true;
         }
+        "translation" | "translate" => {
+            // Mirror the startup resolution so `/set translation …` applies to
+            // the live session instead of waiting for a restart. `auto` tracks
+            // the resolved UI locale; `on`/`off` are explicit. Affects the next
+            // turn's system prompt (the `## Language Output Requirement` block).
+            app.translation_enabled = settings.translation_enabled_default(app.ui_locale);
+        }
         "theme" | "ui_theme" | "background_color" | "background" | "bg" => {
             app.theme_id = crate::palette::ThemeId::from_name(&settings.theme)
                 .unwrap_or(crate::palette::ThemeId::System);
@@ -2222,6 +2232,49 @@ mod tests {
                 None => env::remove_var("TERM_PROGRAM"),
             }
         }
+    }
+
+    #[test]
+    fn config_translation_applies_to_live_session() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-translation-live-config-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+
+        let mut app = create_test_app();
+
+        // `/set translation on` must flip the live session immediately — the
+        // pre-fix behavior only rewrote the persisted value, leaving the
+        // running session (and its next system prompt) untouched until restart.
+        app.translation_enabled = false;
+        let result = set_config_value(&mut app, "translation", "on", false);
+        assert!(!result.is_error);
+        assert!(app.translation_enabled, "`on` must enable translation live");
+
+        // `off` turns it back off in the same session.
+        let result = set_config_value(&mut app, "translation", "off", false);
+        assert!(!result.is_error);
+        assert!(!app.translation_enabled, "`off` must disable translation live");
+
+        // `auto` tracks the resolved UI locale: on for non-English locales,
+        // off for English so English users never pay the translation cost.
+        app.ui_locale = crate::localization::Locale::ZhHans;
+        let result = set_config_value(&mut app, "translation", "auto", false);
+        assert!(!result.is_error);
+        assert!(
+            app.translation_enabled,
+            "`auto` must enable for a non-English locale"
+        );
+
+        app.ui_locale = crate::localization::Locale::En;
+        let result = set_config_value(&mut app, "translation", "auto", false);
+        assert!(!result.is_error);
+        assert!(
+            !app.translation_enabled,
+            "`auto` must stay off for an English locale"
+        );
     }
 
     #[test]
