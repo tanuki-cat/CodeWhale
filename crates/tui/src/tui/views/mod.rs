@@ -574,6 +574,13 @@ impl ConfigView {
             },
             ConfigRow {
                 section: ConfigSection::Display,
+                key: "translation".to_string(),
+                value: settings.translation.clone(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Display,
                 key: "background_color".to_string(),
                 value: settings.background_color.clone().unwrap_or_else(|| {
                     tr(app.ui_locale, MessageId::ConfigDefaultValue).to_string()
