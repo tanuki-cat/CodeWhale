@@ -109,8 +109,12 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "source_ref=${source_ref}" >> "$GITHUB_OUTPUT"
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
-      - name: Require release source on main
-        run: ./scripts/release/ensure-release-on-main.sh "${{ steps.release.outputs.sha }}"
+      - name: Require release source on the release branch
+        # This fork cuts releases from `main-release` (the repo's default
+        # branch), not `main`. Verify the tagged commit is reachable from
+        # the release branch so closing keywords still process on the
+        # default branch.
+        run: ./scripts/release/ensure-release-on-main.sh --main main-release "${{ steps.release.outputs.sha }}"
 
   build:
     needs: [parity, resolve]
