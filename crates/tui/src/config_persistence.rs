@@ -290,6 +290,7 @@ fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static
         ApiProvider::Deepseek | ApiProvider::DeepseekCN => {
             anyhow::bail!("DeepSeek uses the root base_url setting")
         }
+        ApiProvider::DeepseekAnthropic => Ok("deepseek_anthropic"),
         ApiProvider::NvidiaNim => Ok("nvidia_nim"),
         ApiProvider::Openai => Ok("openai"),
         ApiProvider::Anthropic => Ok("anthropic"),
@@ -311,10 +312,73 @@ fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static
         ApiProvider::Together => Ok("together"),
         ApiProvider::Qianfan => Ok("qianfan"),
         ApiProvider::OpenaiCodex => Ok("openai_codex"),
+        ApiProvider::Openmodel => Ok("openmodel"),
         ApiProvider::Zai => Ok("zai"),
         ApiProvider::Stepfun => Ok("stepfun"),
         ApiProvider::Minimax => Ok("minimax"),
+        ApiProvider::Sakana => Ok("sakana"),
+        // Custom providers live under a user-chosen `[providers.<name>]` table,
+        // not a fixed key. Persisting base_url through this static-key path is
+        // out of scope for the #1519 constrained slice; users edit the named
+        // table directly.
+        ApiProvider::Custom => {
+            anyhow::bail!("custom providers store base_url in their named [providers.<name>] table")
+        }
     }
+}
+
+pub(crate) fn persist_hotbar_bindings(
+    config_path: Option<&Path>,
+    bindings: &[codewhale_config::HotbarBindingToml],
+) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    use std::fs;
+
+    let path = config_toml_path(config_path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+    }
+
+    let raw = if path.exists() {
+        Some(
+            fs::read_to_string(&path)
+                .with_context(|| format!("failed to read config at {}", path.display()))?,
+        )
+    } else {
+        None
+    };
+    let mut document = match raw.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => raw
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("failed to edit config at {}", path.display()))?,
+        _ => toml_edit::DocumentMut::new(),
+    };
+
+    let table = document.as_table_mut();
+    table.remove("hotbar");
+    if bindings.is_empty() {
+        table.insert(
+            "hotbar",
+            toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new())),
+        );
+    } else {
+        let mut hotbar = toml_edit::ArrayOfTables::new();
+        for binding in bindings {
+            let mut table = toml_edit::Table::new();
+            table["slot"] = toml_edit::value(i64::from(binding.slot));
+            table["action"] = toml_edit::value(binding.action.clone());
+            if let Some(label) = binding.label.as_deref() {
+                table["label"] = toml_edit::value(label);
+            }
+            hotbar.push(table);
+        }
+        table.insert("hotbar", toml_edit::Item::ArrayOfTables(hotbar));
+    }
+
+    fs::write(&path, document.to_string())
+        .with_context(|| format!("failed to write config at {}", path.display()))?;
+    Ok(path)
 }
 
 pub(crate) fn config_toml_path(config_path: Option<&Path>) -> anyhow::Result<PathBuf> {
@@ -600,5 +664,128 @@ mod tests {
             body.contains("allow_shell = true"),
             "new key not written: {body}"
         );
+    }
+
+    #[test]
+    fn persist_hotbar_bindings_writes_primary_config_path_for_fresh_installs() {
+        let temp_root = temp_root("codewhale-hotbar-persist-fresh");
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+
+        unsafe {
+            env::remove_var("DEEPSEEK_CONFIG_PATH");
+        }
+
+        let bindings = vec![codewhale_config::HotbarBindingToml {
+            slot: 1,
+            action: "mode.plan".to_string(),
+            label: Some("Plan".to_string()),
+        }];
+        let path = persist_hotbar_bindings(None, &bindings).expect("persist should succeed");
+
+        assert_eq!(path, temp_root.join(".codewhale").join("config.toml"));
+        let body = fs::read_to_string(&path).expect("written file should be readable");
+        assert!(body.contains("[[hotbar]]"), "hotbar table missing: {body}");
+        let parsed: codewhale_config::ConfigToml =
+            toml::from_str(&body).expect("written hotbar config should parse");
+        assert_eq!(parsed.hotbar, Some(bindings));
+    }
+
+    #[test]
+    fn persist_default_hotbar_bindings_round_trips_for_hotbar_on() {
+        // #3807: `/hotbar on` persists the explicit default slots (an absent key
+        // now means hidden), and they read back as the eight recommended slots.
+        let temp_root = temp_root("codewhale-hotbar-on-defaults");
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+
+        let defaults = codewhale_config::default_hotbar_bindings_toml();
+        assert_eq!(defaults.len(), codewhale_config::HOTBAR_SLOT_COUNT as usize);
+
+        let path = persist_hotbar_bindings(None, &defaults).expect("persist should succeed");
+        let body = fs::read_to_string(&path).expect("written file should be readable");
+        assert!(body.contains("[[hotbar]]"), "hotbar table missing: {body}");
+
+        let parsed: codewhale_config::ConfigToml =
+            toml::from_str(&body).expect("written hotbar config should parse");
+        assert_eq!(parsed.hotbar, Some(defaults));
+
+        // The persisted defaults resolve back to all eight recommended slots.
+        let resolved = parsed.resolve_hotbar_bindings(&codewhale_config::DEFAULT_HOTBAR_ACTIONS);
+        assert_eq!(
+            resolved.bindings,
+            codewhale_config::default_hotbar_bindings()
+        );
+    }
+
+    #[test]
+    fn persist_hotbar_bindings_preserves_comments_and_replaces_existing_tables() {
+        let temp_root = temp_root("codewhale-hotbar-persist-comments");
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+
+        let path = temp_root.join(".codewhale").join("config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"# model note
+model = "deepseek-v4-flash"
+
+[[hotbar]]
+slot = 1
+action = "mode.plan"
+label = "Plan"
+
+# notification note
+[notifications]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let bindings = vec![codewhale_config::HotbarBindingToml {
+            slot: 2,
+            action: "session.compact".to_string(),
+            label: Some("Compact".to_string()),
+        }];
+        let written =
+            persist_hotbar_bindings(Some(&path), &bindings).expect("persist should succeed");
+        let body = fs::read_to_string(&written).expect("written file should be readable");
+
+        assert!(body.contains("# model note"), "prefix comment lost: {body}");
+        assert!(
+            body.contains("# notification note"),
+            "section comment lost: {body}"
+        );
+        assert!(
+            !body.contains("mode.plan"),
+            "old hotbar table was not replaced: {body}"
+        );
+        assert!(body.contains("[[hotbar]]"), "hotbar table missing: {body}");
+        assert!(
+            body.contains("action = \"session.compact\""),
+            "new action missing: {body}"
+        );
+        let parsed: codewhale_config::ConfigToml =
+            toml::from_str(&body).expect("written hotbar config should parse");
+        assert_eq!(parsed.hotbar, Some(bindings));
+    }
+
+    #[test]
+    fn persist_hotbar_bindings_writes_empty_array_to_disable_defaults() {
+        let temp_root = temp_root("codewhale-hotbar-persist-empty");
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+
+        let path = temp_root.join(".codewhale").join("config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let written = persist_hotbar_bindings(Some(&path), &[]).expect("persist should succeed");
+        let body = fs::read_to_string(&written).expect("written file should be readable");
+
+        assert!(body.contains("hotbar = []"), "empty hotbar missing: {body}");
+        let parsed: codewhale_config::ConfigToml =
+            toml::from_str(&body).expect("written hotbar config should parse");
+        assert_eq!(parsed.hotbar, Some(Vec::new()));
     }
 }

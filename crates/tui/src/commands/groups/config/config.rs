@@ -23,6 +23,7 @@ use crate::tui::app::{
 use crate::tui::approval::ApprovalMode;
 use crate::tui::ui::{SidebarRenderState, sidebar_render_state};
 use anyhow::Result;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 /// Open the interactive config editor.
@@ -53,6 +54,7 @@ pub fn show_config(_app: &mut App, arg: Option<&str>) -> CommandResult {
 /// - `/config` (no args) — opens the schemaui-driven TUI editor.
 /// - `/config tui` / `/config web` / `/config native` — open a specific
 ///   editor mode (web requires the `web` build feature).
+/// - `/config ask-rules` — shows configured ask-only permission rules.
 /// - `/config <key>` — shows the current value of a setting.
 /// - `/config <key> <value>` — sets a runtime value (session only, add --save to persist).
 pub fn config_command(app: &mut App, arg: Option<&str>) -> CommandResult {
@@ -67,12 +69,19 @@ pub fn config_command(app: &mut App, arg: Option<&str>) -> CommandResult {
         return config_editability_audit(app);
     }
     let mut raw_words = raw.splitn(2, char::is_whitespace);
-    if raw_words
-        .next()
-        .is_some_and(|token| token.eq_ignore_ascii_case("subagents"))
-    {
+    let first_word = raw_words.next();
+    if first_word.is_some_and(is_ask_rules_config_token) {
+        let rest = raw_words.next().unwrap_or("").trim();
+        return configured_ask_rules_command(app, rest);
+    }
+    if first_word.is_some_and(|token| token.eq_ignore_ascii_case("subagents")) {
         let rest = raw_words.next().unwrap_or("").trim();
         return subagents_config_command(app, rest);
+    }
+    // `/config preset <name> [--save|-s]` — apply a bundled settings preset (#3478).
+    if first_word.is_some_and(|token| token.eq_ignore_ascii_case("preset")) {
+        let rest = raw_words.next().unwrap_or("").trim();
+        return config_preset_command(app, rest);
     }
     let parts: Vec<&str> = raw.splitn(2, ' ').collect();
     if parts.len() == 1 {
@@ -100,6 +109,71 @@ pub fn config_command(app: &mut App, arg: Option<&str>) -> CommandResult {
         };
         set_config_value(app, parts[0], value, persist)
     }
+}
+
+/// Apply a bundled settings preset, e.g. `/config preset calm [--save]` (#3478).
+///
+/// The preset is applied to the live session through the same per-key setter a
+/// single `/config <key> <value>` uses, so app state mirroring and (with
+/// `--save`) persistence stay consistent. The preset name is validated before
+/// any field is touched.
+fn config_preset_command(app: &mut App, rest: &str) -> CommandResult {
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    let persist = matches!(tokens.last(), Some(&"--save") | Some(&"-s"));
+    let name = tokens.first().copied().unwrap_or("");
+    if name.is_empty() || name.starts_with('-') {
+        return CommandResult::message(
+            "Usage: /config preset <name> [--save]. Available presets: calm.",
+        );
+    }
+
+    let Some(fields) = crate::settings::preset_fields(name) else {
+        return CommandResult::error(format!("Unknown preset '{name}'. Available presets: calm."));
+    };
+
+    // Persist the whole bundle atomically when requested (one load/apply/save),
+    // validating the preset before touching anything on disk.
+    if persist {
+        match Settings::load() {
+            Ok(mut settings) => {
+                if let Err(e) = settings.apply_preset(name) {
+                    return CommandResult::error(format!("{e}"));
+                }
+                settings.apply_env_overrides();
+                if let Err(e) = settings.save() {
+                    return CommandResult::error(format!("Failed to save settings: {e}"));
+                }
+            }
+            Err(e) => return CommandResult::error(format!("Failed to load settings: {e}")),
+        }
+    }
+
+    // Mirror the bundle into the live session via the per-key setter (the
+    // persisted write, if any, already happened atomically above, so this pass
+    // is session-only).
+    let mut applied = Vec::with_capacity(fields.len());
+    for (key, value) in fields {
+        let result = set_config_value(app, key, value, false);
+        if result.is_error {
+            let message = result
+                .message
+                .unwrap_or_else(|| "unknown apply error".to_string());
+            return CommandResult::error(format!(
+                "Failed to apply preset field {key}={value}: {message}"
+            ));
+        }
+        applied.push(format!("{key}={value}"));
+    }
+
+    let suffix = if persist {
+        " (saved)"
+    } else {
+        " (session only — add --save to persist)"
+    };
+    CommandResult::message(format!(
+        "Applied '{name}' transcript preset{suffix}: {}. Thinking stays visible and tool runs stay expandable.",
+        applied.join(", ")
+    ))
 }
 
 /// Show the current value of a single setting.
@@ -454,8 +528,115 @@ fn parse_config_bool(value: &str) -> Result<bool, String> {
 fn approval_mode_config_value(mode: ApprovalMode) -> &'static str {
     match mode {
         ApprovalMode::Auto => "auto",
+        ApprovalMode::Bypass => "bypass",
         ApprovalMode::Suggest => "on-request",
         ApprovalMode::Never => "never",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionsFileStatus {
+    Missing,
+    Empty,
+    Present,
+}
+
+impl PermissionsFileStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Empty => "empty",
+            Self::Present => "present",
+        }
+    }
+}
+
+fn is_ask_rules_config_token(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "ask-rules"
+            | "ask_rules"
+            | "askrules"
+            | "rules"
+            | "permission-rules"
+            | "permission_rules"
+            | "permissions"
+    )
+}
+
+fn configured_ask_rules_command(app: &App, raw: &str) -> CommandResult {
+    match raw.to_ascii_lowercase().as_str() {
+        "" | "list" | "status" => configured_ask_rules(app),
+        _ => CommandResult::error(
+            "Usage: /config ask-rules [list|status] (read-only; does not edit permissions.toml)",
+        ),
+    }
+}
+
+fn configured_ask_rules(app: &App) -> CommandResult {
+    let store = match codewhale_config::ConfigStore::load(app.config_path.clone()) {
+        Ok(store) => store,
+        Err(err) => return CommandResult::error(format!("Failed to load config: {err}")),
+    };
+    let permissions_path = store.permissions_path();
+    let status = match permissions_file_status(&permissions_path) {
+        Ok(status) => status,
+        Err(err) => return CommandResult::error(err),
+    };
+
+    CommandResult::message(format_configured_ask_rules(
+        &permissions_path,
+        status,
+        &store.permissions().rules,
+    ))
+}
+
+fn permissions_file_status(path: &Path) -> Result<PermissionsFileStatus, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() == 0 => Ok(PermissionsFileStatus::Empty),
+        Ok(_) => Ok(PermissionsFileStatus::Present),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(PermissionsFileStatus::Missing),
+        Err(err) => Err(format!(
+            "Failed to inspect permissions.toml at {}: {err}",
+            path.display()
+        )),
+    }
+}
+
+fn format_configured_ask_rules(
+    permissions_path: &Path,
+    status: PermissionsFileStatus,
+    rules: &[codewhale_config::ToolAskRule],
+) -> String {
+    let mut lines = Vec::new();
+    lines.push("Configured ask rules".to_string());
+    lines.push(format!("Permissions path: {}", permissions_path.display()));
+    lines.push(format!("File status: {}", status.label()));
+    lines.push(format!("Rule count: {}", rules.len()));
+
+    if rules.is_empty() {
+        lines.push("No ask rules configured.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push("# | tool | command | path".to_string());
+    for (index, rule) in rules.iter().enumerate() {
+        lines.push(format!(
+            "{} | {} | {} | {}",
+            index + 1,
+            format_rule_field(Some(&rule.tool)),
+            format_rule_field(rule.command.as_deref()),
+            format_rule_field(rule.path.as_deref())
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_rule_field(value: Option<&str>) -> String {
+    match value {
+        Some("") => "\"\"".to_string(),
+        Some(value) => value.replace('\n', "\\n").replace('\r', "\\r"),
+        None => "(any)".to_string(),
     }
 }
 
@@ -1601,7 +1782,7 @@ pub fn mode(app: &mut App, arg: Option<&str>) -> CommandResult {
     let Some(arg) = arg.filter(|value| !value.trim().is_empty()) else {
         return CommandResult::action(AppAction::OpenModePicker);
     };
-    match parse_mode_arg(arg) {
+    match AppMode::parse(arg) {
         Some(mode) => {
             let (message, changed) = switch_mode_with_status(app, mode);
             if changed {
@@ -1610,7 +1791,7 @@ pub fn mode(app: &mut App, arg: Option<&str>) -> CommandResult {
                 CommandResult::message(message)
             }
         }
-        None => CommandResult::error("Usage: /mode [agent|plan|yolo|1|2|3]"),
+        None => CommandResult::error("Usage: /mode [agent|plan|yolo|1|2|4]"),
     }
 }
 
@@ -1620,32 +1801,9 @@ pub fn switch_mode(app: &mut App, mode: AppMode) -> String {
 
 fn switch_mode_with_status(app: &mut App, mode: AppMode) -> (String, bool) {
     if app.set_mode(mode) {
-        (
-            format!("Switched to {} mode.", mode_display_name(mode)),
-            true,
-        )
+        (format!("Switched to {} mode.", mode.display_name()), true)
     } else {
-        (
-            format!("Already in {} mode.", mode_display_name(mode)),
-            false,
-        )
-    }
-}
-
-fn parse_mode_arg(arg: &str) -> Option<AppMode> {
-    match arg.trim().to_ascii_lowercase().as_str() {
-        "agent" | "1" => Some(AppMode::Agent),
-        "plan" | "2" => Some(AppMode::Plan),
-        "yolo" | "3" => Some(AppMode::Yolo),
-        _ => None,
-    }
-}
-
-fn mode_display_name(mode: AppMode) -> &'static str {
-    match mode {
-        AppMode::Agent => "Agent",
-        AppMode::Plan => "Plan",
-        AppMode::Yolo => "YOLO",
+        (format!("Already in {} mode.", mode.display_name()), false)
     }
 }
 
@@ -2007,6 +2165,159 @@ mod tests {
     }
 
     #[test]
+    fn config_command_ask_rules_reports_missing_permissions_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let permissions_path =
+            codewhale_config::resolve_permissions_path(Some(config_path.clone())).unwrap();
+        let mut app = create_test_app();
+        app.config_path = Some(config_path);
+
+        let result = config_command(&mut app, Some("ask-rules"));
+        let msg = result.message.unwrap();
+
+        assert!(!result.is_error);
+        assert!(msg.contains("Configured ask rules"));
+        assert!(msg.contains(&format!("Permissions path: {}", permissions_path.display())));
+        assert!(msg.contains("File status: missing"));
+        assert!(msg.contains("Rule count: 0"));
+        assert!(msg.contains("No ask rules configured."));
+    }
+
+    #[test]
+    fn config_command_ask_rules_reports_empty_permissions_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let permissions_path =
+            codewhale_config::resolve_permissions_path(Some(config_path.clone())).unwrap();
+        fs::write(&permissions_path, "").unwrap();
+        let mut app = create_test_app();
+        app.config_path = Some(config_path);
+
+        let result = config_command(&mut app, Some("ask_rules"));
+        let msg = result.message.unwrap();
+
+        assert!(!result.is_error);
+        assert!(msg.contains(&format!("Permissions path: {}", permissions_path.display())));
+        assert!(msg.contains("File status: empty"));
+        assert!(msg.contains("Rule count: 0"));
+        assert!(msg.contains("No ask rules configured."));
+    }
+
+    #[test]
+    fn config_command_ask_rules_lists_loaded_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let permissions_path =
+            codewhale_config::resolve_permissions_path(Some(config_path.clone())).unwrap();
+        fs::write(
+            &permissions_path,
+            r#"
+[[rules]]
+tool = "exec_shell"
+command = "cargo test"
+
+[[rules]]
+tool = "edit_file"
+path = "src/a.rs"
+"#,
+        )
+        .unwrap();
+        let mut app = create_test_app();
+        app.config_path = Some(config_path);
+
+        let result = config_command(&mut app, Some("permissions status"));
+        let msg = result.message.unwrap();
+
+        assert!(!result.is_error);
+        assert!(msg.contains(&format!("Permissions path: {}", permissions_path.display())));
+        assert!(msg.contains("File status: present"));
+        assert!(msg.contains("Rule count: 2"));
+        assert!(msg.contains("# | tool | command | path"));
+        assert!(msg.contains("1 | exec_shell | cargo test | (any)"));
+        assert!(msg.contains("2 | edit_file | (any) | src/a.rs"));
+    }
+
+    #[test]
+    fn config_command_ask_rules_output_format_is_stable() {
+        let rules = vec![
+            codewhale_config::ToolAskRule::exec_shell("cargo test"),
+            codewhale_config::ToolAskRule::file_path("edit_file", r"src\a.rs"),
+        ];
+
+        let output = format_configured_ask_rules(
+            Path::new("permissions.toml"),
+            PermissionsFileStatus::Present,
+            &rules,
+        );
+
+        assert_eq!(
+            output,
+            "Configured ask rules\n\
+Permissions path: permissions.toml\n\
+File status: present\n\
+Rule count: 2\n\
+# | tool | command | path\n\
+1 | exec_shell | cargo test | (any)\n\
+2 | edit_file | (any) | src\\a.rs"
+        );
+    }
+
+    #[test]
+    fn config_preset_calm_applies_bundle_to_session_and_keeps_evidence() {
+        let mut app = create_test_app();
+        app.calm_mode = false;
+        app.show_thinking = true;
+        app.show_tool_details = true;
+        app.fancy_animations = true;
+
+        let result = config_command(&mut app, Some("preset calm"));
+        let message = result.message.unwrap_or_default();
+        assert!(
+            message.contains("calm"),
+            "summary should name the preset: {message}"
+        );
+
+        assert!(app.calm_mode);
+        assert!(!app.show_tool_details);
+        assert!(app.low_motion);
+        assert!(!app.fancy_animations);
+        assert_eq!(
+            app.tool_collapse_mode,
+            crate::tui::app::ToolCollapseMode::Calm
+        );
+        assert_eq!(
+            app.transcript_spacing,
+            crate::tui::app::TranscriptSpacing::Comfortable
+        );
+        // Evidence preserved: thinking is not hidden by the preset.
+        assert!(app.show_thinking, "calm preset must not hide thinking");
+    }
+
+    #[test]
+    fn config_preset_unknown_name_reports_error() {
+        let mut app = create_test_app();
+        let result = config_command(&mut app, Some("preset turbo"));
+        let message = result.message.unwrap_or_default();
+        assert!(
+            message.to_lowercase().contains("unknown preset"),
+            "expected unknown-preset error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn config_preset_save_without_name_reports_usage() {
+        let mut app = create_test_app();
+        let result = config_command(&mut app, Some("preset --save"));
+        let message = result.message.unwrap_or_default();
+        assert!(
+            message.contains("Usage: /config preset"),
+            "expected usage hint, got: {message}"
+        );
+        assert!(!result.is_error);
+    }
+
+    #[test]
     fn sidebar_config_command_restores_pinned_sidebar_by_default() {
         let mut app = create_test_app();
         app.sidebar_focus = SidebarFocus::Hidden;
@@ -2078,7 +2389,7 @@ mod tests {
         assert!(app.allow_shell);
         assert!(app.trust_mode);
         assert!(app.yolo);
-        assert_eq!(app.approval_mode, ApprovalMode::Auto);
+        assert_eq!(app.approval_mode, ApprovalMode::Bypass);
         assert_eq!(app.mode, AppMode::Yolo);
     }
 
@@ -2091,6 +2402,9 @@ mod tests {
         assert_eq!(result.action, Some(AppAction::ModeChanged(AppMode::Plan)));
         assert_eq!(app.mode, AppMode::Plan);
         let result = mode(&mut app, Some("3"));
+        assert!(result.is_error);
+        assert_eq!(app.mode, AppMode::Plan);
+        let result = mode(&mut app, Some("4"));
         assert_eq!(result.action, Some(AppAction::ModeChanged(AppMode::Yolo)));
         assert_eq!(app.mode, AppMode::Yolo);
     }
@@ -2256,7 +2570,10 @@ mod tests {
         // `off` turns it back off in the same session.
         let result = set_config_value(&mut app, "translation", "off", false);
         assert!(!result.is_error);
-        assert!(!app.translation_enabled, "`off` must disable translation live");
+        assert!(
+            !app.translation_enabled,
+            "`off` must disable translation live"
+        );
 
         // `auto` tracks the resolved UI locale: on for non-English locales,
         // off for English so English users never pay the translation cost.

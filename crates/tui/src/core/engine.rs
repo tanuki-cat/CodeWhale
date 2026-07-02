@@ -40,6 +40,8 @@ use crate::models::{
 };
 use crate::prompts;
 use crate::purge::{emit_purge_completed, emit_purge_failed, emit_purge_started, run_purge};
+use crate::resource_telemetry::ResourceTelemetry;
+use crate::route_runtime::resolve_runtime_route;
 use crate::seam_manager::{SeamConfig, SeamManager};
 use crate::tools::goal::{GoalSnapshot, GoalStatus, SharedGoalState, new_shared_goal_state};
 use crate::tools::plan::{PlanSnapshot, SharedPlanState, new_shared_plan_state};
@@ -60,7 +62,9 @@ use crate::worker_profile::ModelRoute;
 use crate::working_set::WorkingSet;
 
 use super::events::{Event, TurnOutcomeStatus};
-use super::ops::{Op, SessionSnapshot, USER_SHELL_TOOL_ID_PREFIX, UserInputProvenance};
+use super::ops::{
+    Op, ProviderRuntimeStatus, SessionSnapshot, USER_SHELL_TOOL_ID_PREFIX, UserInputProvenance,
+};
 use super::session::Session;
 use super::tool_parser;
 use super::turn::{TurnContext, post_turn_snapshot, pre_turn_snapshot};
@@ -110,7 +114,8 @@ impl StructuredState {
         };
 
         let subagent_snapshots = if let Some(handle) = subagents {
-            let guard = handle.read().await;
+            let mut guard = handle.write().await;
+            guard.cleanup(Duration::from_secs(60 * 60));
             guard
                 .list()
                 .into_iter()
@@ -240,6 +245,9 @@ fn append_plan_list(out: &mut String, label: &str, values: &[String]) {
 pub struct EngineConfig {
     /// Model identifier to use for responses.
     pub model: String,
+    /// Route/offering limits for the active provider+model, when the runtime
+    /// route resolver had concrete catalog facts.
+    pub active_route_limits: Option<codewhale_config::route::RouteLimits>,
     /// Workspace root for tool execution and file operations.
     pub workspace: PathBuf,
     /// Allow shell tool execution when true.
@@ -326,6 +334,11 @@ pub struct EngineConfig {
     /// engine reads `memory_path` on each prompt assembly and prepends a
     /// `<user_memory>` block to the system prompt.
     pub memory_enabled: bool,
+    /// When `true`, the legacy `memory.rs` push/inject path is deprecated
+    /// in favour of Moraine MCP recall. `compose_block` returns `None`
+    /// regardless of `memory_enabled`, the `remember` tool is not
+    /// registered, and `# foo` quick-add falls through.
+    pub moraine_fallback: bool,
     /// Path to the user memory file (#489). Always populated; only
     /// consulted when `memory_enabled` is `true`.
     pub memory_path: PathBuf,
@@ -400,6 +413,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             model: DEFAULT_TEXT_MODEL.to_string(),
+            active_route_limits: None,
             workspace: PathBuf::from("."),
             allow_shell: true,
             trust_mode: false,
@@ -437,6 +451,7 @@ impl Default for EngineConfig {
             runtime_services: RuntimeToolServices::default(),
             subagent_model_overrides: HashMap::new(),
             memory_enabled: false,
+            moraine_fallback: false,
             memory_path: PathBuf::from("./memory.md"),
             speech_output_dir: None,
             vision_config: None,
@@ -545,6 +560,7 @@ pub struct Engine {
     shell_manager: SharedShellManager,
     mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
     api_provider: ApiProvider,
+    active_route_limits: Option<codewhale_config::route::RouteLimits>,
     rx_op: mpsc::Receiver<Op>,
     /// Clone of the op-channel sender, so the engine can self-dispatch ops
     /// (e.g. a goal-continuation `SendMessage` after a turn completes).
@@ -646,6 +662,15 @@ fn subagent_mailbox_best_effort_send_permitted(
 }
 
 impl Engine {
+    fn mode_runtime_instructions(mode: AppMode) -> &'static str {
+        match mode {
+            AppMode::Agent | AppMode::Auto => prompts::AGENT_MODE,
+            AppMode::Plan => prompts::PLAN_MODE,
+            AppMode::Yolo => prompts::YOLO_MODE,
+        }
+        .trim()
+    }
+
     pub(super) async fn emit_compaction_started(
         &mut self,
         id: String,
@@ -738,16 +763,6 @@ impl Engine {
         format!("{message}\n\n{hint}")
     }
 
-    fn config_for_runtime_route(&self, provider: ApiProvider, model: &str) -> Config {
-        let mut config = self.api_config.clone();
-        config.provider = Some(provider.as_str().to_string());
-        config.provider_config_for_mut(provider).model = Some(model.to_string());
-        if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
-            config.default_text_model = Some(model.to_string());
-        }
-        config
-    }
-
     fn activate_runtime_route(&mut self, provider: ApiProvider, model: &str) -> Result<(), String> {
         if self.api_provider == provider
             && self
@@ -758,11 +773,21 @@ impl Engine {
             return Ok(());
         }
 
-        let route_config = self.config_for_runtime_route(provider, model);
-        match DeepSeekClient::new(&route_config) {
+        let route =
+            resolve_runtime_route(&self.api_config, provider, Some(model)).map_err(|reason| {
+                format!(
+                    "Failed to resolve provider route {} / {}: {reason}",
+                    provider.as_str(),
+                    model
+                )
+            })?;
+        let route_config = route.config;
+        match DeepSeekClient::from_candidate(&route_config, &route.candidate) {
             Ok(client) => {
                 self.api_provider = provider;
                 self.api_config = route_config;
+                self.active_route_limits =
+                    crate::route_budget::known_route_limits(route.candidate.limits);
                 self.api_key_env_only_recovery =
                     Self::env_only_api_key_recovery_hint(&self.api_config);
                 self.deepseek_client = Some(client.clone());
@@ -826,8 +851,10 @@ impl Engine {
         // Set up stable system prompt with project context (default to agent mode).
         // Per-turn working-set metadata is injected into the latest user
         // message at request time so file churn does not rewrite this prefix.
-        let user_memory_block =
-            crate::memory::compose_block(config.memory_enabled, &config.memory_path);
+        let user_memory_block = crate::memory::compose_block(
+            config.memory_enabled && !config.moraine_fallback, // TODO(v0.8.71): remove when Moraine recall stable; see #3490, #3495
+            &config.memory_path,
+        );
         let prompt_goal_objective =
             goal_objective_for_prompt(config.goal_objective.as_deref(), &config.goal_state);
         let system_prompt =
@@ -844,8 +871,11 @@ impl Engine {
                     translation_enabled: config.translation_enabled,
                     model_id: &config.model,
                     context_window_override: Some(
-                        crate::config::provider_capability(api_provider, &config.model)
-                            .context_window,
+                        crate::route_budget::route_context_window_tokens(
+                            api_provider,
+                            &config.model,
+                            config.active_route_limits,
+                        ),
                     ),
                     show_thinking: config.show_thinking,
                     verbosity: config.verbosity.as_deref(),
@@ -942,6 +972,7 @@ impl Engine {
             })
             .map(std::sync::Arc::from);
 
+        let active_route_limits = config.active_route_limits;
         let engine = Engine {
             config,
             api_config: api_config.clone(),
@@ -953,6 +984,7 @@ impl Engine {
             shell_manager,
             mcp_pool: None,
             api_provider,
+            active_route_limits,
             rx_op,
             tx_op: tx_op.clone(),
             rx_approval,
@@ -995,6 +1027,7 @@ impl Engine {
         &mut self,
         command: String,
         mode: AppMode,
+        allow_shell: bool,
         trust_mode: bool,
         auto_approve: bool,
         approval_mode: crate::tui::approval::ApprovalMode,
@@ -1015,15 +1048,7 @@ impl Engine {
             .unwrap_or_default()
             .to_string();
 
-        self.session.trust_mode = trust_mode;
-        self.config.trust_mode = trust_mode;
-        self.session.auto_approve = auto_approve;
-        let agent_approval_mode = agent_approval_mode_for_turn(auto_approve, approval_mode);
-        // Only track the Agent-mode approval — Yolo/Plan have fixed
-        // approval policies that are derived from the mode itself.
-        if mode == AppMode::Agent {
-            self.session.approval_mode = agent_approval_mode;
-        }
+        self.apply_runtime_mode_policy(mode, allow_shell, trust_mode, auto_approve, approval_mode);
 
         let _ = self
             .tx_event
@@ -1066,7 +1091,8 @@ impl Engine {
                 "Tool 'exec_shell' is disabled by feature flag".to_string(),
             ))
         } else if let Some(spec) = registry.get(&tool_name) {
-            let mut approval_required = spec.approval_requirement() != ApprovalRequirement::Auto
+            let mut approval_required = spec.approval_requirement_for(&tool_input)
+                != ApprovalRequirement::Auto
                 && !registry.context().auto_approve;
             let mut approval_description = spec.description().to_string();
             let mut approval_force_prompt = false;
@@ -1078,9 +1104,14 @@ impl Engine {
                 self.session.approval_mode,
             );
             if let Some(ToolAskRuleDecision::Prompt(reason)) = ask_rule_decision.as_ref() {
-                approval_required = true;
-                approval_description = reason.clone();
-                approval_force_prompt = true;
+                // YOLO mode (auto_approve) is the explicit "no approvals"
+                // contract: a typed ask-rule must not pop a modal in YOLO.
+                // A typed deny rule still blocks hard below.
+                if !self.session.auto_approve {
+                    approval_required = true;
+                    approval_description = reason.clone();
+                    approval_force_prompt = true;
+                }
             }
             if let Some(ToolAskRuleDecision::Block(reason)) = ask_rule_decision {
                 Err(ToolError::permission_denied(reason))
@@ -1122,7 +1153,7 @@ impl Engine {
                             "decision": "approved",
                             "source": "composer_bang",
                         }));
-                        Self::execute_tool_with_lock(
+                        let mut result = Self::execute_tool_with_lock(
                             self.tool_exec_lock.clone(),
                             spec.supports_parallel(),
                             false,
@@ -1134,7 +1165,14 @@ impl Engine {
                             None,
                             None,
                         )
-                        .await
+                        .await;
+                        if let Ok(tool_result) = result.as_mut() {
+                            stamp_tool_result_approval(
+                                tool_result,
+                                ToolApprovalStamp::ApprovedByUser,
+                            );
+                        }
+                        result
                     }
                     Ok(ApprovalResult::Denied) => {
                         emit_tool_audit(json!({
@@ -1161,7 +1199,7 @@ impl Engine {
                             .context()
                             .clone()
                             .with_elevated_sandbox_policy(policy);
-                        Self::execute_tool_with_lock(
+                        let mut result = Self::execute_tool_with_lock(
                             self.tool_exec_lock.clone(),
                             spec.supports_parallel(),
                             false,
@@ -1173,7 +1211,14 @@ impl Engine {
                             None,
                             Some(elevated_context),
                         )
-                        .await
+                        .await;
+                        if let Ok(tool_result) = result.as_mut() {
+                            stamp_tool_result_approval(
+                                tool_result,
+                                ToolApprovalStamp::ApprovedWithPolicy,
+                            );
+                        }
+                        result
                     }
                     Err(err) => Err(err),
                 }
@@ -1253,6 +1298,23 @@ impl Engine {
         }
     }
 
+    fn apply_runtime_mode_policy(
+        &mut self,
+        mode: AppMode,
+        allow_shell: bool,
+        trust_mode: bool,
+        auto_approve: bool,
+        approval_mode: crate::tui::approval::ApprovalMode,
+    ) {
+        self.current_mode = mode;
+        self.session.allow_shell = allow_shell;
+        self.config.allow_shell = allow_shell;
+        self.session.trust_mode = trust_mode;
+        self.config.trust_mode = trust_mode;
+        self.session.auto_approve = auto_approve;
+        self.session.approval_mode = agent_approval_mode_for_turn(auto_approve, approval_mode);
+    }
+
     /// Run the engine event loop
     #[allow(clippy::too_many_lines)]
     pub async fn run(mut self) {
@@ -1328,6 +1390,7 @@ impl Engine {
                     Op::RunShellCommand {
                         command,
                         mode,
+                        allow_shell,
                         trust_mode,
                         auto_approve,
                         approval_mode,
@@ -1335,6 +1398,7 @@ impl Engine {
                         self.handle_run_shell_command(
                             command,
                             mode,
+                            allow_shell,
                             trust_mode,
                             auto_approve,
                             approval_mode,
@@ -1450,15 +1514,48 @@ impl Engine {
                         }
                     }
                     Op::ListSubAgents => {
-                        let agents = {
+                        // #3803: the sidebar refresh is a read-only snapshot.
+                        // Render from a read lock; only take the write lock to
+                        // run cleanup on a bounded cadence, so a UI refresh storm
+                        // during a sub-agent fanout no longer contends for the
+                        // write lock (against completions/persistence) on every
+                        // request. Cleanup still auto-cancels stale agents.
+                        let due = {
+                            let manager = self.subagent_manager.read().await;
+                            manager.cleanup_due(
+                                crate::tools::subagent::SUBAGENT_LIST_CLEANUP_MIN_INTERVAL,
+                            )
+                        };
+                        let agents = if due {
                             let mut manager = self.subagent_manager.write().await;
                             manager.cleanup(Duration::from_secs(60 * 60));
                             manager.list()
+                        } else {
+                            self.subagent_manager.read().await.list()
                         };
-                        let _ = self.tx_event.send(Event::AgentList { agents }).await;
+                        // #3802: use non-blocking send — this is a refresh event
+                        // that can safely be dropped when the channel is full.
+                        // The next drain cycle will re-request the list.
+                        if let Err(_e) = self.tx_event.try_send(Event::AgentList { agents }) {
+                            tracing::debug!(
+                                "Event channel full; dropping ListSubAgents refresh (will retry next drain)"
+                            );
+                        }
                     }
-                    Op::ChangeMode { mode } => {
-                        self.current_mode = mode;
+                    Op::ChangeMode {
+                        mode,
+                        allow_shell,
+                        trust_mode,
+                        auto_approve,
+                        approval_mode,
+                    } => {
+                        self.apply_runtime_mode_policy(
+                            mode,
+                            allow_shell,
+                            trust_mode,
+                            auto_approve,
+                            approval_mode,
+                        );
                         self.emit_session_updated().await;
                         let _ = self
                             .tx_event
@@ -1468,10 +1565,15 @@ impl Engine {
                             )))
                             .await;
                     }
-                    Op::SetModel { model, mode: _ } => {
+                    Op::SetModel {
+                        model,
+                        mode: _,
+                        route_limits,
+                    } => {
                         self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
                         self.session.model = model;
                         self.config.model.clone_from(&self.session.model);
+                        self.active_route_limits = route_limits;
                         self.refresh_system_prompt();
                         self.emit_session_updated().await;
                         let _ = self
@@ -1553,6 +1655,7 @@ impl Engine {
                         system_prompt_override,
                         model,
                         workspace,
+                        mode,
                     } => {
                         if let Some(session_id) = session_id {
                             self.session.id = session_id;
@@ -1572,6 +1675,7 @@ impl Engine {
                         self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
                         self.session.model = model;
                         self.session.workspace = workspace.clone();
+                        self.current_mode = mode;
                         self.config.model.clone_from(&self.session.model);
                         self.config.workspace = workspace.clone();
                         let ctx =
@@ -1606,6 +1710,28 @@ impl Engine {
                             let _ = tx.send(snapshot);
                         }
                     }
+                    Op::GetProviderRuntimeStatus { tx } => {
+                        let status = if let Some(client) = self.deepseek_client.as_ref() {
+                            ProviderRuntimeStatus {
+                                provider: client.api_provider(),
+                                request_concurrency_limit: client
+                                    .provider_request_concurrency_limit(),
+                                active_provider_requests: client.active_provider_requests(),
+                            }
+                        } else {
+                            let provider = self.api_config.api_provider();
+                            ProviderRuntimeStatus {
+                                provider,
+                                request_concurrency_limit: self
+                                    .api_config
+                                    .provider_max_concurrency(provider),
+                                active_provider_requests: 0,
+                            }
+                        };
+                        if let Some(tx) = tx.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = tx.send(status);
+                        }
+                    }
                     Op::PurgeContext => {
                         self.handle_purge().await;
                     }
@@ -1628,7 +1754,7 @@ impl Engine {
                         }
                         // Now dispatch the new message as a normal send,
                         // reusing the engine's stored mode/model config.
-                        let mode = AppMode::Agent; // default fallback
+                        let mode = self.current_mode;
                         self.handle_send_message(
                             new_message,
                             mode,
@@ -1724,6 +1850,92 @@ impl Engine {
         }
     }
 
+    fn active_input_tokens_with_current_text(&self, current_text: &str) -> usize {
+        let mut messages: Vec<Message> = self.session.messages.clone().into();
+        if !current_text.trim().is_empty() {
+            messages.push(Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: current_text.to_string(),
+                    cache_control: None,
+                }],
+            });
+        }
+        estimate_input_tokens_conservative(&messages, self.session.system_prompt.as_ref())
+    }
+
+    fn append_resource_metadata_lines(
+        &self,
+        lines: &mut Vec<String>,
+        routed_model: &str,
+        current_text: &str,
+    ) {
+        let input_tokens = self.active_input_tokens_with_current_text(current_text);
+        if let Some(budget) = route_context_budget_for_route(
+            self.api_provider,
+            routed_model,
+            self.active_route_limits,
+            input_tokens,
+        ) {
+            lines.push(format!(
+                "Context pressure: {} ({:.1}% used, {} / {} tokens; {} input tokens available)",
+                budget.pressure.label(),
+                budget.usage_percent(),
+                budget.input_tokens,
+                budget.window_tokens,
+                budget.available_input_tokens,
+            ));
+        }
+
+        if let Some(line) = self.session_token_usage_line() {
+            lines.push(line);
+        }
+        if let Some(line) = self.active_goal_resource_line() {
+            lines.push(line);
+        }
+    }
+
+    fn session_token_usage_line(&self) -> Option<String> {
+        let usage = &self.session.total_usage;
+        let total = usage.input_tokens.saturating_add(usage.output_tokens);
+        if total == 0 {
+            return None;
+        }
+
+        let mut line = format!(
+            "Session token usage: {total} total ({} input, {} output)",
+            usage.input_tokens, usage.output_tokens,
+        );
+        if let Some(hit_tokens) = usage.cache_read_input_tokens {
+            line.push_str(&format!(", cache hits {hit_tokens}"));
+        }
+        if let Some(miss_tokens) = usage.cache_creation_input_tokens {
+            line.push_str(&format!(", cache misses {miss_tokens}"));
+        }
+        Some(line)
+    }
+
+    fn active_goal_resource_line(&self) -> Option<String> {
+        let snapshot = self.config.goal_state.lock().ok()?.snapshot();
+        if !snapshot.is_active() {
+            return None;
+        }
+
+        let mut telemetry =
+            ResourceTelemetry::new(snapshot.tokens_used, snapshot.time_used_seconds);
+        if let Some(token_budget) = snapshot.token_budget {
+            telemetry = telemetry.with_token_budget(u64::from(token_budget));
+        }
+
+        let mut line = format!("Active goal resource usage: {}", telemetry.human_summary());
+        if snapshot.tokens_used > 0 && snapshot.time_used_seconds > 0 {
+            let rate = snapshot.tokens_used as f64 / snapshot.time_used_seconds as f64;
+            line.push_str(&format!("; {rate:.1} tok/s"));
+        }
+        line.push_str(&format!("; {} continuations", snapshot.continuation_count));
+        Some(line)
+    }
+
     async fn add_session_message(&mut self, message: Message) {
         self.session.add_message(message);
         self.emit_session_updated().await;
@@ -1736,6 +1948,7 @@ impl Engine {
         reasoning_effort: Option<&str>,
         reasoning_effort_auto: bool,
         provenance: UserInputProvenance,
+        current_text: &str,
     ) -> ContentBlock {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let working_set_summary = self
@@ -1752,6 +1965,12 @@ impl Engine {
             // `render_environment_block` for the prefix-cache rationale).
             format!("Current workspace: {}", self.config.workspace.display()),
             format!("Current model: {routed_model}"),
+            format!("Current mode: {}", self.current_mode.as_setting()),
+            "Current mode policy source: runtime".to_string(),
+            format!(
+                "Current mode policy:\n{}",
+                Self::mode_runtime_instructions(self.current_mode)
+            ),
             format!("Input provenance: {}", provenance.as_str()),
             format!(
                 "Input authority: {}",
@@ -1768,6 +1987,7 @@ impl Engine {
         if reasoning_effort_auto && let Some(reasoning_effort) = reasoning_effort {
             lines.push(format!("Auto reasoning effort: {reasoning_effort}"));
         }
+        self.append_resource_metadata_lines(&mut lines, routed_model, current_text);
         if let Some(working_set_summary) = working_set_summary {
             lines.push(working_set_summary);
         }
@@ -1839,6 +2059,14 @@ impl Engine {
         // message prefix is invalidated at every date boundary. Moving it
         // to the tail preserves the user-input prefix and limits cache
         // invalidation to the trailing metadata block.
+        let turn_metadata = self.turn_metadata_block(
+            routed_model,
+            auto_model,
+            reasoning_effort,
+            reasoning_effort_auto,
+            provenance,
+            &text,
+        );
         Message {
             role: "user".to_string(),
             content: vec![
@@ -1846,13 +2074,7 @@ impl Engine {
                     text,
                     cache_control: None,
                 },
-                self.turn_metadata_block(
-                    routed_model,
-                    auto_model,
-                    reasoning_effort,
-                    reasoning_effort_auto,
-                    provenance,
-                ),
+                turn_metadata,
             ],
         }
     }
@@ -2027,7 +2249,7 @@ impl Engine {
             &content,
             allow_shell,
             trust_mode,
-            auto_approve,
+            mode == AppMode::Yolo || auto_approve,
             approval_mode,
         );
         if let Some(status) = input_policy.status.clone() {
@@ -2036,8 +2258,16 @@ impl Engine {
         // Reset cancel token for fresh turn (in case previous was cancelled)
         self.reset_cancel_token();
 
-        // Track current mode so mid-turn messages include the right mode in turn metadata.
-        self.current_mode = input_policy.mode;
+        // Track the complete effective mode policy so mid-turn metadata, `/edit`,
+        // idle worker resumptions, and approval gates cannot read a stale policy
+        // after the UI changed modes (#3568).
+        self.apply_runtime_mode_policy(
+            input_policy.mode,
+            input_policy.allow_shell,
+            input_policy.trust_mode,
+            input_policy.auto_approve,
+            input_policy.approval_mode,
+        );
 
         // Drain stale steer messages from previous turns.
         while self.rx_steer.try_recv().is_ok() {}
@@ -2135,15 +2365,6 @@ impl Engine {
             .observe_user_message(&content, &self.session.workspace);
         let force_update_plan_first = should_force_update_plan_first(input_policy.mode, &content);
 
-        let agent_approval_mode =
-            agent_approval_mode_for_turn(input_policy.auto_approve, input_policy.approval_mode);
-        self.session.auto_approve = input_policy.auto_approve;
-        // Only track the Agent-mode approval — Yolo/Plan have fixed
-        // approval policies that are derived from the mode itself.
-        if input_policy.mode == AppMode::Agent {
-            self.session.approval_mode = agent_approval_mode;
-        }
-
         // Add user message to session
         let user_msg = self.user_text_message_with_turn_metadata_for_route_and_provenance(
             content,
@@ -2181,10 +2402,6 @@ impl Engine {
         self.session.reasoning_effort = reasoning_effort;
         self.session.reasoning_effort_auto = reasoning_effort_auto;
         self.session.auto_model = auto_model;
-        self.session.allow_shell = input_policy.allow_shell;
-        self.config.allow_shell = input_policy.allow_shell;
-        self.session.trust_mode = input_policy.trust_mode;
-        self.config.trust_mode = input_policy.trust_mode;
         self.config.translation_enabled = translation_enabled;
         self.config.show_thinking = show_thinking;
         self.config.verbosity = verbosity;
@@ -2278,7 +2495,7 @@ impl Engine {
         };
 
         let mut tool_registry = match input_policy.mode {
-            AppMode::Agent | AppMode::Yolo => {
+            AppMode::Agent | AppMode::Auto | AppMode::Yolo => {
                 if subagents_available {
                     let runtime = if let Some(client) = self.deepseek_client.clone() {
                         let mut rt = SubAgentRuntime::new(
@@ -2390,6 +2607,7 @@ impl Engine {
             tools,
             input_policy.mode,
             force_update_plan_first,
+            input_policy.dynamic_active_tools,
         ))
         .catch_unwind()
         .await;
@@ -2635,7 +2853,7 @@ impl Engine {
             &self.session.messages,
             &self.session.model,
             self.session.reasoning_effort.clone(),
-            effective_max_output_tokens(&self.session.model),
+            effective_max_output_tokens_for_route(&self.session.model, self.active_route_limits),
         )
         .await
         {
@@ -2703,9 +2921,12 @@ impl Engine {
     }
 
     async fn recover_context_overflow(&mut self, client: &DeepSeekClient, reason: &str) -> bool {
-        let Some(target_budget) =
-            context_input_budget_for_provider(self.api_provider, &self.session.model)
-        else {
+        let Some(target_budget) = context_input_budget_for_route(
+            self.api_provider,
+            &self.session.model,
+            self.active_route_limits,
+            0,
+        ) else {
             return false;
         };
 
@@ -3034,8 +3255,10 @@ impl Engine {
     }
     /// Refresh the stable system prompt based on current non-mode context.
     fn refresh_system_prompt(&mut self) {
-        let user_memory_block =
-            crate::memory::compose_block(self.config.memory_enabled, &self.config.memory_path);
+        let user_memory_block = crate::memory::compose_block(
+            self.config.memory_enabled && !self.config.moraine_fallback, // TODO(v0.8.71): remove when Moraine recall stable; see #3490, #3495
+            &self.config.memory_path,
+        );
         let prompt_goal_objective = goal_objective_for_prompt(
             self.config.goal_objective.as_deref(),
             &self.config.goal_state,
@@ -3052,10 +3275,11 @@ impl Engine {
                 locale_tag: &self.config.locale_tag,
                 translation_enabled: self.config.translation_enabled,
                 model_id: &self.config.model,
-                context_window_override: Some(
-                    crate::config::provider_capability(self.api_provider, &self.config.model)
-                        .context_window,
-                ),
+                context_window_override: Some(crate::route_budget::route_context_window_tokens(
+                    self.api_provider,
+                    &self.config.model,
+                    self.active_route_limits,
+                )),
                 show_thinking: self.config.show_thinking,
                 verbosity: self.config.verbosity.as_deref(),
                 skills_scan_codewhale_only: self.config.skills_scan_codewhale_only,
@@ -3251,6 +3475,7 @@ struct EffectiveInputPolicy {
     trust_mode: bool,
     auto_approve: bool,
     approval_mode: crate::tui::approval::ApprovalMode,
+    dynamic_active_tools: Vec<&'static str>,
     status: Option<String>,
 }
 
@@ -3267,36 +3492,38 @@ fn effective_input_policy(
     let mut trust_mode = trust_mode;
     let mut auto_approve = auto_approve;
     let mut approval_mode = approval_mode;
+    let mut dynamic_active_tools = Vec::new();
     let mut status = None;
 
-    if !provenance.can_authorize_work() {
+    if !provenance_can_inherit_standing_auto_authority(provenance) {
         let had_auto_authority = matches!(mode, AppMode::Yolo)
             || trust_mode
             || auto_approve
-            || matches!(approval_mode, crate::tui::approval::ApprovalMode::Auto);
+            || matches!(approval_mode, crate::tui::approval::ApprovalMode::Bypass);
         if matches!(mode, AppMode::Yolo) {
             mode = AppMode::Agent;
         }
         trust_mode = false;
         auto_approve = false;
-        if matches!(approval_mode, crate::tui::approval::ApprovalMode::Auto) {
+        if matches!(
+            approval_mode,
+            crate::tui::approval::ApprovalMode::Auto | crate::tui::approval::ApprovalMode::Bypass
+        ) {
             approval_mode = crate::tui::approval::ApprovalMode::Suggest;
         }
         if had_auto_authority {
             status = Some(format!(
-                "Input provenance '{}' is not external user input; continuing with approvals required.",
+                "Input provenance '{}' cannot inherit standing auto-approval authority; continuing with approvals required.",
                 provenance.as_str()
             ));
         }
     } else if is_review_only_user_intent(content) {
-        mode = AppMode::Plan;
-        trust_mode = false;
-        auto_approve = false;
-        if matches!(approval_mode, crate::tui::approval::ApprovalMode::Auto) {
-            approval_mode = crate::tui::approval::ApprovalMode::Suggest;
-        }
+        // Advisory only: never silently override an explicitly chosen mode
+        // or strip its tools. Surface the question modal dynamically so the
+        // model can ask focused follow-ups without inflating every tool prompt.
+        dynamic_active_tools.push(REQUEST_USER_INPUT_NAME);
         status = Some(
-            "Review/inspection request detected; using read-only Plan tools for this turn. Add an explicit fix/edit/commit instruction to allow writes.".to_string(),
+            "Review/inspection request detected; keeping the current mode and exposing request_user_input for focused follow-up questions.".to_string(),
         );
     }
 
@@ -3306,8 +3533,18 @@ fn effective_input_policy(
         trust_mode,
         auto_approve,
         approval_mode,
+        dynamic_active_tools,
         status,
     }
+}
+
+fn provenance_can_inherit_standing_auto_authority(provenance: UserInputProvenance) -> bool {
+    matches!(
+        provenance,
+        UserInputProvenance::ExternalUser
+            | UserInputProvenance::Runtime
+            | UserInputProvenance::SubAgentHandoff
+    )
 }
 
 fn is_review_only_user_intent(content: &str) -> bool {
@@ -3358,7 +3595,7 @@ fn agent_approval_mode_for_turn(
     approval_mode: crate::tui::approval::ApprovalMode,
 ) -> crate::tui::approval::ApprovalMode {
     if auto_approve {
-        crate::tui::approval::ApprovalMode::Auto
+        crate::tui::approval::ApprovalMode::Bypass
     } else {
         approval_mode
     }
@@ -3387,6 +3624,9 @@ pub(super) fn auto_review_run_origin_for_plan(
     }
 }
 
+// The parameter list intentionally mirrors `AutoReviewContext::from_tool_call`,
+// which this thin wrapper builds; the 8 call sites (1 prod + tests) read clearer
+// passing the fields than constructing a context first.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn auto_review_plan_decision(
     policy: &crate::tui::auto_review::AutoReviewPolicy,
@@ -3494,9 +3734,9 @@ fn tool_ask_rule_decision_for_context(
     let cwd = workspace.to_string_lossy();
     let ask_for_approval = match approval_mode {
         crate::tui::approval::ApprovalMode::Never => AskForApproval::Never,
-        crate::tui::approval::ApprovalMode::Auto | crate::tui::approval::ApprovalMode::Suggest => {
-            AskForApproval::OnFailure
-        }
+        crate::tui::approval::ApprovalMode::Auto
+        | crate::tui::approval::ApprovalMode::Bypass
+        | crate::tui::approval::ApprovalMode::Suggest => AskForApproval::OnFailure,
     };
     let decision = config
         .exec_policy_engine
@@ -3638,10 +3878,13 @@ pub(crate) use context::compact_tool_result_for_context;
 #[cfg(test)]
 use context::route_context_budget_for_provider;
 use context::{
-    MAX_CONTEXT_RECOVERY_ATTEMPTS, MIN_RECENT_MESSAGES_TO_KEEP, context_input_budget_for_provider,
-    effective_max_output_tokens, extract_compaction_summary_prompt,
-    is_context_length_error_message, summarize_text,
+    MAX_CONTEXT_RECOVERY_ATTEMPTS, MIN_RECENT_MESSAGES_TO_KEEP, context_input_budget_for_route,
+    effective_max_output_tokens_for_route, estimate_input_tokens_conservative,
+    extract_compaction_summary_prompt, is_context_length_error_message,
+    route_context_budget_for_route, summarize_text,
 };
+#[cfg(test)]
+use context::{context_input_budget_for_provider, effective_max_output_tokens};
 mod dispatch;
 mod lsp_hooks;
 mod streaming;
@@ -3675,11 +3918,13 @@ use self::approval::{ApprovalDecision, ApprovalResult, UserInputDecision};
 #[cfg(test)]
 use self::dispatch::should_parallelize_tool_batch;
 use self::dispatch::{
-    ParallelToolResult, ParallelToolResultEntry, ToolExecGuard, ToolExecOutcome,
+    ParallelToolResult, ParallelToolResultEntry, ToolApprovalStamp, ToolExecGuard, ToolExecOutcome,
     ToolExecutionBatch, ToolExecutionPlan, caller_allowed_for_tool, caller_type_for_tool_use,
-    final_tool_input, format_tool_error, mcp_tool_approval_description, mcp_tool_is_parallel_safe,
+    final_tool_input, format_tool_error, malformed_tool_arguments_error,
+    malformed_tool_arguments_input, mcp_tool_approval_description, mcp_tool_is_parallel_safe,
     mcp_tool_is_read_only, parse_parallel_tool_calls, parse_tool_input,
     plan_tool_execution_batches, should_force_update_plan_first, should_stop_after_plan_tool,
+    stamp_tool_result_approval,
 };
 #[cfg(test)]
 use self::lsp_hooks::edited_paths_for_tool;

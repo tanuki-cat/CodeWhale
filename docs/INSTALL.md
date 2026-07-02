@@ -8,22 +8,32 @@ If you just want the short version, see the
 [main README](../README.md#install) or
 [简体中文 README](../README.zh-CN.md#安装).
 
+On macOS and Linux, the website installer is the shortest install/update path:
+
+```bash
+curl -fsSL https://codewhale.net/install.sh | sh
+```
+
+It downloads the matching `codewhale`, `codew`, and `codewhale-tui` release binaries,
+verifies them against `codewhale-artifacts-sha256.txt`, installs to
+`~/.local/bin` by default, and exposes the `codew` convenience command.
+
 ---
 
 ## 1. Supported platforms
 
-CodeWhale ships matched `codewhale` and `codewhale-tui` prebuilt binaries for
+CodeWhale ships matched `codewhale`, `codew`, and `codewhale-tui` prebuilt binaries for
 these platform/architecture combinations. Linux ARM64 is available from
 v0.8.8 onward; Linux RISC-V starts with the first release after v0.8.47.
 
 | Platform     | Architecture | npm install | `cargo install` | GitHub release asset                                  |
 | ------------ | ------------ | :---------: | :-------------: | ----------------------------------------------------- |
-| Linux        | x64 (x86_64) |     ✅      |       ✅        | `codewhale-linux-x64`, `codewhale-tui-linux-x64`        |
-| Linux        | arm64        |     ✅      |       ✅        | `codewhale-linux-arm64`, `codewhale-tui-linux-arm64`    |
-| Linux        | riscv64      |     ✅      |       ✅        | `codewhale-linux-riscv64`, `codewhale-tui-linux-riscv64`|
-| macOS        | x64          |     ✅      |       ✅        | `codewhale-macos-x64`, `codewhale-tui-macos-x64`        |
-| macOS        | arm64 (M-series) | ✅      |       ✅        | `codewhale-macos-arm64`, `codewhale-tui-macos-arm64`    |
-| Windows      | x64          |     ✅      |       ✅        | `codewhale-windows-x64.exe`, `codewhale-tui-windows-x64.exe` |
+| Linux        | x64 (x86_64) |     ✅      |       ✅        | `codewhale-linux-x64`, `codew-linux-x64`, `codewhale-tui-linux-x64`        |
+| Linux        | arm64        |     ✅      |       ✅        | `codewhale-linux-arm64`, `codew-linux-arm64`, `codewhale-tui-linux-arm64`    |
+| Linux        | riscv64      |     ✅      |       ✅        | `codewhale-linux-riscv64`, `codew-linux-riscv64`, `codewhale-tui-linux-riscv64`|
+| macOS        | x64          |     ✅      |       ✅        | `codewhale-macos-x64`, `codew-macos-x64`, `codewhale-tui-macos-x64`        |
+| macOS        | arm64 (M-series) | ✅      |       ✅        | `codewhale-macos-arm64`, `codew-macos-arm64`, `codewhale-tui-macos-arm64`    |
+| Windows      | x64          |     ✅      |       ✅        | `codewhale-windows-x64.exe`, `codew-windows-x64.exe`, `codewhale-tui-windows-x64.exe` |
 | Linux x64 on musl (Alpine) | ✅ (static) |    ✅      |       ✅        | static `codewhale-tui-linux-x64` (musl) asset           |
 | Other Linux (musl non-x64, other arches) | — | ❌¹ | ✅² | build from source                                     |
 | FreeBSD / OpenBSD              | — |   ❌      |       ✅²       | build from source                                     |
@@ -32,7 +42,7 @@ v0.8.8 onward; Linux RISC-V starts with the first release after v0.8.47.
 ² Provided your toolchain can compile a recent Rust workspace; see
   [Build from source](#7-build-from-source) below.
 
-The Linux **x64** release assets are **static (musl) builds** as of v0.8.63.
+The Linux **x64** release assets have been **static (musl) builds** since v0.8.65.
 They have no glibc dependency and run on any x86_64 Linux, including Ubuntu
 22.04, Debian stable, RHEL/CentOS, and Alpine/musl. SQLite is bundled into the
 binary through `rusqlite`, so no separate `libsqlite3` runtime package is needed.
@@ -46,7 +56,7 @@ builds. They dynamically link normal Linux runtime libraries such as
 
 This floor applies only to the **GNU libc** assets (arm64, riscv64). The static
 x64 (musl) asset has no `GLIBC_*` symbols, so it passes the install preflight
-and runs on older systems without error. In the current v0.8.63 release lane,
+and runs on older systems without error. In the current v0.8.66 release lane,
 the GNU assets are built on Ubuntu 24.04 and can require `GLIBC_2.39`. Ubuntu
 22.04 ships glibc 2.35, so those arm64/riscv64 binaries fail with errors such as:
 
@@ -117,11 +127,11 @@ a download sourced from an impersonating repository or mirror.
 ## 3. Install via npm
 
 npm is the recommended install path. The `codewhale` wrapper is published at
-v0.8.63 (Node 18+; wrapper available for v0.8.56 and later).
+v0.8.66 (Node 18+; wrapper available for v0.8.56 and later).
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.63
+codewhale --version   # 0.8.66
 ```
 
 `postinstall` downloads the right pair of binaries from the matching GitHub
@@ -159,7 +169,7 @@ delegates to the TUI runtime at runtime.
 
 ```bash
 # Requires Rust 1.88+ (https://rustup.rs)
-cargo install codewhale-cli --locked   # provides `codewhale`
+cargo install codewhale-cli --locked   # provides `codewhale` and `codew`
 cargo install codewhale-tui     --locked   # provides `codewhale-tui`
 codewhale --version
 ```
@@ -310,13 +320,14 @@ once the rename lands, this section will switch to it.
 ## 6. Manual download from GitHub Releases
 
 Each platform appears on the Releases page in **two forms** (this is intentional — see #3208):
-the **bare binaries** (`codewhale-<platform>` and `codewhale-tui-<platform>`, no extension) and a
-**`.tar.gz` / `.zip` archive** (`codewhale-<platform>.tar.gz`) that bundles the same two binaries
-plus an `install.sh`. The bare binaries are what the npm wrapper and the in-app `codewhale update`
-download; the archive is the easiest manual install (see §5). The steps below use the bare binaries
-directly.
+the **bare binaries** (`codewhale-<platform>`, `codew-<platform>`, and
+`codewhale-tui-<platform>`, no extension) and a **`.tar.gz` / `.zip` archive**
+(`codewhale-<platform>.tar.gz`) that bundles the same commands plus an
+`install.sh`. The npm wrapper and the in-app `codewhale update` download the
+matched runtime binaries; the archive is the easiest manual install (see §5).
+The steps below use the bare binaries directly.
 
-Grab the matching pair of binaries for your platform from the
+Grab the matching command set for your platform from the
 [Releases page](https://github.com/Hmbown/CodeWhale/releases) and drop them
 side by side into a directory on your `PATH` (e.g. `~/.local/bin`):
 
@@ -325,17 +336,19 @@ side by side into a directory on your `PATH` (e.g. `~/.local/bin`):
 mkdir -p ~/.local/bin
 curl -L -o ~/.local/bin/codewhale      \
     https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-linux-arm64
+curl -L -o ~/.local/bin/codew          \
+    https://github.com/Hmbown/CodeWhale/releases/latest/download/codew-linux-arm64
 curl -L -o ~/.local/bin/codewhale-tui  \
     https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-tui-linux-arm64
-chmod +x ~/.local/bin/codewhale ~/.local/bin/codewhale-tui
+chmod +x ~/.local/bin/codewhale ~/.local/bin/codew ~/.local/bin/codewhale-tui
 codewhale --version
 ```
 
 > **macOS Gatekeeper note.** If you downloaded the binaries with a browser,
 > macOS may block them with "Apple cannot verify" warnings. Clear the quarantine
-> attribute on both binaries and retry:
+> attribute on all three binaries and retry:
 > ```bash
-> xattr -d com.apple.quarantine ~/.local/bin/codewhale ~/.local/bin/codewhale-tui 2>/dev/null || true
+> xattr -d com.apple.quarantine ~/.local/bin/codewhale ~/.local/bin/codew ~/.local/bin/codewhale-tui 2>/dev/null || true
 > ```
 
 Verify integrity against the per-release SHA-256 manifest:
@@ -362,7 +375,7 @@ cargo install codewhale-cli --version X.Y.Z --locked --force
 cargo install codewhale-tui --version X.Y.Z --locked --force
 ```
 
-For manual installs, download both binaries or the platform archive from the
+For manual installs, download the matched binaries or the platform archive from the
 exact release tag and verify the matching checksum manifest from that same tag:
 
 ```bash
@@ -405,7 +418,7 @@ Cargo required).
 
 **Install** by double-clicking the setup executable. The installer:
 
-- Installs `codewhale.exe` and `codewhale-tui.exe` side-by-side into
+- Installs `codewhale.exe`, `codew.exe`, and `codewhale-tui.exe` side-by-side into
   `%LOCALAPPDATA%\Programs\CodeWhale\bin`
 - Adds the install directory to the **current user** `PATH`
 - Registers in Windows **Apps & Features** for easy uninstall
@@ -465,13 +478,13 @@ LoongArch, FreeBSD, and pre-2024 ARM64 distros.
 git clone https://github.com/Hmbown/CodeWhale.git
 cd CodeWhale
 
-cargo install --path crates/cli --locked   # provides `codewhale`
+cargo install --path crates/cli --locked   # provides `codewhale` and `codew`
 cargo install --path crates/tui --locked   # provides `codewhale-tui`
 
 codewhale --version
 ```
 
-Both binaries land in `~/.cargo/bin/` by default; make sure that directory is
+The commands land in `~/.cargo/bin/` by default; make sure that directory is
 on your `PATH`.
 
 ### Cross-compiling from x64 to ARM64 Linux
@@ -571,8 +584,8 @@ set CARGO_HTTP_CHECK_REVOKE=false   # may be needed behind some Chinese ISPs
 cargo build --release
 ```
 
-Both binaries appear in `target\release\codewhale.exe` and
-`target\release\codewhale-tui.exe`.
+The binaries appear in `target\release\codewhale.exe`,
+`target\release\codew.exe`, and `target\release\codewhale-tui.exe`.
 
 > Prefer not to build? Install via npm, Cargo, GitHub Releases, or the CNB
 > mirror — see the sections above.
@@ -680,6 +693,23 @@ Install the C toolchain:
 ```bash
 sudo apt-get install -y build-essential pkg-config libdbus-1-dev
 ```
+
+### WSL2 / Ubuntu: `dbus-1` or `pkg-config` not found while building
+
+WSL2 uses the same Linux source-build path as Ubuntu. If `cargo install
+codewhale-tui --locked` fails while compiling the keyring or D-Bus secret
+storage crates, install the Linux build dependencies inside the WSL distro,
+then rerun both Cargo install commands:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libdbus-1-dev
+cargo install codewhale-cli --locked
+cargo install codewhale-tui --locked
+```
+
+The prebuilt npm/GitHub binaries do not need these build-time packages; they
+only apply when WSL2 is compiling CodeWhale from source.
 
 ### Wrapper installs but `codewhale` isn't found
 

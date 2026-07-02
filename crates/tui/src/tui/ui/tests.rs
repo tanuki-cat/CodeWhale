@@ -1,12 +1,12 @@
 use super::*;
 use crate::config::{
-    ApiProvider, Config, DEFAULT_OPENROUTER_MODEL, DEFAULT_TEXT_MODEL, ProviderConfig,
-    ProvidersConfig,
+    ApiProvider, Config, DEFAULT_OPENROUTER_MODEL, DEFAULT_TEXT_MODEL, DEFAULT_ZAI_MODEL,
+    ProviderConfig, ProvidersConfig,
 };
 use crate::config_ui::{self, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::mock_engine_handle;
 use crate::tui::active_cell::ActiveCell;
-use crate::tui::app::{SidebarHoverRow, SidebarHoverSection, ToolDetailRecord};
+use crate::tui::app::{ReasoningEffort, SidebarHoverRow, SidebarHoverSection, ToolDetailRecord};
 use crate::tui::file_mention::{
     apply_mention_menu_selection, find_file_mention_completions, partial_file_mention_at_cursor,
     try_autocomplete_file_mention, user_request_with_file_mentions, visible_mention_menu_entries,
@@ -80,6 +80,8 @@ struct SettingsHomeGuard {
     previous_userprofile: Option<OsString>,
     previous_codewhale_home: Option<OsString>,
     previous_deepseek_config_path: Option<OsString>,
+    previous_codewhale_provider: Option<OsString>,
+    previous_deepseek_provider: Option<OsString>,
     previous_xdg_config_home: Option<OsString>,
     previous_appdata: Option<OsString>,
     previous_localappdata: Option<OsString>,
@@ -94,6 +96,8 @@ impl SettingsHomeGuard {
         let previous_userprofile = std::env::var_os("USERPROFILE");
         let previous_codewhale_home = std::env::var_os("CODEWHALE_HOME");
         let previous_deepseek_config_path = std::env::var_os("DEEPSEEK_CONFIG_PATH");
+        let previous_codewhale_provider = std::env::var_os("CODEWHALE_PROVIDER");
+        let previous_deepseek_provider = std::env::var_os("DEEPSEEK_PROVIDER");
         let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let previous_appdata = std::env::var_os("APPDATA");
         let previous_localappdata = std::env::var_os("LOCALAPPDATA");
@@ -104,6 +108,8 @@ impl SettingsHomeGuard {
             std::env::set_var("USERPROFILE", tmp.path());
             std::env::set_var("CODEWHALE_HOME", &codewhale_home);
             std::env::set_var("DEEPSEEK_CONFIG_PATH", codewhale_home.join("config.toml"));
+            std::env::remove_var("CODEWHALE_PROVIDER");
+            std::env::remove_var("DEEPSEEK_PROVIDER");
             std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("xdg-config"));
             std::env::set_var("APPDATA", tmp.path().join("appdata"));
             std::env::set_var("LOCALAPPDATA", tmp.path().join("localappdata"));
@@ -114,6 +120,8 @@ impl SettingsHomeGuard {
             previous_userprofile,
             previous_codewhale_home,
             previous_deepseek_config_path,
+            previous_codewhale_provider,
+            previous_deepseek_provider,
             previous_xdg_config_home,
             previous_appdata,
             previous_localappdata,
@@ -141,6 +149,11 @@ impl Drop for SettingsHomeGuard {
             "DEEPSEEK_CONFIG_PATH",
             self.previous_deepseek_config_path.take(),
         );
+        restore(
+            "CODEWHALE_PROVIDER",
+            self.previous_codewhale_provider.take(),
+        );
+        restore("DEEPSEEK_PROVIDER", self.previous_deepseek_provider.take());
         restore("XDG_CONFIG_HOME", self.previous_xdg_config_home.take());
         restore("APPDATA", self.previous_appdata.take());
         restore("LOCALAPPDATA", self.previous_localappdata.take());
@@ -226,6 +239,30 @@ fn recover_terminal_modes_emits_expected_csi_sequences_with_gating() {
         !off.contains("\x1b[?2004h"),
         "EnableBracketedPaste must be gated by use_bracketed_paste"
     );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn bracketed_paste_mode_helpers_ignore_writer_errors() {
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("terminal mode unsupported"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("terminal mode unsupported"))
+        }
+    }
+
+    let mut writer = FailingWriter;
+
+    assert!(
+        !try_enable_bracketed_paste_mode(&mut writer),
+        "unsupported bracketed paste must be reported without bubbling an error"
+    );
+    disable_bracketed_paste_mode(&mut writer);
 }
 
 #[cfg(windows)]
@@ -1692,6 +1729,101 @@ fn create_test_app() -> App {
 }
 
 #[test]
+fn hotbar_setup_save_persists_bindings_to_config_path() {
+    let tmp = TempDir::new().expect("config tempdir");
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"# keep model note
+model = "deepseek-v4-pro"
+
+[providers.deepseek]
+api_key = "test-key"
+"#,
+    )
+    .expect("write config");
+
+    let mut app = create_test_app();
+    app.config_path = Some(config_path.clone());
+    let mut config = Config::load(Some(config_path.clone()), None).expect("load config");
+    let bindings = vec![codewhale_config::HotbarBindingToml {
+        slot: 1,
+        action: "mode.agent".to_string(),
+        label: Some("Agent".to_string()),
+    }];
+
+    apply_hotbar_setup_saved(&mut app, &mut config, bindings.clone());
+
+    assert_eq!(config.hotbar, Some(bindings.clone()));
+    assert!(app.needs_redraw);
+    assert!(
+        app.status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Hotbar bindings saved to"))
+    );
+
+    let body = std::fs::read_to_string(&config_path).expect("read saved config");
+    assert!(body.contains("# keep model note"), "comment lost: {body}");
+    assert!(
+        body.contains("[providers.deepseek]"),
+        "provider section lost: {body}"
+    );
+    assert!(body.contains("[[hotbar]]"), "hotbar table missing: {body}");
+    let parsed: codewhale_config::ConfigToml =
+        toml::from_str(&body).expect("saved config should parse");
+    assert_eq!(parsed.hotbar, Some(bindings));
+}
+
+#[test]
+fn hotbar_setup_save_error_leaves_live_config_and_file_unchanged() {
+    let tmp = TempDir::new().expect("config tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let invalid_body = "model = [\n";
+    std::fs::write(&config_path, invalid_body).expect("write malformed config");
+
+    let mut app = create_test_app();
+    app.config_path = Some(config_path.clone());
+    let original_bindings = vec![codewhale_config::HotbarBindingToml {
+        slot: 2,
+        action: "mode.plan".to_string(),
+        label: None,
+    }];
+    let mut config = Config {
+        hotbar: Some(original_bindings.clone()),
+        ..Default::default()
+    };
+    let attempted_bindings = vec![codewhale_config::HotbarBindingToml {
+        slot: 1,
+        action: "mode.agent".to_string(),
+        label: None,
+    }];
+
+    apply_hotbar_setup_saved(&mut app, &mut config, attempted_bindings);
+
+    assert_eq!(config.hotbar, Some(original_bindings));
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read malformed config"),
+        invalid_body
+    );
+    assert!(
+        app.status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Failed to save Hotbar bindings"))
+    );
+    assert!(app.needs_redraw);
+    let last_system_message = app
+        .history
+        .iter()
+        .rev()
+        .find_map(|cell| match cell {
+            HistoryCell::System { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .expect("failed save should add a system message");
+    assert!(last_system_message.contains("Failed to save Hotbar bindings"));
+}
+
+#[test]
 fn app_system_prompt_includes_configured_instructions() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let instructions = tmp.path().join("extra-instructions.md");
@@ -1768,10 +1900,18 @@ fn forced_approval_prompt_bypasses_session_approval_shortcut() {
 }
 
 #[test]
-fn non_forced_approval_request_keeps_existing_auto_shortcuts() {
+fn approval_request_uses_session_cache_not_current_mode_shortcut() {
     let mut app = create_test_app();
     app.approval_mode = ApprovalMode::Auto;
-    assert!(should_auto_approve_approval_request(
+    assert!(!should_auto_approve_approval_request(
+        &app,
+        "exec_shell",
+        "shell:exec_shell:cargo test",
+        false,
+    ));
+
+    app.approval_mode = ApprovalMode::Bypass;
+    assert!(!should_auto_approve_approval_request(
         &app,
         "exec_shell",
         "shell:exec_shell:cargo test",
@@ -1779,6 +1919,15 @@ fn non_forced_approval_request_keeps_existing_auto_shortcuts() {
     ));
 
     app.approval_mode = ApprovalMode::Suggest;
+    app.mode = AppMode::Yolo;
+    assert!(!should_auto_approve_approval_request(
+        &app,
+        "exec_shell",
+        "shell:exec_shell:cargo test",
+        false,
+    ));
+
+    app.mode = AppMode::Agent;
     app.approval_session_approved
         .insert("shell:exec_shell:cargo test".to_string());
     assert!(should_auto_approve_approval_request(
@@ -1787,6 +1936,24 @@ fn non_forced_approval_request_keeps_existing_auto_shortcuts() {
         "shell:exec_shell:cargo test",
         false,
     ));
+}
+
+#[test]
+fn app_auto_approval_helper_covers_yolo_and_bypass_only() {
+    let mut app = create_test_app();
+    app.mode = AppMode::Agent;
+    app.approval_mode = ApprovalMode::Suggest;
+    assert!(!app_auto_approve_enabled(&app));
+
+    app.approval_mode = ApprovalMode::Auto;
+    assert!(!app_auto_approve_enabled(&app));
+
+    app.approval_mode = ApprovalMode::Bypass;
+    assert!(app_auto_approve_enabled(&app));
+
+    app.approval_mode = ApprovalMode::Suggest;
+    app.mode = AppMode::Yolo;
+    assert!(app_auto_approve_enabled(&app));
 }
 
 fn create_test_options() -> TuiOptions {
@@ -2010,6 +2177,9 @@ fn apply_loaded_session_resets_unpersisted_telemetry() {
     app.session.last_prompt_cache_miss_tokens = Some(40);
     app.session.last_reasoning_replay_tokens = Some(12);
     app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
+        provider: None,
+        model: None,
+        auto_model: false,
         input_tokens: 120,
         output_tokens: 35,
         cache_hit_tokens: Some(80),
@@ -2089,6 +2259,33 @@ async fn apply_loaded_session_resets_workspace_runtime_state() {
         session.metadata.workspace.as_path()
     );
     assert!(app.runtime_services.hook_executor.is_some());
+}
+
+#[test]
+fn shell_live_output_refresh_does_not_block_on_contended_lock() {
+    // #3804: the async UI loop must never block on the shell manager's
+    // std::sync Mutex. While the lock is held, the render-only live-output
+    // refresh must return immediately via try_lock — the previous blocking
+    // lock() would deadlock on this same thread, so reaching the assert at all
+    // proves the path no longer blocks under contention.
+    let mut app = create_test_app();
+    let shell_mgr = app
+        .runtime_services
+        .shell_manager
+        .as_ref()
+        .expect("shell manager")
+        .clone();
+
+    let guard = shell_mgr.lock().expect("hold shell lock");
+    let changed = refresh_shell_exec_live_output(&mut app);
+    assert!(
+        !changed,
+        "contended live-output refresh should skip this frame, not block or update"
+    );
+    drop(guard);
+
+    // With the lock free again the path runs normally (no jobs → no change).
+    assert!(!refresh_shell_exec_live_output(&mut app));
 }
 
 #[test]
@@ -2219,7 +2416,7 @@ fn active_tool_status_label_summarizes_live_tool_group() {
     assert!(label.contains("1 active"));
     assert!(label.contains("1 done"));
     assert!(label.contains(crate::tui::key_shortcuts::tool_details_shortcut_label()));
-    assert!(label.contains("/v"));
+    assert!(label.contains("opens details"));
 }
 
 #[test]
@@ -2493,10 +2690,20 @@ async fn model_change_update_syncs_engine_model_before_compaction() {
     let compaction = app.compaction_config();
     let mut engine = crate::core::engine::mock_engine_handle();
 
-    apply_model_and_compaction_update(&engine.handle, compaction, app.mode).await;
+    apply_model_and_compaction_update(
+        &engine.handle,
+        compaction,
+        app.mode,
+        app.active_route_limits,
+    )
+    .await;
 
     match engine.rx_op.recv().await.expect("set model op") {
-        crate::core::ops::Op::SetModel { model, mode } => {
+        crate::core::ops::Op::SetModel {
+            model,
+            mode,
+            route_limits: _,
+        } => {
             assert_eq!(model, "deepseek-v4-flash");
             assert_eq!(mode, app.mode);
         }
@@ -2520,8 +2727,47 @@ async fn mode_change_update_notifies_engine() {
     assert!(apply_mode_update(&mut app, &engine.handle, crate::tui::app::AppMode::Yolo).await);
 
     match engine.rx_op.recv().await.expect("change mode op") {
-        crate::core::ops::Op::ChangeMode { mode } => {
+        crate::core::ops::Op::ChangeMode {
+            mode,
+            allow_shell,
+            trust_mode,
+            auto_approve,
+            approval_mode,
+        } => {
             assert_eq!(mode, crate::tui::app::AppMode::Yolo);
+            assert!(allow_shell);
+            assert!(trust_mode);
+            assert!(auto_approve);
+            assert_eq!(approval_mode, crate::tui::approval::ApprovalMode::Bypass);
+        }
+        other => panic!("expected ChangeMode, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mode_change_update_sends_restored_agent_policy() {
+    let mut app = create_test_app();
+    app.allow_shell = true;
+    app.trust_mode = false;
+    app.approval_mode = crate::tui::approval::ApprovalMode::Never;
+    let _ = app.set_mode(crate::tui::app::AppMode::Plan);
+    let mut engine = crate::core::engine::mock_engine_handle();
+
+    assert!(apply_mode_update(&mut app, &engine.handle, crate::tui::app::AppMode::Agent).await);
+
+    match engine.rx_op.recv().await.expect("change mode op") {
+        crate::core::ops::Op::ChangeMode {
+            mode,
+            allow_shell,
+            trust_mode,
+            auto_approve,
+            approval_mode,
+        } => {
+            assert_eq!(mode, crate::tui::app::AppMode::Agent);
+            assert!(allow_shell);
+            assert!(!trust_mode);
+            assert!(!auto_approve);
+            assert_eq!(approval_mode, crate::tui::approval::ApprovalMode::Never);
         }
         other => panic!("expected ChangeMode, got {other:?}"),
     }
@@ -2573,6 +2819,9 @@ async fn provider_switch_clears_turn_cache_history() {
 
     let mut app = create_test_app();
     app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
+        provider: None,
+        model: None,
+        auto_model: false,
         input_tokens: 100,
         output_tokens: 25,
         cache_hit_tokens: Some(70),
@@ -2824,6 +3073,113 @@ async fn provider_switch_model_override_updates_target_provider_model_slot() {
 }
 
 #[tokio::test]
+async fn provider_switch_without_model_uses_target_default_not_previous_provider_model() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Openrouter;
+    app.model = "deepseek/deepseek-v4-pro".to_string();
+    app.model_ids_passthrough = true;
+    let mut engine = mock_engine_handle();
+    let mut config = Config {
+        provider: Some("openrouter".to_string()),
+        api_key: Some("deepseek-key".to_string()),
+        providers: Some(ProvidersConfig {
+            openrouter: ProviderConfig {
+                api_key: Some("openrouter-key".to_string()),
+                model: Some("deepseek/deepseek-v4-pro".to_string()),
+                ..Default::default()
+            },
+            zai: ProviderConfig {
+                api_key: Some("zai-key".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    switch_provider(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApiProvider::Zai,
+        None,
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Zai);
+    assert_eq!(app.model, DEFAULT_ZAI_MODEL);
+    assert_eq!(config.provider.as_deref(), Some("zai"));
+    assert_eq!(
+        config
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.zai.model.as_deref()),
+        Some(DEFAULT_ZAI_MODEL)
+    );
+    assert_eq!(
+        config
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.openrouter.model.as_deref()),
+        Some("deepseek/deepseek-v4-pro")
+    );
+}
+
+#[tokio::test]
+async fn provider_switch_foreign_direct_model_rejected_before_mutation() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Deepseek;
+    app.model = DEFAULT_TEXT_MODEL.to_string();
+    let mut engine = mock_engine_handle();
+    let mut config = Config {
+        provider: Some("deepseek".to_string()),
+        api_key: Some("deepseek-key".to_string()),
+        providers: Some(ProvidersConfig {
+            deepseek: ProviderConfig {
+                api_key: Some("deepseek-key".to_string()),
+                model: Some(DEFAULT_TEXT_MODEL.to_string()),
+                ..Default::default()
+            },
+            zai: ProviderConfig {
+                api_key: Some("zai-key".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    switch_provider(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApiProvider::Zai,
+        Some("deepseek-v4-pro".to_string()),
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.model, DEFAULT_TEXT_MODEL);
+    assert_eq!(config.provider.as_deref(), Some("deepseek"));
+    assert_eq!(
+        config
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.zai.model.as_deref()),
+        None
+    );
+    assert!(app.pending_provider_switch.is_none());
+    assert!(
+        app.status_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Route rejected before provider switch")
+    );
+}
+
+#[tokio::test]
 async fn provider_switch_to_openai_codex_normalizes_deepseek_off_effort() {
     let _home = SettingsHomeGuard::new();
     let _token = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
@@ -2918,6 +3274,10 @@ async fn dispatch_user_message_failed_send_clears_loading_state() {
     );
     assert!(app.last_send_at.is_none());
     assert!(app.dispatch_started_at.is_none());
+    assert!(
+        app.pending_turn_route.is_none(),
+        "failed dispatch must not leave stale route telemetry"
+    );
 }
 
 #[cfg(not(windows))]
@@ -3243,6 +3603,48 @@ async fn dispatch_resume_message_restores_paused_command_goal() {
             );
             assert!(content.contains("Paused custom slash command: Scan nested git repositories"));
             assert!(content.contains("Continue the paused command"));
+        }
+        other => panic!("expected SendMessage, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_user_message_keeps_auto_review_separate_from_bypass() {
+    let mut app = create_test_app();
+    app.mode = AppMode::Agent;
+    app.approval_mode = ApprovalMode::Auto;
+    app.allow_shell = true;
+    app.trust_mode = true;
+    let mut engine = mock_engine_handle();
+    let config = Config::default();
+
+    dispatch_user_message(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("run the local verification".to_string(), None),
+    )
+    .await
+    .expect("dispatch user message");
+
+    let pending_route = app
+        .pending_turn_route
+        .as_ref()
+        .expect("successful dispatch records route telemetry");
+    assert_eq!(pending_route.0, app.api_provider);
+    assert_eq!(pending_route.1, app.model);
+    assert!(!pending_route.2);
+
+    match engine.rx_op.recv().await.expect("send message op") {
+        crate::core::ops::Op::SendMessage {
+            mode,
+            auto_approve,
+            approval_mode,
+            ..
+        } => {
+            assert_eq!(mode, AppMode::Agent);
+            assert!(!auto_approve);
+            assert_eq!(approval_mode, ApprovalMode::Auto);
         }
         other => panic!("expected SendMessage, got {other:?}"),
     }
@@ -3683,17 +4085,61 @@ fn hotbar_bare_digit_inserts_text_even_when_composer_empty() {
 }
 
 #[test]
-fn hotbar_alt_digit_fires_when_composer_has_text() {
+fn hotbar_alt_digit_fires_from_composer_and_sidebar_states() {
     let mut app = create_test_app();
     app.onboarding = OnboardingState::None;
-    app.input = "draft".to_string();
 
     let alt_four = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT);
+
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), Some(4));
+
+    app.input = "draft".to_string();
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), Some(4));
+
+    app.input = "   ".to_string();
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), Some(4));
+
+    app.sidebar_focus = SidebarFocus::Hidden;
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), Some(4));
+
+    app.sidebar_focus = SidebarFocus::Agents;
     assert_eq!(hotbar_slot_from_key(&app, &alt_four), Some(4));
 }
 
 #[test]
-fn hotbar_digits_are_blocked_while_overlay_is_open() {
+fn hotbar_alt_digit_requires_plain_alt_one_through_eight() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+
+    assert_eq!(
+        hotbar_slot_from_key(
+            &app,
+            &KeyEvent::new(
+                KeyCode::Char('4'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            )
+        ),
+        None
+    );
+    assert_eq!(
+        hotbar_slot_from_key(
+            &app,
+            &KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT | KeyModifiers::SUPER)
+        ),
+        None
+    );
+    assert_eq!(
+        hotbar_slot_from_key(&app, &KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT)),
+        None
+    );
+    assert_eq!(
+        hotbar_slot_from_key(&app, &KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT)),
+        None
+    );
+}
+
+#[test]
+fn hotbar_digits_are_blocked_while_modal_or_onboarding_is_active() {
     let mut app = create_test_app();
     app.onboarding = OnboardingState::None;
     app.view_stack.push(HelpView::new());
@@ -3703,12 +4149,85 @@ fn hotbar_digits_are_blocked_while_overlay_is_open() {
 
     assert_eq!(hotbar_slot_from_key(&app, &bare_four), None);
     assert_eq!(hotbar_slot_from_key(&app, &alt_four), None);
+
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::Language;
+    assert_eq!(hotbar_slot_from_key(&app, &bare_four), None);
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), None);
+}
+
+#[test]
+fn hotbar_alt_digit_is_blocked_while_inline_selectors_are_open() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+    app.input = "/".to_string();
+    app.cursor_position = app.input.chars().count();
+    app.slash_menu_hidden = false;
+    assert!(
+        !visible_slash_menu_entries(&app, SLASH_MENU_LIMIT).is_empty(),
+        "precondition: slash menu should be visible"
+    );
+
+    let alt_four = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT);
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), None);
+
+    app.input = "draft".to_string();
+    app.cursor_position = app.input.chars().count();
+    app.start_history_search();
+    assert!(app.is_history_search_active());
+    assert_eq!(hotbar_slot_from_key(&app, &alt_four), None);
+}
+
+#[test]
+fn decision_card_numeric_shortcuts_accept_bare_digits_only() {
+    assert_eq!(
+        decision_card_number_from_key(&KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE)),
+        Some(4)
+    );
+    assert_eq!(
+        decision_card_number_from_key(&KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT)),
+        None
+    );
+    assert_eq!(
+        decision_card_number_from_key(&KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL)),
+        None
+    );
+}
+
+#[test]
+fn hotbar_alt_digit_is_blocked_while_decision_card_is_active() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+    app.decision_card = Some(crate::tui::widgets::decision_card::DecisionCard::new(
+        "Pick one".to_string(),
+        vec![
+            crate::tui::widgets::decision_card::DecisionOption {
+                label: "First".to_string(),
+                description: None,
+            },
+            crate::tui::widgets::decision_card::DecisionOption {
+                label: "Second".to_string(),
+                description: None,
+            },
+        ],
+        0,
+    ));
+
+    assert_eq!(
+        hotbar_slot_from_key(&app, &KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT)),
+        None
+    );
 }
 
 #[test]
 fn hotbar_dispatches_bound_slot_and_ignores_empty_slot() {
     let mut app = create_test_app();
-    let config = Config::default();
+    // #3807: a fresh config has no bindings, so opt in with the default slots
+    // (slot 4 = mode.agent) to exercise dispatch of a bound slot.
+    let config = Config {
+        hotbar: Some(codewhale_config::default_hotbar_bindings_toml()),
+        ..Config::default()
+    };
     app.onboarding = OnboardingState::None;
     app.mode = AppMode::Plan;
     app.needs_redraw = false;
@@ -3754,6 +4273,36 @@ fn hotbar_dispatches_slash_command_slot() {
         Some(HotbarDispatch::AppAction(AppAction::OpenModePicker))
     );
     assert!(app.input.is_empty());
+}
+
+#[test]
+fn hotbar_bound_disabled_action_reports_reason_without_dispatching() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+    app.auto_model = true;
+    app.reasoning_effort = ReasoningEffort::Off;
+    app.needs_redraw = false;
+    let config = Config {
+        hotbar: Some(vec![codewhale_config::HotbarBindingToml {
+            slot: 1,
+            label: Some("reason".to_string()),
+            action: "reasoning.cycle".to_string(),
+        }]),
+        ..Config::default()
+    };
+
+    assert_eq!(
+        dispatch_hotbar_slot(&mut app, &config, 1).expect("disabled slot dispatch"),
+        Some(HotbarDispatch::Handled)
+    );
+    assert_eq!(app.reasoning_effort, ReasoningEffort::Off);
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some(
+            "Hotbar slot 1 action is not available: Reasoning effort is controlled by auto model routing."
+        )
+    );
+    assert!(app.needs_redraw);
 }
 
 #[test]
@@ -4745,15 +5294,52 @@ async fn bang_shell_input_dispatches_shell_op_instead_of_model_message() {
         Op::RunShellCommand {
             command,
             mode,
+            allow_shell,
             trust_mode,
             auto_approve,
             approval_mode,
         } => {
             assert_eq!(command, "pwd");
             assert_eq!(mode, AppMode::Agent);
+            assert!(!allow_shell);
             assert!(!trust_mode);
             assert!(!auto_approve);
             assert_eq!(approval_mode, ApprovalMode::Suggest);
+        }
+        other => panic!("expected RunShellCommand, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn bang_shell_input_keeps_auto_review_separate_from_bypass() {
+    let mut app = create_test_app();
+    app.mode = AppMode::Agent;
+    app.approval_mode = ApprovalMode::Auto;
+    app.trust_mode = true;
+
+    let mut engine = mock_engine_handle();
+
+    let handled = handle_bang_shell_input(&mut app, &engine.handle, "! pwd")
+        .await
+        .expect("bang shell handler");
+
+    assert!(handled);
+    let op = engine.rx_op.recv().await.expect("engine op");
+    match op {
+        Op::RunShellCommand {
+            command,
+            mode,
+            allow_shell,
+            trust_mode,
+            auto_approve,
+            approval_mode,
+        } => {
+            assert_eq!(command, "pwd");
+            assert_eq!(mode, AppMode::Agent);
+            assert!(!allow_shell);
+            assert!(trust_mode);
+            assert!(!auto_approve);
+            assert_eq!(approval_mode, ApprovalMode::Auto);
         }
         other => panic!("expected RunShellCommand, got {other:?}"),
     }
@@ -5707,6 +6293,32 @@ fn visible_slash_menu_entries_excludes_removed_commands() {
 }
 
 #[test]
+fn visible_slash_model_completions_are_provider_scoped() {
+    let mut app = create_test_app();
+    app.api_provider = crate::config::ApiProvider::Together;
+    app.model = crate::config::DEFAULT_TOGETHER_MODEL.to_string();
+    app.provider_models.insert(
+        "openrouter".to_string(),
+        crate::config::DEFAULT_OPENROUTER_MODEL.to_string(),
+    );
+    app.input = "/model".to_string();
+    app.cursor_position = app.input.chars().count();
+
+    let entries = visible_slash_menu_entries(&app, 128);
+    let names = entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(names.contains(&"/model deepseek-ai/DeepSeek-V4-Pro"));
+    let openrouter_completion = format!("/model {}", crate::config::DEFAULT_OPENROUTER_MODEL);
+    assert!(
+        !names.contains(&openrouter_completion.as_str()),
+        "OpenRouter saved rows must not appear as bare Together /model completions"
+    );
+}
+
+#[test]
 fn slash_menu_up_wraps_from_first_to_last() {
     let mut app = create_test_app();
     app.input = "/".to_string();
@@ -6655,9 +7267,9 @@ fn detail_target_prefers_visible_tool_card() {
 
     assert_eq!(detail_target_cell_index(&app), Some(1));
     let expected = format!(
-        "{} Activity: find · {} raw",
+        "{} Activity: find · {}",
         crate::tui::key_shortcuts::activity_shortcut_label(),
-        crate::tui::key_shortcuts::tool_details_shortcut_hint_label()
+        crate::tui::key_shortcuts::tool_details_shortcut_action_hint("raw details")
     );
     assert_eq!(
         selected_detail_footer_label(&app).as_deref(),
@@ -6710,9 +7322,9 @@ fn activity_footer_hint_uses_details_for_subagent_cards() {
     app.viewport.last_transcript_visible = 4;
 
     let expected = format!(
-        "{} Activity: sub-agent · {} details",
+        "{} Activity: sub-agent · {}",
         crate::tui::key_shortcuts::activity_shortcut_label(),
-        crate::tui::key_shortcuts::tool_details_shortcut_hint_label()
+        crate::tui::key_shortcuts::tool_details_shortcut_action_hint("details")
     );
     assert_eq!(
         selected_detail_footer_label(&app).as_deref(),
@@ -7689,6 +8301,24 @@ fn apply_loaded_session_restores_auto_model_mode() {
 }
 
 #[test]
+fn apply_loaded_session_restores_saved_mode() {
+    let mut app = create_test_app();
+    app.set_mode(crate::tui::app::AppMode::Agent);
+    let mut session = saved_session_with_messages(vec![
+        text_message("user", "draft a plan"),
+        text_message("assistant", "plan response"),
+    ]);
+    session.metadata.mode = Some("plan".to_string());
+
+    let recovered = apply_loaded_session(&mut app, &Config::default(), &session);
+
+    assert!(!recovered);
+    assert_eq!(app.mode, crate::tui::app::AppMode::Plan);
+    assert!(!app.allow_shell);
+    assert!(!app.trust_mode);
+}
+
+#[test]
 fn app_new_restores_saved_model_and_reasoning_effort() {
     let _guard = ConfigPathEnvGuard::new();
     let settings = crate::settings::Settings {
@@ -8539,8 +9169,8 @@ fn activity_detail_includes_tool_handle_and_neighbor_context() {
         body.contains("retrieve_tool_result ref=art_call-read"),
         "{body}"
     );
-    assert!(body.contains("Alt+V"), "{body}");
-    assert!(body.contains("raw details"), "{body}");
+    assert!(body.contains("v raw"), "{body}");
+    assert!(body.contains("details)"), "{body}");
 }
 
 #[test]
@@ -8597,9 +9227,9 @@ fn activity_detail_fallback_uses_recent_meaningful_activity_without_full_tool_du
 
     assert!(body.contains("Activity: read"));
     assert!(body.contains("Status: done"));
-    assert!(body.contains("Detail handle: Alt+V details"), "{body}");
+    assert!(body.contains("Detail handle: v details"), "{body}");
     assert!(
-        !body.contains("Detail handle: Alt+V raw details"),
+        !body.contains("Detail handle: v raw details"),
         "fallback tool details should not be labeled raw: {body}"
     );
     assert!(
@@ -9013,6 +9643,88 @@ fn recoverable_provider_error_advances_fallback_chain() {
     );
 }
 
+/// #2574 acceptance: auth (401) errors must never trigger provider fallback,
+/// even when marked recoverable — the exclusion is by error *category*, not
+/// recoverability (the gate lives at this call site, not inside the chain
+/// walk). A bad key requires user intervention, not a silent rotation.
+#[test]
+fn auth_error_does_not_trigger_provider_fallback() {
+    use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, ErrorSeverity};
+
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Deepseek;
+    // Not env-only, so we exercise the category gate rather than the env-key
+    // onboarding early-return.
+    app.api_key_env_only = false;
+    app.provider_chain = Some(codewhale_config::ProviderChain::new(
+        codewhale_config::ProviderKind::Deepseek,
+        &[codewhale_config::ProviderKind::Openrouter],
+    ));
+
+    apply_engine_error_to_app(
+        &mut app,
+        ErrorEnvelope::new(
+            ErrorCategory::Authentication,
+            ErrorSeverity::Critical,
+            // Deliberately recoverable to prove the *category* is what excludes
+            // fallback, not the recoverable flag.
+            true,
+            "authentication",
+            "provider returned 401",
+        ),
+    );
+
+    assert_eq!(
+        app.api_provider,
+        ApiProvider::Deepseek,
+        "auth failure must not rotate providers"
+    );
+    assert!(!app.is_fallback_active());
+    assert_eq!(app.fallback_chain_position(), Some(0));
+    assert!(
+        app.last_fallback_reason.is_none(),
+        "no fallback should have been attempted on an auth error"
+    );
+}
+
+/// #2574 acceptance: the route switch is visible to the user with a 1-based
+/// position and the failure cause (regression guard against off-by-one position
+/// indexing in the fallback status).
+#[test]
+fn fallback_switch_status_shows_one_based_position_and_reason() {
+    use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, ErrorSeverity};
+
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Deepseek;
+    app.provider_chain = Some(codewhale_config::ProviderChain::new(
+        codewhale_config::ProviderKind::Deepseek,
+        &[codewhale_config::ProviderKind::Openrouter],
+    ));
+
+    apply_engine_error_to_app(
+        &mut app,
+        ErrorEnvelope::new(
+            ErrorCategory::RateLimit,
+            ErrorSeverity::Warning,
+            true,
+            "rate_limit",
+            "provider returned 429",
+        ),
+    );
+
+    assert_eq!(app.api_provider, ApiProvider::Openrouter);
+    assert_eq!(
+        app.fallback_chain_position(),
+        Some(1),
+        "first fallback sits at 1-based position 1"
+    );
+    let status = app.status_message.as_deref().unwrap_or_default();
+    assert!(
+        status.contains("Switched to openrouter") && status.contains("(fallback 1/"),
+        "visible status must show the destination and 1-based position: {status}"
+    );
+}
+
 #[tokio::test]
 async fn provider_switch_auth_error_restores_previous_provider_and_model() {
     use crate::error_taxonomy::ErrorEnvelope;
@@ -9025,6 +9737,7 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
     app.onboarding = OnboardingState::None;
     app.onboarding_needs_api_key = false;
     app.api_key_env_only = true;
+    app.active_context_window_override = Some(1_000_000);
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("deepseek".to_string()),
@@ -9033,10 +9746,12 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
         providers: Some(ProvidersConfig {
             deepseek: ProviderConfig {
                 api_key: Some("deepseek-key".to_string()),
+                context_window: Some(1_000_000),
                 ..Default::default()
             },
             moonshot: ProviderConfig {
                 api_key: Some("kimi-key".to_string()),
+                context_window: Some(262_144),
                 ..Default::default()
             },
             ..Default::default()
@@ -9053,6 +9768,7 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
     )
     .await;
     assert_eq!(app.api_provider, ApiProvider::Moonshot);
+    assert_eq!(app.active_context_window_override, Some(262_144));
     assert_eq!(config.provider.as_deref(), Some("moonshot"));
     assert!(app.pending_provider_switch.is_some());
 
@@ -9065,6 +9781,7 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
 
     assert_eq!(app.api_provider, ApiProvider::Deepseek);
     assert_eq!(app.model, "deepseek-v4-pro");
+    assert_eq!(app.active_context_window_override, Some(1_000_000));
     assert!(!app.model_ids_passthrough);
     assert!(!app.offline_mode);
     assert_eq!(app.onboarding, OnboardingState::None);
@@ -10564,6 +11281,7 @@ mod work_sidebar_projection_tests {
             started_at: Some(Utc.with_ymd_and_hms(2026, 5, 16, 12, 1, 0).unwrap()),
             ended_at,
             duration_ms: ended_at.map(|_| 1_234),
+            hunt_verdict: None,
             error: None,
             thread_id: None,
             turn_id: None,
@@ -10906,6 +11624,8 @@ fn six_worker_progress_storm_keeps_input_render_and_cancel_live() {
     let input = TerminalInputPump {
         rx,
         stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused_ack: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         handle: None,
         last_alive_at: std::cell::Cell::new(Instant::now()),
     };
@@ -10932,4 +11652,53 @@ fn six_worker_progress_storm_keeps_input_render_and_cancel_live() {
     app.runtime_turn_status = Some("in_progress".to_string());
     assert_eq!(next_escape_action(&app, false), EscapeAction::CancelRequest);
     assert_eq!(ctrl_c_disposition(&app), CtrlCDisposition::CancelTurn);
+}
+
+#[test]
+fn terminal_input_child_pause_drains_codewhale_events_before_editor_handoff() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(TerminalInputMessage::Event(Event::Key(KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::NONE,
+    ))))
+    .expect("send buffered key event");
+    tx.send(TerminalInputMessage::Heartbeat)
+        .expect("send buffered heartbeat");
+    tx.send(TerminalInputMessage::Event(Event::Key(KeyEvent::new(
+        KeyCode::Char('y'),
+        KeyModifiers::NONE,
+    ))))
+    .expect("send second buffered key event");
+
+    let input = TerminalInputPump {
+        rx,
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused_ack: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        handle: None,
+        last_alive_at: std::cell::Cell::new(Instant::now()),
+    };
+    let mut pending_terminal_events = VecDeque::from([Event::Key(KeyEvent::new(
+        KeyCode::Char('z'),
+        KeyModifiers::NONE,
+    ))]);
+
+    input
+        .pause_for_child_terminal()
+        .expect("synthetic pump can pause");
+    drain_terminal_input_queue(&input, &mut pending_terminal_events)
+        .expect("queued terminal events drain before launching child editor");
+
+    assert!(
+        pending_terminal_events.is_empty(),
+        "pending CodeWhale terminal events must not leak into the editor handoff"
+    );
+    assert!(
+        input.try_recv().expect("drained channel").is_none(),
+        "input pump channel should be empty after the editor handoff drain"
+    );
+
+    input.resume_after_child_terminal();
+    assert!(!input.paused.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!input.paused_ack.load(std::sync::atomic::Ordering::Acquire));
 }

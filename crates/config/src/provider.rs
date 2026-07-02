@@ -7,14 +7,16 @@
 use super::{
     DEFAULT_ARCEE_BASE_URL, DEFAULT_ARCEE_MODEL, DEFAULT_ATLASCLOUD_BASE_URL,
     DEFAULT_ATLASCLOUD_MODEL, DEFAULT_DEEPINFRA_BASE_URL, DEFAULT_DEEPINFRA_MODEL,
+    DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL, DEFAULT_DEEPSEEK_ANTHROPIC_MODEL,
     DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, DEFAULT_FIREWORKS_BASE_URL,
     DEFAULT_FIREWORKS_MODEL, DEFAULT_HUGGINGFACE_BASE_URL, DEFAULT_HUGGINGFACE_MODEL,
     DEFAULT_MINIMAX_BASE_URL, DEFAULT_MINIMAX_MODEL, DEFAULT_MOONSHOT_BASE_URL,
     DEFAULT_MOONSHOT_MODEL, DEFAULT_NOVITA_BASE_URL, DEFAULT_NOVITA_MODEL,
     DEFAULT_NVIDIA_NIM_BASE_URL, DEFAULT_NVIDIA_NIM_MODEL, DEFAULT_OLLAMA_BASE_URL,
     DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_BASE_URL, DEFAULT_OPENAI_CODEX_BASE_URL,
-    DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENROUTER_BASE_URL,
-    DEFAULT_OPENROUTER_MODEL, DEFAULT_QIANFAN_BASE_URL, DEFAULT_QIANFAN_MODEL,
+    DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENMODEL_BASE_URL,
+    DEFAULT_OPENMODEL_MODEL, DEFAULT_OPENROUTER_BASE_URL, DEFAULT_OPENROUTER_MODEL,
+    DEFAULT_QIANFAN_BASE_URL, DEFAULT_QIANFAN_MODEL, DEFAULT_SAKANA_BASE_URL, DEFAULT_SAKANA_MODEL,
     DEFAULT_SGLANG_BASE_URL, DEFAULT_SGLANG_MODEL, DEFAULT_SILICONFLOW_BASE_URL,
     DEFAULT_SILICONFLOW_CN_BASE_URL, DEFAULT_SILICONFLOW_MODEL, DEFAULT_STEPFUN_BASE_URL,
     DEFAULT_STEPFUN_MODEL, DEFAULT_TOGETHER_BASE_URL, DEFAULT_TOGETHER_MODEL,
@@ -134,6 +136,47 @@ provider!(
     "deepseek",
     aliases: ["deep-seek", "deepseek-cn", "deepseek_china", "deepseekcn", "deepseek-china"]
 );
+
+/// Opt-in DeepSeek route that speaks the Anthropic Messages wire protocol.
+pub struct DeepseekAnthropic;
+
+impl Provider for DeepseekAnthropic {
+    fn id(&self) -> &'static str {
+        "deepseek-anthropic"
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::DeepseekAnthropic
+    }
+
+    fn display_name(&self) -> &'static str {
+        "DeepSeek (Anthropic-compatible)"
+    }
+
+    fn default_base_url(&self) -> &'static str {
+        DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL
+    }
+
+    fn default_model(&self) -> &'static str {
+        DEFAULT_DEEPSEEK_ANTHROPIC_MODEL
+    }
+
+    fn env_vars(&self) -> &'static [&'static str] {
+        &["DEEPSEEK_API_KEY"]
+    }
+
+    fn provider_config_key(&self) -> &'static str {
+        "deepseek_anthropic"
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["deepseek_anthropic", "deepseek-claude", "deepseek_claude"]
+    }
+
+    fn wire(&self) -> WireFormat {
+        WireFormat::AnthropicMessages
+    }
+}
 provider!(
     NvidiaNim,
     NvidiaNim,
@@ -450,16 +493,57 @@ impl Provider for Anthropic {
     }
 }
 
+/// OpenModel Anthropic-compatible Messages API provider.
+pub struct Openmodel;
+
+impl Provider for Openmodel {
+    fn id(&self) -> &'static str {
+        "openmodel"
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Openmodel
+    }
+
+    fn display_name(&self) -> &'static str {
+        "OpenModel"
+    }
+
+    fn default_base_url(&self) -> &'static str {
+        DEFAULT_OPENMODEL_BASE_URL
+    }
+
+    fn default_model(&self) -> &'static str {
+        DEFAULT_OPENMODEL_MODEL
+    }
+
+    fn env_vars(&self) -> &'static [&'static str] {
+        &["OPENMODEL_API_KEY"]
+    }
+
+    fn provider_config_key(&self) -> &'static str {
+        "openmodel"
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["open-model", "open_model"]
+    }
+
+    fn wire(&self) -> WireFormat {
+        WireFormat::AnthropicMessages
+    }
+}
+
 provider!(
     Zai,
     Zai,
     "zai",
-    "Z.ai (GLM Coding)",
+    "Zhipu AI / Z.ai",
     DEFAULT_ZAI_BASE_URL,
     DEFAULT_ZAI_MODEL,
-    ["ZAI_API_KEY", "Z_AI_API_KEY"],
+    ["ZAI_API_KEY", "Z_AI_API_KEY", "ZHIPU_API_KEY", "GLM_API_KEY"],
     "zai",
-    aliases: ["z-ai", "z_ai", "z.ai"]
+    aliases: ["z-ai", "z_ai", "z.ai", "zhipu", "zhipuai", "bigmodel", "big-model"]
 );
 
 provider!(
@@ -498,7 +582,73 @@ provider!(
     aliases: ["deep-infra", "deep_infra"]
 );
 
+provider!(
+    Sakana,
+    Sakana,
+    "sakana",
+    "Sakana AI (Fugu)",
+    DEFAULT_SAKANA_BASE_URL,
+    DEFAULT_SAKANA_MODEL,
+    ["FUGU_API_KEY", "SAKANA_API_KEY"],
+    "sakana",
+    aliases: ["sakana-ai", "sakana_ai", "fugu"]
+);
+
+/// User-defined OpenAI-compatible endpoint (#1519).
+///
+/// A single dynamic provider identity for arbitrary `[providers.<name>]
+/// kind="openai-compatible"` config entries. Unlike the built-in providers it
+/// carries no real default base URL/model/env var: the concrete endpoint, model
+/// id, and auth env var all arrive from the named `[providers.<name>]` config
+/// table at route time. The placeholder base URL/model here exist only so the
+/// descriptor stays well-formed (non-empty) for conformance; runtime routing
+/// always supplies a `base_url_override` and a wire model id, so these
+/// placeholders are never used to reach the network.
+pub struct Custom;
+
+impl Provider for Custom {
+    fn id(&self) -> &'static str {
+        "custom"
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Custom
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Custom (OpenAI-compatible)"
+    }
+
+    fn default_base_url(&self) -> &'static str {
+        // Placeholder only; the real endpoint comes from the named config table
+        // via the route's base_url_override. Loopback so a misconfigured custom
+        // provider fails closed locally rather than reaching a public host.
+        "http://localhost/v1"
+    }
+
+    fn default_model(&self) -> &'static str {
+        // Placeholder only; the real model id comes from config and is preserved
+        // verbatim as the wire model id.
+        "custom-model"
+    }
+
+    fn env_vars(&self) -> &'static [&'static str] {
+        // No built-in env var: the auth env var is named per-entry via
+        // `[providers.<name>] api_key_env = "..."`.
+        &[]
+    }
+
+    fn provider_config_key(&self) -> &'static str {
+        "custom"
+    }
+
+    fn wire(&self) -> WireFormat {
+        WireFormat::ChatCompletions
+    }
+}
+
 static DEEPSEEK: Deepseek = Deepseek;
+static DEEPSEEK_ANTHROPIC: DeepseekAnthropic = DeepseekAnthropic;
 static NVIDIA_NIM: NvidiaNim = NvidiaNim;
 static OPENAI: Openai = Openai;
 static ATLASCLOUD: Atlascloud = Atlascloud;
@@ -520,13 +670,17 @@ static TOGETHER: Together = Together;
 static QIANFAN: Qianfan = Qianfan;
 static OPENAI_CODEX: OpenaiCodex = OpenaiCodex;
 static ANTHROPIC: Anthropic = Anthropic;
+static OPENMODEL: Openmodel = Openmodel;
 static ZAI: Zai = Zai;
 static STEPFUN: Stepfun = Stepfun;
 static MINIMAX: Minimax = Minimax;
 static DEEPINFRA: Deepinfra = Deepinfra;
+static SAKANA: Sakana = Sakana;
+static CUSTOM: Custom = Custom;
 
-static PROVIDER_REGISTRY: [&dyn Provider; 26] = [
+static PROVIDER_REGISTRY: [&dyn Provider; 30] = [
     &DEEPSEEK,
+    &DEEPSEEK_ANTHROPIC,
     &NVIDIA_NIM,
     &OPENAI,
     &ATLASCLOUD,
@@ -548,10 +702,13 @@ static PROVIDER_REGISTRY: [&dyn Provider; 26] = [
     &QIANFAN,
     &OPENAI_CODEX,
     &ANTHROPIC,
+    &OPENMODEL,
     &ZAI,
     &STEPFUN,
     &MINIMAX,
     &DEEPINFRA,
+    &SAKANA,
+    &CUSTOM,
 ];
 
 /// Return all built-in provider metadata entries in `ProviderKind::ALL` order.

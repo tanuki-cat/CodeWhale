@@ -5,9 +5,10 @@ use std::path::PathBuf;
 
 use crate::config::{
     ApiProvider, COMMON_DEEPSEEK_MODELS, normalize_custom_model_id,
-    normalize_model_name_for_provider, provider_passes_model_through,
+    normalize_model_name_for_provider,
 };
 use crate::localization::{MessageId, tr};
+use crate::route_runtime::resolve_route_candidate;
 use crate::tui::app::{App, AppAction, AppMode, ReasoningEffort};
 use crate::tui::views::{HelpView, ModalKind, SubAgentsView, subagent_view_agents};
 
@@ -65,6 +66,7 @@ pub fn clear(app: &mut App) -> CommandResult {
             system_prompt: None,
             model: app.model.clone(),
             workspace: app.workspace.clone(),
+            mode: app.mode,
         },
     )
 }
@@ -128,6 +130,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             app.last_effective_model = None;
             app.reasoning_effort = ReasoningEffort::Auto;
             app.last_effective_reasoning_effort = None;
+            app.active_route_limits = app.context_window_override_limits();
             app.update_model_compaction_budget();
             if model_changed {
                 app.clear_model_scoped_telemetry();
@@ -160,39 +163,40 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             model_id
         } else {
             let Some(model_id) = normalize_model_name_for_provider(app.api_provider, name) else {
-                if let Some((provider, model_id)) = saved_provider_model_match(app, name) {
-                    return CommandResult::with_message_and_action(
-                        format!(
-                            "Switching provider to {} for model {model_id}.",
-                            provider.as_str()
-                        ),
-                        AppAction::SwitchProvider {
-                            provider,
-                            model: Some(model_id),
-                        },
-                    );
-                }
                 return CommandResult::error(format!(
-                    "Invalid model '{name}'. Expected auto, a model for the active provider, or a saved provider model. Common DeepSeek models: {}",
+                    "Invalid model '{name}'. Expected auto or a model for the active provider. Common DeepSeek models: {}",
                     COMMON_DEEPSEEK_MODELS.join(", ")
                 ));
             };
             model_id
         };
-        // Reject a model that is incompatible with the active provider locally,
-        // before it can be persisted or sent and bounced as `400 Unknown Model`
-        // (#3227). The route stays atomic: provider unchanged, model unchanged.
-        // Skip the strict check when the app accepts custom model ids (a
-        // pass-through provider or a custom DeepSeek-compatible base URL), where
-        // any id is a deliberate choice and the upstream is the authority.
-        if !app.accepts_custom_model_ids()
-            && let Err(reason) = crate::config::validate_route(app.api_provider, &model_id)
-        {
-            return CommandResult::error(reason);
-        }
+        let strict_direct_custom_endpoint = app.accepts_custom_model_ids()
+            && matches!(
+                app.api_provider,
+                ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Zai
+            );
+        let route_limits = if strict_direct_custom_endpoint {
+            None
+        } else {
+            match resolve_route_candidate(
+                app.api_provider,
+                Some(&model_id),
+                None,
+                None,
+                app.active_context_window_override,
+            ) {
+                Ok(candidate) => Some(candidate.limits),
+                Err(reason) => return CommandResult::error(reason),
+            }
+        };
         let old_model = app.model_display_label();
         let model_changed = app.auto_model || app.model != model_id;
         app.set_model_selection(model_id.clone());
+        if let Some(limits) = route_limits {
+            app.set_active_route_limits(limits);
+        } else {
+            app.active_route_limits = app.context_window_override_limits();
+        }
         app.update_model_compaction_budget();
         if model_changed {
             app.clear_model_scoped_telemetry();
@@ -225,49 +229,12 @@ fn provider_model_selection_persist_warning(provider: ApiProvider, model: &str) 
         .map(|err| format!(" (not persisted: {err})"))
 }
 
-fn saved_provider_model_match(app: &App, name: &str) -> Option<(ApiProvider, String)> {
-    let requested = normalize_custom_model_id(name)?;
-    let mut saved = app
-        .provider_models
-        .iter()
-        .filter_map(|(provider_name, model)| {
-            let provider = ApiProvider::parse(provider_name)?;
-            (provider != app.api_provider).then_some((provider, model.as_str()))
-        })
-        .collect::<Vec<_>>();
-    saved.sort_by_key(|(provider, _)| provider.as_str());
-
-    for (provider, saved_model) in saved {
-        let Some(saved_model) = normalize_model_for_provider_selection(provider, saved_model)
-        else {
-            continue;
-        };
-        let requested_model = normalize_model_for_provider_selection(provider, &requested)
-            .unwrap_or_else(|| requested.clone());
-        if saved_model.eq_ignore_ascii_case(&requested_model)
-            || saved_model.eq_ignore_ascii_case(&requested)
-        {
-            return Some((provider, saved_model));
-        }
-    }
-
-    None
-}
-
-fn normalize_model_for_provider_selection(provider: ApiProvider, model: &str) -> Option<String> {
-    if provider_passes_model_through(provider) {
-        normalize_custom_model_id(model)
-    } else {
-        normalize_model_name_for_provider(provider, model)
-    }
-}
-
 /// Fetch and list available models from the configured API endpoint.
 pub fn models(_app: &mut App) -> CommandResult {
     CommandResult::action(AppAction::FetchModels)
 }
 
-/// List sub-agent status from the engine
+/// List Fleet worker status from the engine.
 pub fn subagents(app: &mut App) -> CommandResult {
     if app.view_stack.top_kind() != Some(ModalKind::SubAgents) {
         let agents = subagent_view_agents(app, &app.subagent_cache);
@@ -474,9 +441,14 @@ fn provider_link_info(provider_id: &str) -> ProviderLinkInfo {
             docs_url: "https://docs.deepinfra.com/quickstart",
             note: "Create DeepInfra API keys from the dashboard.",
         },
+        "qianfan" => ProviderLinkInfo {
+            key_url: None,
+            docs_url: "https://cloud.baidu.com/doc/qianfan/index.html",
+            note: "Create Baidu Qianfan API keys from the Qianfan console.",
+        },
         _ => ProviderLinkInfo {
             key_url: None,
-            docs_url: "https://codewhale.dev/docs/providers",
+            docs_url: "https://codewhale.net/en/docs",
             note: "Use the provider console for credentials, then configure the matching env var.",
         },
     }
@@ -592,7 +564,7 @@ pub fn home_dashboard(app: &mut App) -> CommandResult {
         );
     }
 
-    // Sub-agents
+    // Fleet role workers
     let subagent_count = app.subagent_cache.len();
     if subagent_count > 0 {
         let _ = writeln!(
@@ -629,7 +601,7 @@ pub fn home_dashboard(app: &mut App) -> CommandResult {
     let _ = writeln!(stats, "\n{}", tr(locale, MessageId::HomeModeTips));
     let _ = writeln!(stats, "--------------------------------------------");
     match app.mode {
-        AppMode::Agent => {
+        AppMode::Agent | AppMode::Auto => {
             let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeAgentModeTip));
             let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeAgentModeReviewTip));
             let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeAgentModeYoloTip));
@@ -881,6 +853,9 @@ mod tests {
             layers: Vec::new(),
         });
         app.push_turn_cache_record(TurnCacheRecord {
+            provider: None,
+            model: None,
+            auto_model: false,
             input_tokens: 100,
             output_tokens: 25,
             cache_hit_tokens: Some(70),
@@ -1142,6 +1117,9 @@ mod tests {
         app.auto_model = false;
         app.model = "deepseek-v4-pro".to_string();
         app.push_turn_cache_record(TurnCacheRecord {
+            provider: None,
+            model: None,
+            auto_model: false,
             input_tokens: 100,
             output_tokens: 25,
             cache_hit_tokens: Some(70),
@@ -1163,6 +1141,9 @@ mod tests {
         app.auto_model = false;
         app.model = "deepseek-v4-pro".to_string();
         app.push_turn_cache_record(TurnCacheRecord {
+            provider: None,
+            model: None,
+            auto_model: false,
             input_tokens: 100,
             output_tokens: 25,
             cache_hit_tokens: Some(70),
@@ -1256,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn model_command_switches_to_saved_provider_model() {
+    fn model_command_rejects_saved_model_from_other_provider() {
         let mut app = create_test_app();
         app.api_provider = crate::config::ApiProvider::Deepseek;
         app.provider_models
@@ -1264,13 +1245,10 @@ mod tests {
 
         let result = model(&mut app, Some("kimi-k2.6"));
 
-        match result.action {
-            Some(AppAction::SwitchProvider { provider, model }) => {
-                assert_eq!(provider, crate::config::ApiProvider::Moonshot);
-                assert_eq!(model.as_deref(), Some("kimi-k2.6"));
-            }
-            other => panic!("expected SwitchProvider action, got {other:?}"),
-        }
+        let message = result.message.expect("invalid model message");
+        assert!(message.contains("Invalid model"));
+        assert!(message.contains("active provider"));
+        assert!(result.action.is_none());
         assert_eq!(app.api_provider, crate::config::ApiProvider::Deepseek);
         assert_eq!(app.model, "deepseek-v4-pro");
     }
@@ -1300,7 +1278,7 @@ mod tests {
         assert_eq!(app.view_stack.top_kind(), Some(ModalKind::SubAgents));
         assert_eq!(
             app.status_message,
-            Some("Fetching sub-agent status...".to_string())
+            Some("Fetching Fleet worker status...".to_string())
         );
     }
 
@@ -1315,9 +1293,20 @@ mod tests {
         assert!(msg.contains("https://platform.deepseek.com/api_keys"));
         assert!(msg.contains("Xiaomi MiMo (xiaomi-mimo)"));
         assert!(msg.contains("https://platform.xiaomimimo.com/token-plan"));
+        assert!(msg.contains("Baidu Qianfan (qianfan)"));
+        assert!(msg.contains("https://cloud.baidu.com/doc/qianfan/index.html"));
         assert!(msg.contains("OPENAI_API_KEY"));
         assert!(msg.contains("XIAOMI_MIMO_TOKEN_PLAN_API_KEY"));
+        assert!(!msg.contains("https://codewhale.dev/docs/providers"));
         assert!(result.action.is_none());
+    }
+
+    #[test]
+    fn provider_link_fallback_uses_current_codewhale_docs() {
+        let links = provider_link_info("unknown-provider");
+
+        assert_eq!(links.docs_url, "https://codewhale.net/en/docs");
+        assert_eq!(links.key_url, None);
     }
 
     #[test]
@@ -1353,7 +1342,7 @@ mod tests {
 
     #[test]
     fn test_home_dashboard_mode_tips_for_each_mode() {
-        let modes = [AppMode::Agent, AppMode::Yolo, AppMode::Plan];
+        let modes = [AppMode::Agent, AppMode::Auto, AppMode::Yolo, AppMode::Plan];
         for mode in modes {
             let mut app = create_test_app();
             app.mode = mode;

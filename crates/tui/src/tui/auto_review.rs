@@ -292,9 +292,12 @@ impl AutoReviewPolicy {
                 .with_rule(rule.id.clone());
         }
 
-        if let Some(floor) = safety_floor(ctx) {
-            return floor;
-        }
+        // #3790: the Tab-selected mode is the single authority for whether a
+        // tool prompts. The auto-review "safety floor" that used to force
+        // publish / destructive / MCP holds *past* the mode was removed and
+        // deferred to 0.8.67 (to return together with Auto mode). Only an
+        // explicit Block (deny) rule above still refuses an action — a hard
+        // prohibition, not a prompt — and it applies in every mode.
 
         if let Some(rule) = self
             .allow_rules
@@ -327,42 +330,17 @@ impl AutoReviewPolicy {
     }
 }
 
-fn safety_floor(ctx: &AutoReviewContext<'_>) -> Option<AutoReviewDecision> {
-    if matches!(ctx.action_kind, ToolActionKind::Publish) {
-        return Some(AutoReviewDecision::new(
-            AutoReviewAction::HoldForReview,
-            "publish-like actions require a durable review step",
-        ));
-    }
-
-    if matches!(ctx.run_origin, RunOrigin::Headless | RunOrigin::Background)
-        && matches!(ctx.risk, RiskLevel::Destructive)
-    {
-        return Some(AutoReviewDecision::new(
-            AutoReviewAction::HoldForReview,
-            "destructive background/headless actions cannot auto-approve",
-        ));
-    }
-
-    if !ctx.workspace_trusted && matches!(ctx.risk, RiskLevel::Destructive) {
-        return Some(AutoReviewDecision::new(
-            AutoReviewAction::AskUser,
-            "destructive action in an untrusted workspace requires user review",
-        ));
-    }
-
-    None
-}
-
 fn deterministic_fallback(ctx: &AutoReviewContext<'_>) -> AutoReviewDecision {
     match (ctx.category, ctx.risk, ctx.action_kind) {
-        (ToolCategory::Safe | ToolCategory::McpRead, RiskLevel::Benign, _) => {
+        (_, RiskLevel::Benign, _) => {
             AutoReviewDecision::new(AutoReviewAction::Allow, "read-only action is allowed")
         }
-        (_, _, ToolActionKind::McpAction) => AutoReviewDecision::new(
-            AutoReviewAction::HoldForReview,
-            "MCP actions may have remote side effects",
-        ),
+        // #3790: MCP actions are governed by the mode exactly like every other
+        // tool — the engine prompts in Agent and auto-approves in YOLO. The old
+        // unconditional HoldForReview here (which could hold even outside the
+        // user's chosen mode) was removed and deferred to 0.8.67. A destructive
+        // MCP action now falls through to the generic Destructive arm below,
+        // identical to a destructive shell command.
         (ToolCategory::Unknown, _, _) => AutoReviewDecision::new(
             AutoReviewAction::AskUser,
             "unknown tool category requires explicit review",
@@ -370,10 +348,6 @@ fn deterministic_fallback(ctx: &AutoReviewContext<'_>) -> AutoReviewDecision {
         (_, RiskLevel::Destructive, _) => AutoReviewDecision::new(
             AutoReviewAction::AskUser,
             "destructive action requires explicit review",
-        ),
-        _ => AutoReviewDecision::new(
-            AutoReviewAction::AskUser,
-            "no deterministic allow rule matched",
         ),
     }
 }
@@ -399,13 +373,120 @@ fn shell_params_are_publish_like(params: &Value) -> bool {
                 .filter(|token| !token.trim().is_empty())
                 .collect::<Vec<_>>()
         })
-        .any(|tokens| {
-            let canonical = crate::command_safety::classify_command(&tokens);
-            matches!(
-                canonical.as_str(),
-                "git push" | "git tag" | "gh release" | "npm publish" | "cargo publish"
-            )
-        })
+        .any(|tokens| shell_tokens_are_publish_like(&tokens))
+}
+
+fn shell_tokens_are_publish_like(tokens: &[&str]) -> bool {
+    if git_tag_tokens_are_publish_like(tokens) {
+        return true;
+    }
+
+    let canonical = crate::command_safety::classify_command(tokens);
+    matches!(
+        canonical.as_str(),
+        "git push" | "gh release" | "npm publish" | "cargo publish"
+    )
+}
+
+fn git_tag_tokens_are_publish_like(tokens: &[&str]) -> bool {
+    let Some(tag_index) = git_subcommand_index(tokens).filter(|index| {
+        tokens
+            .get(*index)
+            .is_some_and(|token| shell_token_eq(token, "tag"))
+    }) else {
+        return false;
+    };
+
+    let mut list_like = false;
+    let mut verify_only = false;
+    let mut has_positional = false;
+    let mut index = tag_index + 1;
+
+    while let Some(token) = tokens.get(index).map(|token| shell_token_trim(token)) {
+        match token {
+            "-d" | "--delete" => return true,
+            "-a" | "--annotate" | "-s" | "--sign" | "-f" | "--force" => {
+                return true;
+            }
+            "-u" | "--local-user" | "-m" | "--message" | "-F" | "--file" => {
+                return true;
+            }
+            "--list" | "-l" => list_like = true,
+            "-n" | "--verify" | "-v" => verify_only = true,
+            "--contains" | "--points-at" | "--merged" | "--no-merged" | "--sort" | "--format"
+            | "--column" => {
+                list_like = true;
+                index += 1;
+            }
+            _ if token.starts_with("--list=")
+                || token.starts_with("-n")
+                || token.starts_with("--contains=")
+                || token.starts_with("--points-at=")
+                || token.starts_with("--merged=")
+                || token.starts_with("--no-merged=")
+                || token.starts_with("--sort=")
+                || token.starts_with("--format=")
+                || token.starts_with("--column=") =>
+            {
+                list_like = true;
+            }
+            _ if token.starts_with('-') => {}
+            _ => has_positional = true,
+        }
+
+        index += 1;
+    }
+
+    has_positional && !list_like && !verify_only
+}
+
+fn git_subcommand_index(tokens: &[&str]) -> Option<usize> {
+    if !tokens
+        .first()
+        .is_some_and(|token| shell_token_eq(token, "git"))
+    {
+        return None;
+    }
+
+    let mut index = 1;
+    while let Some(token) = tokens.get(index).map(|token| shell_token_trim(token)) {
+        if git_global_option_takes_value(token) {
+            index += 2;
+            continue;
+        }
+
+        if git_global_option_has_value(token) || token.starts_with('-') {
+            index += 1;
+            continue;
+        }
+
+        return Some(index);
+    }
+
+    None
+}
+
+fn git_global_option_takes_value(token: &str) -> bool {
+    matches!(
+        token,
+        "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env" | "--exec-path"
+    )
+}
+
+fn git_global_option_has_value(token: &str) -> bool {
+    token.starts_with("--git-dir=")
+        || token.starts_with("--work-tree=")
+        || token.starts_with("--namespace=")
+        || token.starts_with("--config-env=")
+        || token.starts_with("--exec-path=")
+}
+
+fn shell_token_eq(token: &str, expected: &str) -> bool {
+    shell_token_trim(token).eq_ignore_ascii_case(expected)
+}
+
+fn shell_token_trim(token: &str) -> &str {
+    token.trim_matches(|ch| matches!(ch, '\'' | '"'))
 }
 
 fn split_shell_segments_for_review(command: &str) -> Vec<String> {
@@ -478,6 +559,24 @@ mod tests {
     }
 
     #[test]
+    fn read_only_shell_allows_by_default() {
+        let policy = AutoReviewPolicy::default();
+        let ctx = ctx_for(
+            "exec_shell",
+            json!({ "command": "codewhale --version" }),
+            RunOrigin::Interactive,
+            ApprovalMode::Auto,
+        );
+
+        let decision = policy.evaluate(&ctx);
+
+        assert_eq!(ctx.category, ToolCategory::Shell);
+        assert_eq!(ctx.risk, RiskLevel::Benign);
+        assert_eq!(decision.action, AutoReviewAction::Allow);
+        assert!(decision.reason.contains("read-only"));
+    }
+
+    #[test]
     fn explicit_block_rule_blocks_destructive_shell() {
         let policy = AutoReviewPolicy {
             block_rules: vec![
@@ -504,11 +603,14 @@ mod tests {
     }
 
     #[test]
-    fn headless_destructive_tool_holds_for_review_even_with_allow_rule() {
+    fn allow_rule_for_publish_is_honored_without_a_floor_override() {
+        // #3790: with the safety floor removed, a user allow_rule is
+        // authoritative — nothing overrides it back to a hold. Previously the
+        // publish / headless-destructive floor beat the allow_rule.
         let policy = AutoReviewPolicy {
             allow_rules: vec![
-                AutoReviewRule::allow("allow-shell", "trusted shell command")
-                    .action_kind(ToolActionKind::Shell),
+                AutoReviewRule::allow("allow-publish", "trusted publish")
+                    .action_kind(ToolActionKind::Publish),
             ],
             ..AutoReviewPolicy::default()
         };
@@ -521,12 +623,14 @@ mod tests {
 
         let decision = policy.evaluate(&ctx);
 
-        assert_eq!(decision.action, AutoReviewAction::HoldForReview);
-        assert!(decision.rule_id.is_none());
+        assert_eq!(decision.action, AutoReviewAction::Allow);
+        assert_eq!(decision.rule_id.as_deref(), Some("allow-publish"));
     }
 
     #[test]
-    fn mcp_read_allows_and_mcp_action_holds() {
+    fn mcp_read_allows_and_mcp_action_is_not_held_by_policy() {
+        // #3790: the policy no longer holds MCP actions. The mode governs MCP
+        // prompting at the engine exactly like shell — Agent prompts, YOLO runs.
         let policy = AutoReviewPolicy::default();
         let read_ctx = ctx_for(
             "read_mcp_resource",
@@ -542,14 +646,16 @@ mod tests {
         );
 
         assert_eq!(policy.evaluate(&read_ctx).action, AutoReviewAction::Allow);
-        assert_eq!(
+        assert_ne!(
             policy.evaluate(&action_ctx).action,
-            AutoReviewAction::HoldForReview
+            AutoReviewAction::HoldForReview,
+            "MCP actions are no longer held by the policy; the mode governs prompting"
         );
     }
 
     #[test]
-    fn git_push_like_action_holds_for_review() {
+    fn git_push_tool_is_classified_publish_but_not_held() {
+        // #3790: still classified Publish (audit only); no longer force-held.
         let policy = AutoReviewPolicy::default();
         let ctx = ctx_for(
             "git_push",
@@ -558,14 +664,15 @@ mod tests {
             ApprovalMode::Auto,
         );
 
-        let decision = policy.evaluate(&ctx);
-
-        assert_eq!(decision.action, AutoReviewAction::HoldForReview);
-        assert!(decision.reason.contains("publish-like"));
+        assert_eq!(ctx.action_kind, ToolActionKind::Publish);
+        assert_ne!(
+            policy.evaluate(&ctx).action,
+            AutoReviewAction::HoldForReview
+        );
     }
 
     #[test]
-    fn shell_git_push_holds_for_publish_review() {
+    fn shell_git_push_is_classified_publish_but_not_held() {
         let policy = AutoReviewPolicy::default();
         let ctx = ctx_for(
             "exec_shell",
@@ -574,15 +681,15 @@ mod tests {
             ApprovalMode::Auto,
         );
 
-        let decision = policy.evaluate(&ctx);
-
         assert_eq!(ctx.action_kind, ToolActionKind::Publish);
-        assert_eq!(decision.action, AutoReviewAction::HoldForReview);
-        assert!(decision.reason.contains("publish-like"));
+        assert_ne!(
+            policy.evaluate(&ctx).action,
+            AutoReviewAction::HoldForReview
+        );
     }
 
     #[test]
-    fn shell_chained_publish_command_holds_for_review() {
+    fn shell_chained_publish_is_classified_publish_but_not_held() {
         let policy = AutoReviewPolicy::default();
         let ctx = ctx_for(
             "exec_shell",
@@ -591,10 +698,11 @@ mod tests {
             ApprovalMode::Auto,
         );
 
-        let decision = policy.evaluate(&ctx);
-
         assert_eq!(ctx.action_kind, ToolActionKind::Publish);
-        assert_eq!(decision.action, AutoReviewAction::HoldForReview);
+        assert_ne!(
+            policy.evaluate(&ctx).action,
+            AutoReviewAction::HoldForReview
+        );
     }
 
     #[test]
@@ -607,6 +715,52 @@ mod tests {
         );
 
         assert_eq!(ctx.action_kind, ToolActionKind::Shell);
+    }
+
+    #[test]
+    fn shell_git_tag_list_does_not_match_publish_review() {
+        let ctx = ctx_for(
+            "exec_shell",
+            json!({ "command": "git remote -v && git rev-parse --show-toplevel && git branch --show-current && git rev-parse HEAD && git tag --list 'v0.8.65'" }),
+            RunOrigin::Interactive,
+            ApprovalMode::Auto,
+        );
+
+        assert_eq!(ctx.action_kind, ToolActionKind::Shell);
+    }
+
+    #[test]
+    fn shell_git_tag_creation_is_classified_publish_but_not_held() {
+        let policy = AutoReviewPolicy::default();
+        let ctx = ctx_for(
+            "exec_shell",
+            json!({ "command": "git tag v0.8.65" }),
+            RunOrigin::Interactive,
+            ApprovalMode::Auto,
+        );
+
+        assert_eq!(ctx.action_kind, ToolActionKind::Publish);
+        assert_ne!(
+            policy.evaluate(&ctx).action,
+            AutoReviewAction::HoldForReview
+        );
+    }
+
+    #[test]
+    fn shell_git_tag_delete_is_classified_publish_but_not_held() {
+        let policy = AutoReviewPolicy::default();
+        let ctx = ctx_for(
+            "exec_shell",
+            json!({ "command": "git tag --delete v0.8.65" }),
+            RunOrigin::Interactive,
+            ApprovalMode::Auto,
+        );
+
+        assert_eq!(ctx.action_kind, ToolActionKind::Publish);
+        assert_ne!(
+            policy.evaluate(&ctx).action,
+            AutoReviewAction::HoldForReview
+        );
     }
 
     #[test]

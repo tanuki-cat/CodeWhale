@@ -469,6 +469,119 @@ pub fn set_static_prompt_composer_override(
     set_static_prompt_composer(&STATIC_PROMPT_COMPOSER, f)
 }
 
+// ── Config-directory prompt overrides (issue #3638) ──
+// Bridge the embedder override hooks above to a user-facing source: an
+// optional file in the CodeWhale config directory. This lets users repurpose
+// the TUI for non-software use cases (e.g. long-form writing) by swapping the
+// constitutional base prompt, without editing in-tree files or shipping a
+// custom embedder build.
+//
+// Scope is deliberately narrow: only the byte-stable base prompt segment is
+// user-overridable. Mode deltas, approval policy, tool taxonomy, Context
+// Management, and the Compaction Relay stay owned by the runtime assembly (see
+// `StaticPromptCtx`), so an override cannot strip safety-relevant guidance.
+// A missing or empty file is a no-op — the bundled constant is used — so this
+// is fully backward compatible.
+//
+// Because replacing the base prompt is a trust-boundary action (per maintainer
+// review on #3638), the override file alone is NOT sufficient: the user must
+// also set an explicit opt-in flag (`CODEWHALE_ALLOW_BASE_PROMPT_OVERRIDE`).
+// This keeps replacing the global Constitution a deliberate, auditable act
+// rather than something a stray file can do.
+
+/// Relative path, under the config directory, of the optional base-prompt
+/// (constitution) override file.
+pub const CONSTITUTION_OVERRIDE_FILE: &str = "prompts/constitution.md";
+
+/// Env flag that must be set (`1`/`true`/`on`/`yes`) to enable config-dir base
+/// prompt overrides. Required in addition to the override file so the global
+/// base prompt can never be replaced by file presence alone.
+pub const BASE_PROMPT_OVERRIDE_OPT_IN_ENV: &str = "CODEWHALE_ALLOW_BASE_PROMPT_OVERRIDE";
+
+/// Whether the user has explicitly opted in to base-prompt overrides.
+fn base_prompt_override_opt_in() -> bool {
+    match std::env::var(BASE_PROMPT_OVERRIDE_OPT_IN_ENV) {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Read an optional prompt-override file rooted at `config_dir`.
+///
+/// Returns the file contents when it exists and is non-empty after trimming;
+/// otherwise `None` so the caller falls back to the embedded default. Pure
+/// over `config_dir`, so it is unit-testable without touching the global
+/// override cells.
+fn read_prompt_override_file(config_dir: &Path, relative: &str) -> Option<String> {
+    let path = config_dir.join(relative);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    if raw.trim().is_empty() {
+        tracing::warn!(
+            target: "prompts",
+            "ignoring empty prompt override file {}",
+            path.display(),
+        );
+        return None;
+    }
+    tracing::info!(
+        target: "prompts",
+        "loaded prompt override from {}",
+        path.display(),
+    );
+    Some(raw)
+}
+
+/// Load user prompt overrides from `config_dir` and install them through the
+/// existing override hooks. Returns the names of the overrides that were
+/// applied (for logging/diagnostics).
+///
+/// Call once at startup, before any engine spawns, because the underlying
+/// override cells are first-call-wins. Missing files are a no-op, preserving
+/// the bundled defaults.
+pub fn load_config_dir_prompt_overrides(config_dir: &Path) -> Vec<&'static str> {
+    let mut applied = Vec::new();
+    if let Some(text) = read_prompt_override_file(config_dir, CONSTITUTION_OVERRIDE_FILE) {
+        if !base_prompt_override_opt_in() {
+            // A file exists but the user hasn't opted in. Don't silently
+            // replace the base prompt — surface the gate instead.
+            tracing::warn!(
+                target: "prompts",
+                "found a base-prompt override at {}/{} but {} is not set; \
+                 leaving the bundled Constitution in place. Set {}=1 to opt in.",
+                config_dir.display(),
+                CONSTITUTION_OVERRIDE_FILE,
+                BASE_PROMPT_OVERRIDE_OPT_IN_ENV,
+                BASE_PROMPT_OVERRIDE_OPT_IN_ENV,
+            );
+        } else if set_base_prompt_override(text).is_ok() {
+            applied.push("constitution");
+        }
+    }
+    applied
+}
+
+/// Resolve the CodeWhale config directory and load any prompt overrides found
+/// there. Convenience wrapper around [`load_config_dir_prompt_overrides`] for
+/// startup wiring; silently does nothing when the config home cannot be
+/// resolved.
+pub fn load_prompt_overrides_from_config_home() {
+    let Ok(home) = codewhale_config::codewhale_home() else {
+        return;
+    };
+    let applied = load_config_dir_prompt_overrides(&home);
+    if !applied.is_empty() {
+        tracing::info!(
+            target: "prompts",
+            "applied {} config-directory prompt override(s): {}",
+            applied.len(),
+            applied.join(", "),
+        );
+    }
+}
+
 fn set_prompt_override(cell: &std::sync::OnceLock<String>, s: String) -> Result<(), String> {
     cell.set(s)
 }
@@ -1170,11 +1283,13 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
                 workspace,
                 dir,
                 skill_discovery_mode,
+                session_context.locale_tag,
             )
         }
         None => crate::skills::render_available_skills_context_for_workspace_with_mode(
             workspace,
             skill_discovery_mode,
+            session_context.locale_tag,
         ),
     };
     if let Some(block) = skills_block {
@@ -1322,6 +1437,76 @@ mod tests {
     /// Discriminator unique to the injected relay block (not present in the
     /// agent prompt's own discussion of the convention).
     const HANDOFF_BLOCK_MARKER: &str = "left a relay artifact at `.codewhale/handoff.md`";
+
+    // Config-directory prompt override resolution (#3638). These exercise the
+    // pure file resolver only; the global install path is intentionally not
+    // unit-tested here because `set_base_prompt_override` writes a process-wide
+    // `OnceLock` that would leak into sibling tests (same reason
+    // `prompt_override_storage_reports_duplicate_sets` uses a local cell).
+
+    #[test]
+    fn config_override_reads_present_nonempty_file() {
+        let tmp = tempdir().expect("tempdir");
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).expect("mkdir");
+        std::fs::write(
+            prompts_dir.join("constitution.md"),
+            "You are a long-form writing companion.\n",
+        )
+        .expect("write override");
+
+        let got = read_prompt_override_file(tmp.path(), CONSTITUTION_OVERRIDE_FILE);
+        assert_eq!(
+            got.as_deref(),
+            Some("You are a long-form writing companion.\n")
+        );
+    }
+
+    #[test]
+    fn config_override_absent_file_falls_back() {
+        let tmp = tempdir().expect("tempdir");
+        // No prompts/ directory at all → None so the embedded constant is used.
+        assert!(read_prompt_override_file(tmp.path(), CONSTITUTION_OVERRIDE_FILE).is_none());
+    }
+
+    #[test]
+    fn config_override_requires_explicit_opt_in() {
+        // A present, non-empty override file must NOT replace the base prompt
+        // unless the explicit opt-in flag is set. When the flag is unset
+        // `load_config_dir_prompt_overrides` applies nothing (and never touches
+        // the global override cell), so this assertion is safe to run in the
+        // shared test binary.
+        let tmp = tempdir().expect("tempdir");
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).expect("mkdir");
+        std::fs::write(
+            prompts_dir.join("constitution.md"),
+            "You are a long-form writing companion.\n",
+        )
+        .expect("write override");
+
+        // The resolver still finds the file...
+        assert!(read_prompt_override_file(tmp.path(), CONSTITUTION_OVERRIDE_FILE).is_some());
+        // ...but without the opt-in flag, nothing is applied.
+        if std::env::var(BASE_PROMPT_OVERRIDE_OPT_IN_ENV).is_err() {
+            assert!(
+                load_config_dir_prompt_overrides(tmp.path()).is_empty(),
+                "override must require the explicit opt-in flag, not just a file"
+            );
+        }
+    }
+
+    #[test]
+    fn config_override_empty_file_is_ignored() {
+        let tmp = tempdir().expect("tempdir");
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).expect("mkdir");
+        std::fs::write(prompts_dir.join("constitution.md"), "   \n\t\n").expect("write blank");
+
+        // Whitespace-only overrides are treated as absent so a stray empty file
+        // can't silently blank the system prompt.
+        assert!(read_prompt_override_file(tmp.path(), CONSTITUTION_OVERRIDE_FILE).is_none());
+    }
 
     #[test]
     fn prompt_override_storage_reports_duplicate_sets() {
@@ -2276,6 +2461,18 @@ mod tests {
     }
 
     #[test]
+    fn memory_guidance_does_not_claim_moraine_tools_are_always_available() {
+        assert!(!MEMORY_GUIDANCE.contains("You have access to Moraine MCP tools"));
+        assert!(MEMORY_GUIDANCE.contains("When a `moraine-mcp` server is configured"));
+        assert!(MEMORY_GUIDANCE.contains("current tool catalog exposes"));
+        assert!(MEMORY_GUIDANCE.contains("search_sessions"));
+        assert!(
+            !MEMORY_GUIDANCE.contains("searchsessions"),
+            "Moraine search tool spelling must stay consistent"
+        );
+    }
+
+    #[test]
     fn memory_guidance_absent_when_no_memory_block() {
         let tmp = tempdir().expect("tempdir");
         let prompt = match system_prompt_for_mode_with_context_skills_and_session(
@@ -2623,6 +2820,69 @@ mod tests {
         // Base prompt carries the v4 Constitutional preamble.
         assert!(prompt.contains("You are here to build"));
         assert!(prompt.contains("Take the work seriously. Don't take"));
+    }
+
+    #[test]
+    fn mode_prompts_remain_small_deltas_not_base_policy_copies() {
+        for (name, prompt) in [
+            ("agent", AGENT_MODE),
+            ("plan", PLAN_MODE),
+            ("yolo", YOLO_MODE),
+        ] {
+            let word_count = prompt.split_whitespace().count();
+            let estimated_tokens = crate::compaction::estimate_text_tokens_conservative(prompt);
+
+            assert!(
+                word_count <= 350,
+                "{name} mode prompt should remain a delta, got {word_count} words"
+            );
+            assert!(
+                estimated_tokens <= 700,
+                "{name} mode prompt should remain compact, got {estimated_tokens} estimated tokens"
+            );
+            for forbidden in [
+                "## CONSTITUTION OF CODEWHALE",
+                "## STATUTES (Tier 2)",
+                "## REGULATIONS (Tier 3)",
+                "## EVIDENCE (Tier 6)",
+                "## Context Management",
+                "## Runtime Policy Reference",
+            ] {
+                assert!(
+                    !prompt.contains(forbidden),
+                    "{name} mode prompt duplicated shared base section {forbidden:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mode_prompts_do_not_inline_full_approval_policy_overlays() {
+        for (name, mode_prompt) in [
+            ("agent", AGENT_MODE),
+            ("plan", PLAN_MODE),
+            ("yolo", YOLO_MODE),
+        ] {
+            for (approval_name, approval_prompt) in [
+                ("auto", AUTO_APPROVAL),
+                ("suggest", SUGGEST_APPROVAL),
+                ("never", NEVER_APPROVAL),
+            ] {
+                assert!(
+                    !mode_prompt.contains(approval_prompt.trim()),
+                    "{name} mode prompt must not inline the full {approval_name} approval overlay"
+                );
+            }
+        }
+
+        assert!(
+            PLAN_MODE.contains("All writes and patches are blocked"),
+            "Plan may summarize the user-facing mode delta"
+        );
+        assert!(
+            NEVER_APPROVAL.contains("This approval policy is a Tier 2 Statute"),
+            "the approval overlay keeps the policy authority explanation"
+        );
     }
 
     #[test]
@@ -3330,6 +3590,17 @@ mod tests {
         assert!(
             !prompt.contains(first_calm_line),
             "default agent prompt must not include calm.md overlay"
+        );
+    }
+
+    #[test]
+    fn default_prompt_stays_under_2953_static_baseline() {
+        const ISSUE_2953_BASELINE_CHARS: usize = 30_461;
+        let prompt = compose_prompt(Personality::Calm);
+
+        assert!(
+            prompt.chars().count() < ISSUE_2953_BASELINE_CHARS,
+            "default static prompt should stay below the #2953 baseline"
         );
     }
 }

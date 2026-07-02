@@ -109,8 +109,31 @@ pub struct FleetTaskSpec {
 /// Worker role and tool expectations for a task.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct FleetTaskWorkerProfile {
+    /// Named agent profile/persona posture to layer onto this worker.
+    ///
+    /// `profile` is accepted as a shorter authoring alias. This is an intent
+    /// reference only; profile loading and permission narrowing happen in the
+    /// Fleet runtime layer.
+    #[serde(default, alias = "profile", skip_serializing_if = "Option::is_none")]
+    pub agent_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Fleet loadout intent such as `auto`, `fast`, or `review`.
+    ///
+    /// This is not a concrete provider/model selection; route resolution owns
+    /// the executable provider/model/wire-model decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loadout: Option<String>,
+    /// Fleet model class hint such as `strong`, `balanced`, or `fast`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_class: Option<String>,
+    /// Optional explicit model id for this worker.
+    ///
+    /// Task-level model overrides are visible authoring data and take
+    /// precedence over the referenced agent profile's model hint. Provider and
+    /// wire-model validation still belong to route resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_profile: Option<String>,
     #[serde(default)]
@@ -815,6 +838,40 @@ impl FleetAlertEndpoint {
     }
 }
 
+/// Resolved-route detail persisted on a [`FleetReceipt`] (#3154).
+///
+/// This is an additive, *plain-strings* snapshot of the route a fleet worker
+/// resolved to. It deliberately does NOT depend on any `codewhale-config` route
+/// type so the protocol crate stays free of the route model.
+///
+/// CRITICAL no-secrets invariant: this struct carries ONLY non-sensitive route
+/// shape — provider id/kind, model ids, wire protocol, role/loadout intent, and
+/// the resolution source. It must NEVER hold a credential, API key, bearer
+/// token, or a base URL that embeds credentials. There is intentionally no
+/// field that could carry a secret.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetResolvedRoute {
+    /// Resolved provider canonical id (e.g. `"deepseek"`).
+    pub provider_id: String,
+    /// Resolved provider kind (e.g. `"deepseek"`).
+    pub provider_kind: String,
+    /// Canonical, provider-agnostic model identity, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_model: Option<String>,
+    /// Provider-owned wire model id placed on the request.
+    pub wire_model_id: String,
+    /// Selected wire protocol (e.g. `"chat_completions"`).
+    pub protocol: String,
+    /// Effective Fleet role intent, when one applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Effective Fleet loadout intent, when one applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loadout: Option<String>,
+    /// How the route was produced (e.g. `"resolver"`).
+    pub source: String,
+}
+
 /// Receipt produced when a task completes verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetReceipt {
@@ -829,6 +886,12 @@ pub struct FleetReceipt {
     pub artifacts: Vec<FleetArtifactRef>,
     #[serde(default)]
     pub score: Option<FleetScore>,
+    /// Resolved-route snapshot for this task (#3154).
+    ///
+    /// `#[serde(default)]` keeps older ledgers (written before this field
+    /// existed) deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_route: Option<FleetResolvedRoute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -876,7 +939,11 @@ mod tests {
                 objective: Some("Keep the workspace lint-clean".to_string()),
                 instructions: "run cargo clippy".to_string(),
                 worker: Some(FleetTaskWorkerProfile {
+                    agent_profile: None,
                     role: Some("release-checker".to_string()),
+                    loadout: None,
+                    model_class: None,
+                    model: None,
                     tool_profile: Some("read-only".to_string()),
                     tools: vec!["cargo".to_string()],
                     capabilities: vec!["rust".to_string()],
@@ -929,6 +996,37 @@ mod tests {
                 .required_files,
             vec![PathBuf::from("Cargo.toml")]
         );
+    }
+
+    #[test]
+    fn worker_profile_carries_agent_profile_and_loadout_intent() {
+        let json = r#"{
+            "profile": "adversarial_reviewer",
+            "role": "reviewer",
+            "loadout": "auto",
+            "model_class": "balanced",
+            "model": "deepseek-v4-pro",
+            "tool_profile": "read-only",
+            "tools": ["read_file"],
+            "capabilities": ["rust"]
+        }"#;
+
+        let profile: FleetTaskWorkerProfile = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            profile.agent_profile.as_deref(),
+            Some("adversarial_reviewer")
+        );
+        assert_eq!(profile.role.as_deref(), Some("reviewer"));
+        assert_eq!(profile.loadout.as_deref(), Some("auto"));
+        assert_eq!(profile.model_class.as_deref(), Some("balanced"));
+        assert_eq!(profile.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(profile.tool_profile.as_deref(), Some("read-only"));
+
+        let serialized = serde_json::to_value(&profile).unwrap();
+        assert_eq!(serialized["agent_profile"], "adversarial_reviewer");
+        assert_eq!(serialized["model"], "deepseek-v4-pro");
+        assert!(serialized.get("profile").is_none());
     }
 
     #[test]
@@ -1109,6 +1207,7 @@ mod tests {
                 max: Some(1.0),
                 notes: None,
             }),
+            resolved_route: None,
         };
         let json = serde_json::to_string(&receipt).unwrap();
         let back: FleetReceipt = serde_json::from_str(&json).unwrap();
@@ -1131,6 +1230,7 @@ mod tests {
                 max: Some(1.0),
                 notes: Some("manual verification required".to_string()),
             }),
+            resolved_route: None,
         };
 
         let json = serde_json::to_string(&receipt).unwrap();
@@ -1266,5 +1366,107 @@ mod tests {
         assert!(!FleetTrustLevel::Sandbox.may_access_secrets());
         assert!(!FleetTrustLevel::Sandbox.may_write_workspace());
         assert!(FleetTrustLevel::Operator.may_write_workspace());
+    }
+
+    fn sample_receipt_with_route() -> FleetReceipt {
+        FleetReceipt {
+            run_id: FleetRunId::from("run-route"),
+            task_id: "task-route".to_string(),
+            worker_id: "worker-route".to_string(),
+            completed_at: "2026-06-23T00:00:00Z".to_string(),
+            result: FleetTaskResult::Pass,
+            failure_kind: None,
+            artifacts: vec![],
+            score: None,
+            resolved_route: Some(FleetResolvedRoute {
+                provider_id: "deepseek".to_string(),
+                provider_kind: "deepseek".to_string(),
+                canonical_model: Some("deepseek-v4-pro".to_string()),
+                wire_model_id: "deepseek-v4-pro".to_string(),
+                protocol: "chat_completions".to_string(),
+                role: Some("builder".to_string()),
+                loadout: Some("auto".to_string()),
+                source: "resolver".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn fleet_resolved_route_round_trips() {
+        let receipt = sample_receipt_with_route();
+        let json = serde_json::to_string(&receipt).unwrap();
+        let back: FleetReceipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.resolved_route, receipt.resolved_route);
+        let route = back.resolved_route.unwrap();
+        assert_eq!(route.provider_id, "deepseek");
+        assert_eq!(route.wire_model_id, "deepseek-v4-pro");
+        assert_eq!(route.protocol, "chat_completions");
+        assert_eq!(route.role.as_deref(), Some("builder"));
+        assert_eq!(route.source, "resolver");
+    }
+
+    #[test]
+    fn fleet_receipt_without_resolved_route_still_deserializes() {
+        // An old ledger receipt JSON written before #3154 has no
+        // `resolved_route` key; `#[serde(default)]` must keep it readable.
+        let legacy = r#"{
+            "run_id": "run-legacy",
+            "task_id": "task-legacy",
+            "worker_id": "worker-legacy",
+            "completed_at": "2026-06-01T00:00:00Z",
+            "result": "pass",
+            "artifacts": [],
+            "score": null
+        }"#;
+        let receipt: FleetReceipt = serde_json::from_str(legacy).unwrap();
+        assert_eq!(receipt.task_id, "task-legacy");
+        assert!(receipt.resolved_route.is_none());
+    }
+
+    #[test]
+    fn fleet_resolved_route_serialization_carries_no_secrets() {
+        let receipt = sample_receipt_with_route();
+        // Scan the serialized resolved-route object: this is the field whose
+        // no-secrets invariant we are asserting. Scoping to the route value
+        // avoids false positives from unrelated envelope ids (e.g. a task id
+        // such as "task-foo" innocently contains the substring "sk-").
+        let route_json = serde_json::to_string(receipt.resolved_route.as_ref().unwrap()).unwrap();
+        assert_no_secret_markers(&route_json);
+        // The envelope as a whole must also stay credential-free.
+        let receipt_json = serde_json::to_string(&receipt).unwrap();
+        for needle in SECRET_KEY_MARKERS {
+            assert!(
+                !receipt_json.to_ascii_lowercase().contains(needle),
+                "receipt JSON must not contain secret-key marker {needle:?}: {receipt_json}"
+            );
+        }
+    }
+
+    /// Substrings that indicate a leaked credential field/value. These are
+    /// deliberately specific so legitimate ids/model names do not trip them.
+    const SECRET_KEY_MARKERS: &[&str] = &[
+        "api_key",
+        "apikey",
+        "api-key",
+        "authorization",
+        "bearer ",
+        "auth_token",
+        "auth-token",
+        "password",
+        "credential",
+        "sk-ant-",
+        "sk-proj-",
+        "sk-or-",
+        "secret",
+    ];
+
+    fn assert_no_secret_markers(json: &str) {
+        let haystack = json.to_ascii_lowercase();
+        for needle in SECRET_KEY_MARKERS {
+            assert!(
+                !haystack.contains(needle),
+                "resolved-route JSON must not contain secret marker {needle:?}: {json}"
+            );
+        }
     }
 }

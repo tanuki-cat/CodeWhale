@@ -2,8 +2,10 @@ use super::headers::{MCP_HTTP_ACCEPT, is_safe_custom_header, with_default_mcp_ht
 use super::*;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(unix)]
+use tokio::io::AsyncBufReadExt;
 
 fn test_http_client() -> reqwest::Client {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -148,6 +150,42 @@ fn mcp_server_config_parses_custom_headers() {
 }
 
 #[test]
+fn mcp_server_config_parses_remote_auth_fields() {
+    let json = r#"{
+        "servers": {
+            "remote": {
+                "url": "https://example.invalid/mcp",
+                "env_http_headers": {
+                    "X-Api-Key": "REMOTE_MCP_KEY"
+                },
+                "bearer_token_env_var": "REMOTE_MCP_TOKEN",
+                "scopes": ["tools/read", "tools/write"],
+                "oauth": {
+                    "client_id": "client-123"
+                },
+                "oauth_resource": "https://example.invalid"
+            }
+        }
+    }"#;
+    let cfg: McpConfig = serde_json::from_str(json).unwrap();
+    let remote = cfg.servers.get("remote").expect("server present");
+    assert_eq!(
+        remote.env_headers.get("X-Api-Key"),
+        Some(&"REMOTE_MCP_KEY".to_string())
+    );
+    assert_eq!(
+        remote.bearer_token_env_var.as_deref(),
+        Some("REMOTE_MCP_TOKEN")
+    );
+    assert_eq!(remote.scopes, vec!["tools/read", "tools/write"]);
+    assert_eq!(remote.oauth_client_id(), Some("client-123"));
+    assert_eq!(
+        remote.oauth_resource.as_deref(),
+        Some("https://example.invalid")
+    );
+}
+
+#[test]
 fn mcp_server_config_omits_headers_when_empty() {
     // Empty headers map should not appear in the serialized output —
     // older mcp.json files written before v0.8.31 must round-trip
@@ -169,11 +207,95 @@ fn mcp_server_config_omits_headers_when_empty() {
         enabled_tools: Vec::new(),
         disabled_tools: Vec::new(),
         headers: HashMap::new(),
+        env_headers: HashMap::new(),
+        bearer_token_env_var: None,
+        scopes: Vec::new(),
+        oauth: None,
+        oauth_resource: None,
     };
     let serialized = serde_json::to_string(&cfg).unwrap();
     assert!(
         !serialized.contains("\"headers\""),
         "empty headers must be omitted: {serialized}"
+    );
+    assert!(
+        !serialized.contains("\"env_headers\""),
+        "empty env_headers must be omitted: {serialized}"
+    );
+    assert!(
+        !serialized.contains("\"scopes\""),
+        "empty scopes must be omitted: {serialized}"
+    );
+    assert!(
+        !serialized.contains("\"oauth\""),
+        "empty oauth config must be omitted: {serialized}"
+    );
+}
+
+#[test]
+fn expand_env_placeholders_expands_value_from_environment() {
+    let _lock = crate::test_support::lock_test_env();
+    let _secret =
+        crate::test_support::EnvVarGuard::set("MCP_TEST_SECRET_TOKEN", "test-secret-123456");
+    let mut env = HashMap::new();
+    env.insert(
+        "API_TOKEN".to_string(),
+        "${MCP_TEST_SECRET_TOKEN}".to_string(),
+    );
+
+    let expanded = expand_env_placeholders_map(&env, "env").unwrap();
+
+    assert_eq!(
+        expanded.get("API_TOKEN").map(String::as_str),
+        Some("test-secret-123456")
+    );
+}
+
+#[test]
+fn expand_env_placeholders_reports_missing_variable_without_secret_value() {
+    let _lock = crate::test_support::lock_test_env();
+    let _missing = crate::test_support::EnvVarGuard::remove("MCP_TEST_MISSING_SECRET");
+
+    let err = expand_env_placeholders("Bearer ${MCP_TEST_MISSING_SECRET}")
+        .expect_err("missing env should fail")
+        .to_string();
+
+    // The error must name the variable but must not leak the surrounding
+    // value (which in practice carries the secret).
+    assert!(err.contains("MCP_TEST_MISSING_SECRET"));
+    assert!(!err.contains("Bearer "));
+}
+
+#[tokio::test]
+async fn mcp_http_auth_prefers_static_authorization_over_bearer_env() {
+    let mut headers = HashMap::new();
+    headers.insert("Authorization".to_string(), "Bearer static".to_string());
+    let auth = McpHttpAuth {
+        headers,
+        bearer_token_env_var: Some("PATH".to_string()),
+        ..Default::default()
+    };
+
+    let resolved = auth.resolved_headers().await.unwrap();
+    assert_eq!(
+        resolved.get("Authorization"),
+        Some(&"Bearer static".to_string())
+    );
+}
+
+#[tokio::test]
+async fn mcp_http_auth_uses_bearer_env_when_no_authorization_header() {
+    let auth = McpHttpAuth {
+        bearer_token_env_var: Some("PATH".to_string()),
+        ..Default::default()
+    };
+
+    let resolved = auth.resolved_headers().await.unwrap();
+    assert!(
+        resolved
+            .get("Authorization")
+            .is_some_and(|value| value.starts_with("Bearer ") && value.len() > "Bearer ".len()),
+        "expected PATH-backed bearer header, got {resolved:?}"
     );
 }
 
@@ -260,9 +382,25 @@ fn streamable_http_transport_stores_headers() {
     let transport = StreamableHttpTransport::new(
         client,
         "https://example.invalid/mcp".to_string(),
-        headers.clone(),
+        McpHttpAuth {
+            headers: headers.clone(),
+            ..Default::default()
+        },
     );
-    assert_eq!(transport.headers, headers);
+    assert_eq!(transport.auth.headers, headers);
+}
+
+#[test]
+fn mcp_auth_required_error_item_is_model_visible() {
+    let item = McpPool::mcp_auth_required_error_item("nordic-mcp");
+    assert_eq!(item["error"], "authentication_required");
+    assert_eq!(item["server"], "nordic-mcp");
+    assert!(
+        item["message"]
+            .as_str()
+            .expect("message")
+            .contains("codewhale mcp login nordic-mcp")
+    );
 }
 
 #[test]
@@ -374,6 +512,56 @@ fn workspace_manager_snapshot_counts_global_and_project_servers() {
             .any(|server| server.name == "laravel-boost"),
         "workspace-aware snapshots must include trusted project MCP servers"
     );
+}
+
+#[test]
+fn plugin_mcp_servers_are_qualified_and_resolve_relative_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin_base = dir.path().join("plugins").join("fleet");
+    fs::create_dir_all(&plugin_base).unwrap();
+
+    let manifest = toml::from_str::<crate::plugins::manifest::PluginManifest>(
+        r#"
+[plugin]
+name = "fleet"
+
+[mcp_servers.local]
+command = "node"
+args = ["server.js"]
+cwd = "servers/local"
+
+[mcp_servers.remote]
+url = "https://example.invalid/mcp"
+"#,
+    )
+    .unwrap();
+    let plugin = crate::plugins::manifest::LoadedPlugin {
+        manifest,
+        base_path: plugin_base.clone(),
+        enabled: true,
+    };
+    let mut config = McpConfig::default();
+    config.servers.insert(
+        "global".to_string(),
+        serde_json::from_str(r#"{"command":"node","args":["global.js"]}"#).unwrap(),
+    );
+
+    let cfg =
+        merge_plugin_mcp_servers_from_plugins(config, vec![("fleet".to_string(), plugin)]).unwrap();
+
+    assert!(cfg.servers.contains_key("global"));
+
+    let local = cfg.servers.get("fleet-local").unwrap();
+    assert_eq!(local.command.as_deref(), Some("node"));
+    assert_eq!(local.args, vec!["server.js"]);
+    assert_eq!(
+        local.cwd.as_deref(),
+        Some(plugin_base.join("servers/local").as_path())
+    );
+
+    let remote = cfg.servers.get("fleet-remote").unwrap();
+    assert_eq!(remote.url.as_deref(), Some("https://example.invalid/mcp"));
+    assert!(remote.cwd.is_none());
 }
 
 #[test]
@@ -832,6 +1020,11 @@ fn test_server_effective_timeouts() {
         enabled_tools: Vec::new(),
         disabled_tools: Vec::new(),
         headers: HashMap::new(),
+        env_headers: HashMap::new(),
+        bearer_token_env_var: None,
+        scopes: Vec::new(),
+        oauth: None,
+        oauth_resource: None,
     };
 
     assert_eq!(server_with_override.effective_connect_timeout(&global), 20);
@@ -927,6 +1120,27 @@ impl McpTransport for HangingValueTransport {
     }
 }
 
+struct DropCountingTransport {
+    drops: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl McpTransport for DropCountingTransport {
+    async fn send(&mut self, _msg: Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>> {
+        std::future::pending().await
+    }
+}
+
+impl Drop for DropCountingTransport {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+}
+
 fn test_server_config() -> McpServerConfig {
     McpServerConfig {
         command: Some("mock".to_string()),
@@ -944,6 +1158,11 @@ fn test_server_config() -> McpServerConfig {
         enabled_tools: Vec::new(),
         disabled_tools: Vec::new(),
         headers: HashMap::new(),
+        env_headers: HashMap::new(),
+        bearer_token_env_var: None,
+        scopes: Vec::new(),
+        oauth: None,
+        oauth_resource: None,
     }
 }
 
@@ -1131,6 +1350,48 @@ async fn reload_if_config_changed_swaps_config_on_content_change() {
     );
 }
 
+#[tokio::test]
+async fn reload_if_config_changed_drops_live_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    std::fs::write(
+        &path,
+        r#"{"servers":{"local":{"command":"node","args":["server.js"]}}}"#,
+    )
+    .unwrap();
+    let mut pool = McpPool::from_config_path(&path).unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut conn = test_connection(Box::new(DropCountingTransport {
+        drops: Arc::clone(&drops),
+    }));
+    conn.name = "local".to_string();
+    conn.config = pool.config.servers.get("local").unwrap().clone();
+    pool.connections.insert("local".to_string(), conn);
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    std::fs::write(
+        &path,
+        r#"{"servers":{"local":{"command":"node","args":["server-v2.js"]}}}"#,
+    )
+    .unwrap();
+
+    let reloaded = pool.reload_if_config_changed().await.unwrap();
+    assert!(reloaded, "content-changed config must trigger reload");
+    assert_eq!(
+        drops.load(AtomicOrdering::SeqCst),
+        1,
+        "reload must drop the stale live transport"
+    );
+    assert!(
+        !pool.connections.contains_key("local"),
+        "stale connection must not survive config reload"
+    );
+    assert_eq!(
+        pool.config.servers.get("local").unwrap().args,
+        vec!["server-v2.js".to_string()]
+    );
+}
+
 /// #1267 part 2: hash-based comparison must be stable for byte-identical
 /// configs and distinct for differing configs.
 #[test]
@@ -1157,6 +1418,11 @@ fn hash_mcp_config_is_stable_and_change_sensitive() {
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: HashMap::new(),
+            env_headers: HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         },
     );
     assert_ne!(
@@ -1690,6 +1956,11 @@ async fn mcp_connection_supports_streamable_http_event_stream_responses() {
         enabled_tools: Vec::new(),
         disabled_tools: Vec::new(),
         headers: HashMap::new(),
+        env_headers: HashMap::new(),
+        bearer_token_env_var: None,
+        scopes: Vec::new(),
+        oauth: None,
+        oauth_resource: None,
     };
 
     let conn = McpConnection::connect_with_policy(
@@ -1971,7 +2242,7 @@ async fn sse_connect_waits_for_endpoint_before_first_send() {
     let mut transport = SseTransport::connect(
         client,
         url,
-        HashMap::new(),
+        McpHttpAuth::default(),
         cancel_token.clone(),
         Duration::from_secs(2),
     )
@@ -2062,7 +2333,7 @@ async fn sse_connect_accepts_crlf_endpoint_events() {
     let mut transport = SseTransport::connect(
         client,
         url,
-        HashMap::new(),
+        McpHttpAuth::default(),
         cancel_token.clone(),
         Duration::from_secs(2),
     )
@@ -2164,7 +2435,10 @@ async fn sse_transport_applies_custom_headers_to_get_and_post() {
     let mut transport = SseTransport::connect(
         client,
         url,
-        headers,
+        McpHttpAuth {
+            headers,
+            ..Default::default()
+        },
         cancel_token.clone(),
         Duration::from_secs(2),
     )
@@ -2251,7 +2525,7 @@ async fn sse_post_error_includes_response_body_excerpt() {
     let mut transport = SseTransport::connect(
         client,
         url,
-        HashMap::new(),
+        McpHttpAuth::default(),
         cancel_token.clone(),
         Duration::from_secs(2),
     )
@@ -2437,6 +2711,11 @@ async fn streamable_http_stale_session_reconnects_and_retries_tool_call() {
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: HashMap::new(),
+            env_headers: HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         },
     );
     let mut pool = McpPool::new(cfg);
@@ -2496,7 +2775,7 @@ async fn legacy_sse_session_expiry_is_marked_stale() {
     let mut transport = SseTransport {
         client: test_http_client(),
         base_url: format!("http://{addr}/sse"),
-        headers: HashMap::new(),
+        auth: McpHttpAuth::default(),
         endpoint_url: Some(format!("http://{addr}/messages")),
         receiver,
         pending_messages: VecDeque::new(),
@@ -2708,6 +2987,11 @@ async fn legacy_sse_closed_stream_reconnects_and_retries_tool_call() {
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: HashMap::new(),
+            env_headers: HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         },
     );
     let mut pool = McpPool::new(cfg);
@@ -2733,7 +3017,7 @@ fn session_id_starts_none() {
     let transport = StreamableHttpTransport::new(
         test_http_client(),
         "https://example.invalid/mcp".to_string(),
-        HashMap::new(),
+        McpHttpAuth::default(),
     );
     assert!(transport.session_id.is_none());
 }
@@ -2782,7 +3066,7 @@ async fn session_id_captured_from_post_response_and_replayed() {
 
     let client = test_http_client();
     let url = format!("http://{addr}/mcp");
-    let mut transport = StreamableHttpTransport::new(client, url, HashMap::new());
+    let mut transport = StreamableHttpTransport::new(client, url, McpHttpAuth::default());
 
     // First send: server returns Mcp-Session-Id.
     transport
@@ -2853,7 +3137,10 @@ async fn custom_headers_applied_to_get_preflight() {
     let mut transport = HttpTransport::new(
         client,
         url,
-        headers,
+        McpHttpAuth {
+            headers,
+            ..Default::default()
+        },
         tokio_util::sync::CancellationToken::new(),
         Duration::from_secs(10),
     );

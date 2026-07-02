@@ -472,9 +472,65 @@ async fn spawn_test_server_with_root_token_mobile_workspace(
         tokio::task::JoinHandle<()>,
     )>,
 > {
+    spawn_test_server_with_root_token_mobile_workspace_and_subagents(
+        root,
+        sessions_dir,
+        runtime_token,
+        mobile_enabled,
+        workspace,
+        None,
+    )
+    .await
+}
+
+async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
+    root: PathBuf,
+    sessions_dir: PathBuf,
+    runtime_token: Option<String>,
+    mobile_enabled: bool,
+    workspace: PathBuf,
+    sub_agent_manager: Option<SharedSubAgentManager>,
+) -> Result<
+    Option<(
+        SocketAddr,
+        SharedRuntimeThreadManager,
+        tokio::task::JoinHandle<()>,
+    )>,
+> {
+    spawn_test_server_with_root_token_mobile_workspace_subagents_and_config_path(
+        root,
+        sessions_dir,
+        runtime_token,
+        mobile_enabled,
+        workspace,
+        sub_agent_manager,
+        None,
+    )
+    .await
+}
+
+async fn spawn_test_server_with_root_token_mobile_workspace_subagents_and_config_path(
+    root: PathBuf,
+    sessions_dir: PathBuf,
+    runtime_token: Option<String>,
+    mobile_enabled: bool,
+    workspace: PathBuf,
+    sub_agent_manager: Option<SharedSubAgentManager>,
+    config_path: Option<PathBuf>,
+) -> Result<
+    Option<(
+        SocketAddr,
+        SharedRuntimeThreadManager,
+        tokio::task::JoinHandle<()>,
+    )>,
+> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     fs::create_dir_all(&sessions_dir)?;
     fs::create_dir_all(&workspace)?;
+    let config = Config {
+        mcp_config_path: Some(root.join("mcp.json").to_string_lossy().to_string()),
+        ..Config::default()
+    };
     let manager = TaskManager::start_with_executor(
         TaskManagerConfig {
             data_dir: root.join("tasks"),
@@ -490,7 +546,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace(
     )
     .await?;
     let runtime_threads: SharedRuntimeThreadManager = Arc::new(RuntimeThreadManager::open(
-        Config::default(),
+        config.clone(),
         workspace.clone(),
         RuntimeThreadManagerConfig::from_task_data_dir(root.join("runtime")),
     )?);
@@ -501,15 +557,19 @@ async fn spawn_test_server_with_root_token_mobile_workspace(
     runtime_threads.attach_automation_manager(automations.clone());
 
     let auth_required = runtime_token.is_some();
+    let sub_agent_manager =
+        sub_agent_manager.unwrap_or_else(|| runtime_api_sub_agent_manager(&workspace, 2));
     let state = RuntimeApiState {
-        config: Config::default(),
+        config: Arc::new(parking_lot::RwLock::new(config)),
         workspace,
         task_manager: manager,
         runtime_threads: runtime_threads.clone(),
         cors_origins: Vec::new(),
         sessions_dir,
-        mcp_config_path: root.join("mcp.json"),
+        config_path: config_path.clone(),
+        mcp_pool: Arc::new(Mutex::new(None)),
         automations,
+        sub_agent_manager,
         runtime_token,
         skill_state: Arc::new(Mutex::new(
             SkillStateStore::load_from(root.join("skills_state.toml")).unwrap_or_default(),
@@ -542,6 +602,31 @@ async fn spawn_test_server() -> Result<
     let root = std::env::temp_dir().join(format!("deepseek-runtime-api-{}", Uuid::new_v4()));
     let sessions_dir = root.join("sessions");
     spawn_test_server_with_root(root, sessions_dir).await
+}
+
+async fn spawn_test_server_with_config_path(
+    config_path: PathBuf,
+) -> Result<
+    Option<(
+        SocketAddr,
+        SharedRuntimeThreadManager,
+        tokio::task::JoinHandle<()>,
+    )>,
+> {
+    let root = std::env::temp_dir().join(format!("codewhale-config-api-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&root)?;
+    spawn_test_server_with_root_token_mobile_workspace_subagents_and_config_path(
+        root,
+        sessions_dir,
+        None,
+        false,
+        workspace,
+        None,
+        Some(config_path),
+    )
+    .await
 }
 
 async fn read_first_sse_frame(resp: reqwest::Response) -> Result<String> {
@@ -705,6 +790,74 @@ async fn health_and_tasks_endpoints_work() -> Result<()> {
         .error_for_status()?
         .json()
         .await?;
+
+    handle.abort();
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_tools_endpoint_is_passive_until_connect_requested() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-mcp-tools-api-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    fs::create_dir_all(&root)?;
+    let sentinel = root.join("mcp-spawned");
+    fs::write(
+        root.join("mcp.json"),
+        serde_json::json!({
+            "servers": {
+                "sentinel": {
+                    "command": "sh",
+                    "args": [
+                        "-c",
+                        "printf spawned > \"$1\"",
+                        "sh",
+                        sentinel
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let passive: serde_json::Value = client
+        .get(format!("http://{addr}/v1/apps/mcp/tools"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(passive["tools"].as_array().map(Vec::len), Some(0));
+    assert!(
+        !sentinel.exists(),
+        "passive MCP tool listing must not spawn stdio servers"
+    );
+
+    let _live: serde_json::Value = client
+        .get(format!("http://{addr}/v1/apps/mcp/tools?connect=true"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    for _ in 0..20 {
+        if sentinel.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        sentinel.exists(),
+        "explicit MCP connect should spawn configured stdio servers"
+    );
 
     handle.abort();
     Ok(())
@@ -1013,6 +1166,9 @@ async fn workspace_and_automation_endpoints_work() -> Result<()> {
 
 #[tokio::test]
 async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
+    use crate::tools::subagent::{AgentWorkerSpec, AgentWorkerToolProfile, SubAgentType};
+    use crate::worker_profile::WorkerRuntimeProfile;
+
     let root = std::env::temp_dir().join(format!("codewhale-fleet-api-{}", Uuid::new_v4()));
     let workspace = root.join("workspace");
     fs::create_dir_all(&workspace)?;
@@ -1024,7 +1180,11 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
         objective: Some("Inspect fleet status through Runtime API".to_string()),
         instructions: "Stay running for inspection.".to_string(),
         worker: Some(codewhale_protocol::fleet::FleetTaskWorkerProfile {
+            agent_profile: None,
             role: Some("status-reviewer".to_string()),
+            loadout: None,
+            model_class: None,
+            model: None,
             tool_profile: Some("read-only".to_string()),
             tools: vec!["rg".to_string()],
             capabilities: vec!["fleet".to_string()],
@@ -1053,13 +1213,37 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
     )?;
     let worker_id = report.worker_ids[0].clone();
     let sessions_dir = root.join("sessions");
+    let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2);
+    {
+        let mut guard = sub_agent_manager.write().await;
+        guard.register_worker(AgentWorkerSpec {
+            worker_id: worker_id.clone(),
+            run_id: report.run_id.0.clone(),
+            parent_run_id: None,
+            session_name: Some("runtime-api-fleet-worker".to_string()),
+            objective: "Inspect fleet status through Runtime API".to_string(),
+            role: Some("status-reviewer".to_string()),
+            agent_type: SubAgentType::Review,
+            model: "auto".to_string(),
+            workspace: workspace.clone(),
+            git_branch: None,
+            context_mode: "fresh".to_string(),
+            fork_context: false,
+            tool_profile: AgentWorkerToolProfile::Explicit(vec!["rg".to_string()]),
+            runtime_profile: WorkerRuntimeProfile::for_role(SubAgentType::Review),
+            max_steps: 8,
+            spawn_depth: 0,
+            max_spawn_depth: codewhale_config::DEFAULT_SPAWN_DEPTH,
+        });
+    }
     let Some((addr, _runtime_threads, handle)) =
-        spawn_test_server_with_root_token_mobile_workspace(
+        spawn_test_server_with_root_token_mobile_workspace_and_subagents(
             root.clone(),
             sessions_dir,
             None,
             false,
             workspace,
+            Some(sub_agent_manager),
         )
         .await?
     else {
@@ -1091,6 +1275,9 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
     assert_eq!(worker["role"], "status-reviewer");
     assert_eq!(worker["host"], "local");
     assert_eq!(worker["artifacts"][0]["kind"], "log");
+    assert_eq!(worker["runtime_state"]["agent_status"], "starting");
+    assert_eq!(worker["runtime_state"]["steps_taken"], 0);
+    assert_eq!(worker["runtime_state"]["has_session"], true);
 
     let interrupted: serde_json::Value = client
         .post(format!(
@@ -1132,6 +1319,40 @@ async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
 
     handle.abort();
     Ok(())
+}
+
+#[test]
+fn fleet_worker_json_includes_runtime_state_projection() {
+    let inspection = FleetWorkerInspection {
+        worker_id: "fleet-worker-1".to_string(),
+        status: FleetWorkerStatus::Busy,
+        current_run_id: Some(FleetRunId::from("fleet-run-1")),
+        current_task_id: Some("task-a".to_string()),
+        objective: Some("Inspect runtime projection".to_string()),
+        role: Some("reviewer".to_string()),
+        host: Some("local".to_string()),
+        latest_heartbeat_at: None,
+        latest_event: None,
+        artifacts: Vec::new(),
+        receipt_summary: None,
+        last_error: None,
+        alert_state: None,
+        runtime_state: Some(FleetWorkerRuntimeProjection {
+            agent_status: "running".to_string(),
+            steps_taken: 3,
+            latest_message: Some("reading files".to_string()),
+            error: None,
+            result_summary: None,
+            has_session: true,
+        }),
+    };
+
+    let worker = fleet_worker_json(&inspection);
+
+    assert_eq!(worker["runtime_state"]["agent_status"], "running");
+    assert_eq!(worker["runtime_state"]["steps_taken"], 3);
+    assert_eq!(worker["runtime_state"]["latest_message"], "reading files");
+    assert_eq!(worker["runtime_state"]["has_session"], true);
 }
 
 #[tokio::test]
@@ -3034,6 +3255,7 @@ async fn runtime_info_reports_bind_state() -> Result<()> {
     assert_eq!(info["transports"], json!(["http", "sse"]));
     assert_eq!(info["capabilities"]["threads"], true);
     assert_eq!(info["capabilities"]["external_tools"], true);
+    assert_eq!(info["capabilities"]["worker_runtime"], true);
     assert!(info["experimental"].is_object());
 
     handle.abort();
@@ -3484,12 +3706,14 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
     let bundled_skill = crate::skills::Skill {
         name: "delegate".to_string(),
         description: String::new(),
+        localized_descriptions: std::collections::HashMap::new(),
         body: String::new(),
         path: bundled_skill_path,
     };
     let override_skill = crate::skills::Skill {
         name: "delegate".to_string(),
         description: String::new(),
+        localized_descriptions: std::collections::HashMap::new(),
         body: String::new(),
         path: override_skill_path,
     };
@@ -3568,4 +3792,791 @@ fn resolve_skills_dir_rejects_codewhale_only_symlink_escaping_workspace() {
         config.skills_dir(),
         "with no valid in-workspace CodeWhale skills dir, resolution should fall back to config"
     );
+}
+
+// ---------------------------------------------------------------------------
+// /v1/config + /v1/config/reload endpoint tests
+// ---------------------------------------------------------------------------
+
+/// Helper: POST to `/v1/config` with the given key/value and return the
+/// response status + body JSON.
+async fn post_set_config(
+    client: &reqwest::Client,
+    addr: &SocketAddr,
+    key: &str,
+    value: &str,
+    persist: bool,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let resp = client
+        .post(format!("http://{addr}/v1/config"))
+        .json(&serde_json::json!({
+            "key": key,
+            "value": value,
+            "persist": persist,
+        }))
+        .send()
+        .await
+        .expect("POST /v1/config should not fail at transport level");
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({"_error": "non-json response body"}));
+    (status, body)
+}
+
+#[tokio::test]
+async fn set_config_rejects_unknown_key_with_bad_request() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-config-unknown-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root(root, sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, body) = post_set_config(&client, &addr, "nonexistent_key", "x", true).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unknown key should return 400, body: {body}"
+    );
+    let message = body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        message.contains("unknown config key"),
+        "error message should mention 'unknown config key', got: {message}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_config_validates_max_history_input() -> Result<()> {
+    // Fix #4: invalid max_history input must return 400 instead of silently
+    // falling back to a default value.
+    let root = std::env::temp_dir().join(format!("codewhale-config-maxhist-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root(root, sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // Non-integer input must be rejected.
+    let (status, body) = post_set_config(&client, &addr, "max_history", "not-a-number", true).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "invalid max_history should return 400, body: {body}"
+    );
+
+    // Negative input must also be rejected (parse::<usize> rejects negatives).
+    let (status, body) = post_set_config(&client, &addr, "max_history", "-5", true).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "negative max_history should return 400, body: {body}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_config_validates_subagents_enabled_input() -> Result<()> {
+    // Fix #1: subagents_enabled must validate input and reject non-boolean
+    // values with a descriptive 400 error.
+    let root = std::env::temp_dir().join(format!("codewhale-config-subenabled-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root(root, sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, body) = post_set_config(&client, &addr, "subagents_enabled", "maybe", true).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "non-boolean subagents_enabled should return 400, body: {body}"
+    );
+    let message = body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        message.contains("subagents_enabled"),
+        "error message should name the key, got: {message}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_config_validates_subagents_max_depth_input() -> Result<()> {
+    // Fix #1: subagents_max_depth must validate input and reject non-integer
+    // values with a descriptive 400 error.
+    let root = std::env::temp_dir().join(format!("codewhale-config-subdepth-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root(root, sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, body) = post_set_config(&client, &addr, "subagents_max_depth", "deep", true).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "non-integer subagents_max_depth should return 400, body: {body}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_config_with_config_path_writes_to_specified_file() -> Result<()> {
+    // Fix #2: when the server is started with --config, set_config must
+    // persist to that specific file rather than the default discovery path.
+    let root =
+        std::env::temp_dir().join(format!("codewhale-config-path-persist-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(&config_file, "# initial\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // Persist a subagents_max_depth value above the ceiling to also verify
+    // clamping (Fix #1).
+    let over_ceiling = u64::from(codewhale_config::MAX_SPAWN_DEPTH_CEILING) + 10;
+    let (status, body) = post_set_config(
+        &client,
+        &addr,
+        "subagents_max_depth",
+        &over_ceiling.to_string(),
+        true,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "persisting subagents_max_depth should succeed, body: {body}"
+    );
+    assert!(
+        body["persisted"].as_bool().unwrap_or(false),
+        "response should report persisted=true, body: {body}"
+    );
+
+    // Read the config file and verify the value was clamped and written.
+    let contents = fs::read_to_string(&config_file)
+        .with_context(|| format!("config file should exist at {}", config_file.display()))?;
+    assert!(
+        contents.contains("max_depth"),
+        "config file should contain max_depth key, got: {contents}"
+    );
+    // The value should be clamped to MAX_SPAWN_DEPTH_CEILING.
+    let expected = format!(
+        "max_depth = {}",
+        u64::from(codewhale_config::MAX_SPAWN_DEPTH_CEILING)
+    );
+    assert!(
+        contents.contains(&expected),
+        "config file should contain clamped value '{expected}', got: {contents}"
+    );
+
+    // Also verify a subagents_enabled persistence writes to the same file.
+    let (status, body) = post_set_config(&client, &addr, "subagents_enabled", "true", true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let contents = fs::read_to_string(&config_file)?;
+    assert!(
+        contents.contains("enabled = true"),
+        "config file should contain enabled = true, got: {contents}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn reload_config_endpoint_returns_success() -> Result<()> {
+    // Basic smoke test that /v1/config/reload returns 200 with a message.
+    let root = std::env::temp_dir().join(format!("codewhale-config-reload-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root(root, sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let resp = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let message = body["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !message.is_empty(),
+        "reload response should include a non-empty message"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+/// Helper: GET `/v1/config` and return the parsed response body.
+async fn get_config(client: &reqwest::Client, addr: &SocketAddr) -> serde_json::Value {
+    client
+        .get(format!("http://{addr}/v1/config"))
+        .send()
+        .await
+        .expect("GET /v1/config should not fail at transport level")
+        .error_for_status()
+        .expect("GET /v1/config should return 200")
+        .json()
+        .await
+        .expect("GET /v1/config should return valid JSON")
+}
+
+#[tokio::test]
+async fn reload_config_reads_from_config_path_and_updates_in_memory_state() -> Result<()> {
+    // Fix #2 + reload behavior: This test proves that reload reads from the
+    // `--config` path (not default discovery) and actually updates the
+    // in-memory state visible to GET /v1/config.
+    //
+    // If Fix #2 is reverted (reload uses Config::load(None, None) instead of
+    // state.config_path), the reload will read an empty/default config and
+    // the persisted value will NOT appear in GET /v1/config → test fails.
+    let root =
+        std::env::temp_dir().join(format!("codewhale-config-reload-path-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(&config_file, "# initial\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // Step 1: Record initial model value (should be the default, since
+    // Config::default() has default_text_model = None).
+    let before = get_config(&client, &addr).await;
+    let initial_model = before["model"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !initial_model.is_empty(),
+        "initial model should not be empty"
+    );
+    // The initial subagents_max_depth should be DEFAULT_SPAWN_DEPTH (3)
+    // since Config::default() has no subagents config.
+    let initial_depth = before["subagents_max_depth"]
+        .as_u64()
+        .expect("subagents_max_depth should be a number");
+    assert_eq!(
+        initial_depth,
+        u64::from(codewhale_config::DEFAULT_SPAWN_DEPTH),
+        "initial subagents_max_depth should be DEFAULT_SPAWN_DEPTH"
+    );
+
+    // Step 2: Persist a new model value to the config file.
+    // set_config must NOT mutate in-memory state (by design — the caller
+    // must call /v1/config/reload to apply changes).
+    // Use a valid DeepSeek model ID so Config::validate() doesn't reject
+    // the reloaded config.
+    let test_model = "deepseek-v4-flash";
+    let (status, body) = post_set_config(&client, &addr, "model", test_model, true).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "set_config should succeed, body: {body}"
+    );
+
+    // Step 3: Verify in-memory state is NOT mutated by set_config alone.
+    let after_set = get_config(&client, &addr).await;
+    assert_eq!(
+        after_set["model"].as_str().unwrap_or_default(),
+        initial_model,
+        "set_config must NOT update in-memory state before reload"
+    );
+
+    // Step 4: Also persist subagents_max_depth = 5 (below ceiling of 8).
+    let (status, body) = post_set_config(&client, &addr, "subagents_max_depth", "5", true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Step 5: Reload — this must read from config_file (not default discovery).
+    let reload_resp = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(reload_resp.status(), StatusCode::OK);
+
+    // Step 6: Verify in-memory state IS now updated after reload.
+    let after_reload = get_config(&client, &addr).await;
+
+    // Model should reflect the persisted value.
+    assert_eq!(
+        after_reload["model"].as_str().unwrap_or_default(),
+        test_model,
+        "after reload, model should be the persisted value — \
+         if this fails, reload is not reading from config_path"
+    );
+
+    // subagents_max_depth should reflect the persisted value (5).
+    assert_eq!(
+        after_reload["subagents_max_depth"].as_u64(),
+        Some(5),
+        "after reload, subagents_max_depth should be 5"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn reload_config_refreshes_mcp_config_path() -> Result<()> {
+    // Fix #3: After reload, list_mcp_servers should see the new mcp_config_path
+    // from the reloaded config (not a stale cached value).
+    //
+    // This test works by:
+    // 1. Starting with config_path pointing to custom-config.toml (initially empty)
+    // 2. Writing mcp_config_path = <new_path> to the config file via set_config
+    // 3. Reloading
+    // 4. GET /v1/config and verifying mcp_config_path field changed
+    //
+    // If Fix #3 were still needed (stale mcp_config_path field in state),
+    // this test would fail because the old field wouldn't update. Since we
+    // removed the stale field and read directly from config, this test also
+    // validates that architectural decision.
+    let root =
+        std::env::temp_dir().join(format!("codewhale-config-mcp-refresh-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(&config_file, "# initial\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // Record initial mcp_config_path (set by test helper to root/mcp.json).
+    let before = get_config(&client, &addr).await;
+    let initial_mcp_path = before["mcp_config_path"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !initial_mcp_path.is_empty(),
+        "initial mcp_config_path should not be empty"
+    );
+
+    // Persist a new mcp_config_path to the config file.
+    let new_mcp_path = root.join("custom-mcp.json");
+    let new_mcp_path_str = new_mcp_path.to_string_lossy().to_string();
+    let (status, body) =
+        post_set_config(&client, &addr, "mcp_config_path", &new_mcp_path_str, true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Before reload, GET should still return the old path.
+    let after_set = get_config(&client, &addr).await;
+    assert_eq!(
+        after_set["mcp_config_path"].as_str().unwrap_or_default(),
+        initial_mcp_path,
+        "set_config must NOT update in-memory mcp_config_path before reload"
+    );
+
+    // Reload.
+    let reload_resp = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(reload_resp.status(), StatusCode::OK);
+
+    // After reload, GET should return the new path.
+    let after_reload = get_config(&client, &addr).await;
+    let reloaded_mcp_path = after_reload["mcp_config_path"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        reloaded_mcp_path, new_mcp_path_str,
+        "after reload, mcp_config_path should reflect the persisted value — \
+         if this fails, the MCP path is stale after reload"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_config_with_persist_false_does_not_write_to_disk() -> Result<()> {
+    // Verify the persist:false branch: response reports persisted:false and
+    // the config file on disk is NOT modified. This is the "dry run" path
+    // the GUI can use to validate input without committing changes.
+    let root = std::env::temp_dir().join(format!("codewhale-config-nopersist-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    let initial_contents = "# initial empty config\n";
+    fs::write(&config_file, initial_contents)?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, body) = post_set_config(&client, &addr, "model", "some-model", false).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "persist:false should still return 200, body: {body}"
+    );
+    assert_eq!(
+        body["persisted"].as_bool(),
+        Some(false),
+        "persisted should be false when persist:false, body: {body}"
+    );
+    assert_eq!(
+        body["requires_reload"].as_bool(),
+        Some(false),
+        "requires_reload should be false when persist:false, body: {body}"
+    );
+    assert_eq!(
+        body["key"].as_str().unwrap_or_default(),
+        "model",
+        "key should echo the request key, body: {body}"
+    );
+
+    // The config file on disk must NOT have been modified.
+    let contents = fs::read_to_string(&config_file)?;
+    assert_eq!(
+        contents, initial_contents,
+        "persist:false must not modify the config file on disk"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_config_subagents_max_depth_below_ceiling_not_clamped() -> Result<()> {
+    // Verify that values at and below the ceiling pass through unchanged.
+    // The existing clamping test only verifies over-ceiling clamping; this
+    // test ensures legitimate values are not accidentally modified.
+    let root =
+        std::env::temp_dir().join(format!("codewhale-config-depth-noclamp-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(&config_file, "# initial\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // Test a value at the ceiling (should not be clamped).
+    let ceiling = u64::from(codewhale_config::MAX_SPAWN_DEPTH_CEILING);
+    let (status, body) = post_set_config(
+        &client,
+        &addr,
+        "subagents_max_depth",
+        &ceiling.to_string(),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let contents = fs::read_to_string(&config_file)?;
+    let expected = format!("max_depth = {ceiling}");
+    assert!(
+        contents.contains(&expected),
+        "value at ceiling should be written as-is: expected '{expected}', got: {contents}"
+    );
+
+    // Test a value below the ceiling (should not be clamped).
+    let below = ceiling.saturating_sub(1);
+    let (status, body) = post_set_config(
+        &client,
+        &addr,
+        "subagents_max_depth",
+        &below.to_string(),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let contents = fs::read_to_string(&config_file)?;
+    let expected = format!("max_depth = {below}");
+    assert!(
+        contents.contains(&expected),
+        "value below ceiling should be written as-is: expected '{expected}', got: {contents}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_config_subagents_enabled_false_persists() -> Result<()> {
+    // Verify that subagents_enabled=false is properly persisted. The
+    // existing test only verifies the true branch; this covers the false
+    // branch to ensure both boolean values round-trip correctly.
+    let root = std::env::temp_dir().join(format!("codewhale-config-subfalse-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(&config_file, "[subagents]\nenabled = true\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, body) = post_set_config(&client, &addr, "subagents_enabled", "false", true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["persisted"].as_bool().unwrap_or(false),
+        "should report persisted=true, body: {body}"
+    );
+
+    let contents = fs::read_to_string(&config_file)?;
+    assert!(
+        contents.contains("enabled = false"),
+        "config file should contain 'enabled = false', got: {contents}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn reload_config_with_malformed_file_returns_error() -> Result<()> {
+    // Verify error handling: if the config file contains invalid TOML,
+    // reload should return 500 instead of crashing or silently succeeding.
+    // This catches regressions where the map_err is accidentally removed.
+    let root = std::env::temp_dir().join(format!("codewhale-config-malformed-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(&config_file, "# initial\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // Corrupt the config file with invalid TOML.
+    fs::write(&config_file, "this is = = not valid toml [[[\n")?;
+
+    let resp = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "reload with malformed config should return 500"
+    );
+
+    // Verify the error response has a meaningful message.
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    let message = body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        message.contains("failed to reload config"),
+        "error message should mention reload failure, got: {message}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn reload_config_applies_multiple_persisted_keys() -> Result<()> {
+    // Verify that multiple set_config calls accumulate on disk and a single
+    // reload picks up ALL changes. This catches regressions where reload
+    // only applies the last-written key or where set_config overwrites
+    // prior keys unexpectedly.
+    let root = std::env::temp_dir().join(format!("codewhale-config-multi-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(&config_file, "# initial\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // Record initial values.
+    let before = get_config(&client, &addr).await;
+    let initial_model = before["model"].as_str().unwrap_or_default().to_string();
+    let initial_depth = before["subagents_max_depth"].as_u64().unwrap_or(0);
+    let initial_enabled = before["subagents_enabled"].as_bool().unwrap_or(false);
+
+    // Persist three different keys.
+    // Use a valid DeepSeek model ID so Config::validate() doesn't reject
+    // the reloaded config.
+    let test_model = "deepseek-v4-pro";
+    let (status, body) = post_set_config(&client, &addr, "model", test_model, true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, body) = post_set_config(&client, &addr, "subagents_max_depth", "4", true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Flip subagents_enabled to the opposite of its initial value.
+    let target_enabled = !initial_enabled;
+    let (status, body) = post_set_config(
+        &client,
+        &addr,
+        "subagents_enabled",
+        &target_enabled.to_string(),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Before reload, in-memory state should be unchanged for all three keys.
+    let after_set = get_config(&client, &addr).await;
+    assert_eq!(
+        after_set["model"].as_str().unwrap_or_default(),
+        initial_model,
+        "model should be unchanged before reload"
+    );
+    assert_eq!(
+        after_set["subagents_max_depth"].as_u64(),
+        Some(initial_depth),
+        "subagents_max_depth should be unchanged before reload"
+    );
+    assert_eq!(
+        after_set["subagents_enabled"].as_bool(),
+        Some(initial_enabled),
+        "subagents_enabled should be unchanged before reload"
+    );
+
+    // Reload.
+    let reload_resp = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(reload_resp.status(), StatusCode::OK);
+
+    // After reload, ALL three keys should reflect their persisted values.
+    let after_reload = get_config(&client, &addr).await;
+    assert_eq!(
+        after_reload["model"].as_str().unwrap_or_default(),
+        test_model,
+        "model should be updated after reload"
+    );
+    assert_eq!(
+        after_reload["subagents_max_depth"].as_u64(),
+        Some(4),
+        "subagents_max_depth should be 4 after reload"
+    );
+    assert_eq!(
+        after_reload["subagents_enabled"].as_bool(),
+        Some(target_enabled),
+        "subagents_enabled should be {} after reload",
+        target_enabled
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_config_response_contains_all_expected_fields() -> Result<()> {
+    // Verify the SetConfigResponse shape: key, value, message, persisted,
+    // requires_reload. This catches serialization regressions and ensures
+    // the GUI client can rely on these fields being present and correct.
+    let root = std::env::temp_dir().join(format!("codewhale-config-shape-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(&config_file, "# initial\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // persist:true → persisted=true, requires_reload=true
+    let (status, body) = post_set_config(&client, &addr, "model", "shape-test-model", true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["key"].as_str(),
+        Some("model"),
+        "key field, body: {body}"
+    );
+    assert_eq!(
+        body["value"].as_str(),
+        Some("shape-test-model"),
+        "value field, body: {body}"
+    );
+    assert!(
+        body["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "message should be non-empty, body: {body}"
+    );
+    assert_eq!(
+        body["persisted"].as_bool(),
+        Some(true),
+        "persisted should be true, body: {body}"
+    );
+    assert_eq!(
+        body["requires_reload"].as_bool(),
+        Some(true),
+        "requires_reload should be true when persist:true, body: {body}"
+    );
+
+    // persist:false → persisted=false, requires_reload=false
+    let (status, body) = post_set_config(&client, &addr, "model", "another-model", false).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["key"].as_str(),
+        Some("model"),
+        "key field, body: {body}"
+    );
+    assert_eq!(
+        body["value"].as_str(),
+        Some("another-model"),
+        "value field, body: {body}"
+    );
+    assert_eq!(
+        body["persisted"].as_bool(),
+        Some(false),
+        "persisted should be false, body: {body}"
+    );
+    assert_eq!(
+        body["requires_reload"].as_bool(),
+        Some(false),
+        "requires_reload should be false when persist:false, body: {body}"
+    );
+
+    handle.abort();
+    Ok(())
 }

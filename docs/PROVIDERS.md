@@ -5,12 +5,11 @@ CodeWhale codebase. It is intentionally conservative: shipped entries are
 limited to provider IDs, config keys, auth paths, base URLs, model resolution,
 and capability metadata that the code already knows about.
 
-DeepSeek remains the first-class default provider. NVIDIA NIM, OpenRouter,
-Volcengine Ark, Xiaomi MiMo, Novita, Fireworks, SiliconFlow, Arcee AI,
-DeepInfra, Together AI, Baidu Qianfan, Z.ai, StepFun, MiniMax, generic OpenAI-compatible
-endpoints, self-hosted runtimes, Moonshot/Kimi, and Hugging Face Inference
-Providers are additive routes for running the same terminal harness against
-other hosted or local model endpoints.
+DeepSeek remains the default provider, but every entry in `ProviderKind::ALL`
+and `PROVIDER_REGISTRY` is a first-class selectable provider route. Hosted
+routes, generic OpenAI-compatible endpoints, the OpenAI Codex/ChatGPT route,
+native Anthropic, and local runtimes all run the same terminal harness against
+the selected provider/model/base URL.
 
 Sources to keep in sync:
 
@@ -29,11 +28,11 @@ Sources to keep in sync:
 
 The canonical provider IDs are:
 
-`deepseek`, `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `volcengine`,
-`openrouter`, `xiaomi-mimo`, `novita`, `fireworks`, `siliconflow`,
-`siliconflow-CN`, `arcee`, `moonshot`, `zai`, `stepfun`, `minimax`, `sglang`,
-`vllm`, `ollama`, `huggingface`, `deepinfra`, `together`, `qianfan`, `openai-codex`, and
-`anthropic`.
+`deepseek`, `deepseek-anthropic`, `nvidia-nim`, `openai`, `atlascloud`,
+`wanjie-ark`, `volcengine`, `openrouter`, `xiaomi-mimo`, `novita`, `fireworks`,
+`siliconflow`, `arcee`, `siliconflow-CN`, `moonshot`, `sglang`, `vllm`,
+`ollama`, `huggingface`, `together`, `qianfan`, `openai-codex`, `anthropic`,
+`openmodel`, `zai`, `stepfun`, `minimax`, `deepinfra`, and `sakana`.
 
 Use any of these surfaces to select a provider:
 
@@ -46,6 +45,12 @@ Use any of these surfaces to select a provider:
 as legacy aliases for `deepseek`. They do not select a different official host;
 DeepSeek uses the same official API host worldwide.
 
+`deepseek_anthropic`, `deepseek-claude`, and `deepseek_claude` select
+`deepseek-anthropic`, the opt-in DeepSeek route that speaks the Anthropic
+Messages API at `https://api.deepseek.com/anthropic`. It keeps the normal
+DeepSeek API key path but uses `x-api-key` plus `anthropic-version: 2023-06-01`
+instead of Bearer auth.
+
 `huggingface`, `hugging-face`, `hugging_face`, and `hf` all select the
 Hugging Face Inference Providers route. This is the OpenAI-compatible router
 path for chat/inference, not Hub browsing, model-card inspection, uploads, or
@@ -53,6 +58,60 @@ artifact export.
 
 Fresh shared config writes to `~/.codewhale/config.toml`. Existing
 `~/.deepseek/config.toml` files are still read for compatibility.
+
+### Wire Protocol Compatibility
+
+Provider selection is explicit. A model string prefix such as
+`deepseek-ai/...`, `deepseek/...`, `qwen/...`, or `arcee-ai/...` is a
+provider-owned wire ID or catalog namespace hint under the selected provider.
+It is not a provider switch and must not be treated as proof that the route is
+DeepSeek, OpenRouter, or any other provider.
+
+Set the route with `provider = "<id>"`, `CODEWHALE_PROVIDER=<id>`, or
+`codewhale --provider <id>`. Set the request model with `CODEWHALE_MODEL`, a
+provider-specific model env var, top-level `default_text_model`, or
+`[providers.<table>].model`. Set the endpoint with `CODEWHALE_BASE_URL`, a
+provider-specific base URL env var, or `[providers.<table>].base_url`. Set auth
+with `codewhale auth set --provider <id>`, `[providers.<table>].api_key`, or
+the listed provider env vars.
+
+| Provider ID | TOML table | Wire protocol | Auth env vars |
+| --- | --- | --- | --- |
+| `deepseek` | `[providers.deepseek]` | OpenAI Chat Completions | `DEEPSEEK_API_KEY` |
+| `deepseek-anthropic` | `[providers.deepseek_anthropic]` | Anthropic Messages | `DEEPSEEK_API_KEY` |
+| `nvidia-nim` | `[providers.nvidia_nim]` | OpenAI Chat Completions | `NVIDIA_API_KEY`, `NVIDIA_NIM_API_KEY`, `DEEPSEEK_API_KEY` |
+| `openai` | `[providers.openai]` | OpenAI Chat Completions | `OPENAI_API_KEY` |
+| `atlascloud` | `[providers.atlascloud]` | OpenAI Chat Completions | `ATLASCLOUD_API_KEY` |
+| `wanjie-ark` | `[providers.wanjie_ark]` | OpenAI Chat Completions | `WANJIE_ARK_API_KEY`, `WANJIE_API_KEY`, `WANJIE_MAAS_API_KEY` |
+| `volcengine` | `[providers.volcengine]` | OpenAI Chat Completions | `VOLCENGINE_API_KEY`, `VOLCENGINE_ARK_API_KEY`, `ARK_API_KEY` |
+| `openrouter` | `[providers.openrouter]` | OpenAI Chat Completions | `OPENROUTER_API_KEY` |
+| `xiaomi-mimo` | `[providers.xiaomi_mimo]` | OpenAI Chat Completions | `XIAOMI_MIMO_TOKEN_PLAN_API_KEY`, `MIMO_TOKEN_PLAN_API_KEY`, `XIAOMI_MIMO_API_KEY`, `XIAOMI_API_KEY`, `MIMO_API_KEY` |
+| `novita` | `[providers.novita]` | OpenAI Chat Completions | `NOVITA_API_KEY` |
+| `fireworks` | `[providers.fireworks]` | OpenAI Chat Completions | `FIREWORKS_API_KEY` |
+| `siliconflow` | `[providers.siliconflow]` | OpenAI Chat Completions | `SILICONFLOW_API_KEY` |
+| `arcee` | `[providers.arcee]` | OpenAI Chat Completions | `ARCEE_API_KEY` |
+| `siliconflow-CN` | `[providers.siliconflow_cn]` | OpenAI Chat Completions | `SILICONFLOW_API_KEY` |
+| `moonshot` | `[providers.moonshot]` | OpenAI Chat Completions | `MOONSHOT_API_KEY`, `KIMI_API_KEY` |
+| `sglang` | `[providers.sglang]` | OpenAI Chat Completions | `SGLANG_API_KEY` |
+| `vllm` | `[providers.vllm]` | OpenAI Chat Completions | `VLLM_API_KEY` |
+| `ollama` | `[providers.ollama]` | Ollama-local OpenAI-compatible Chat Completions | `OLLAMA_API_KEY` |
+| `huggingface` | `[providers.huggingface]` | OpenAI Chat Completions | `HUGGINGFACE_API_KEY`, `HF_TOKEN` |
+| `together` | `[providers.together]` | OpenAI Chat Completions | `TOGETHER_API_KEY` |
+| `qianfan` | `[providers.qianfan]` | OpenAI Chat Completions | `QIANFAN_API_KEY`, `BAIDU_QIANFAN_API_KEY` |
+| `openai-codex` | `[providers.openai_codex]` | OpenAI Responses | `OPENAI_CODEX_ACCESS_TOKEN`, `CODEX_ACCESS_TOKEN` |
+| `anthropic` | `[providers.anthropic]` | Anthropic Messages | `ANTHROPIC_API_KEY` |
+| `openmodel` | `[providers.openmodel]` | Anthropic Messages | `OPENMODEL_API_KEY` |
+| `zai` | `[providers.zai]` | OpenAI Chat Completions | `ZAI_API_KEY`, `Z_AI_API_KEY` |
+| `stepfun` | `[providers.stepfun]` | OpenAI Chat Completions | `STEPFUN_API_KEY`, `STEP_API_KEY` |
+| `minimax` | `[providers.minimax]` | OpenAI Chat Completions | `MINIMAX_API_KEY` |
+| `deepinfra` | `[providers.deepinfra]` | OpenAI Chat Completions | `DEEPINFRA_API_KEY`, `DEEPINFRA_TOKEN` |
+| `sakana` | `[providers.sakana]` | OpenAI Chat Completions | `FUGU_API_KEY`, `SAKANA_API_KEY` |
+
+Default base URLs and models for each route are listed in the shipped provider
+table below. The wire protocol values above are derived from
+`crates/config/src/provider.rs`: `ChatCompletions` is the default,
+`openai-codex` overrides to `Responses`, and `deepseek-anthropic`,
+`anthropic`, plus `openmodel` override to `AnthropicMessages`.
 
 ## Auth And Env Rules
 
@@ -121,6 +180,7 @@ provider = "openai"
 api_key = "YOUR_DASHSCOPE_API_KEY"
 base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 model = "qwen-plus"
+context_window = 1000000
 ```
 
 The Singapore endpoint above sends chat requests to `/chat/completions`;
@@ -128,7 +188,9 @@ Alibaba also documents regional `compatible-mode/v1` base URLs for Virginia,
 Beijing, Hong Kong, and Frankfurt. Keep the API key and base URL from the same
 region. The `qwen-plus` model ID is preserved as an OpenAI provider-scoped wire
 ID; CodeWhale does not infer a switch to OpenRouter, DeepSeek, or another
-provider from the `qwen` prefix.
+provider from the `qwen` prefix. Set `context_window` to the gateway/model's
+real total context window when it differs from CodeWhale's static model
+metadata.
 
 Private gateways with broken or intercepted certificates should use
 `SSL_CERT_FILE` with a trusted CA bundle. The legacy
@@ -169,14 +231,17 @@ the same links where possible.
 | `deepinfra` | [DeepInfra API keys](https://deepinfra.com/dash/api_keys) |
 | `together` | [Together API keys](https://api.together.ai/settings/api-keys) |
 | `anthropic` | [Anthropic API keys](https://console.anthropic.com/settings/keys) |
+| `openmodel` | [OpenModel API key guide](https://docs.openmodel.ai/en/docs/guides/api-key) |
 | `openai-codex` | Reuses `codex login`; no CodeWhale API key is stored. |
 | `sglang`, `vllm`, `ollama` | Local OpenAI-compatible endpoints can run without an API key on localhost. |
+| `sakana` | [Sakana AI API](https://api.sakana.ai/) |
 
 ## Shipped Providers
 
 | Provider ID | TOML table | Auth env | Base URL env and default | Default or static models | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `deepseek` | `[providers.deepseek]` | `DEEPSEEK_API_KEY` | `CODEWHALE_BASE_URL` / `DEEPSEEK_BASE_URL`; default `https://api.deepseek.com/beta` | `deepseek-v4-pro`, `deepseek-v4-flash`; compatibility aliases `deepseek-chat`, `deepseek-reasoner` | First-class default. Beta URL enables strict tool mode, chat prefix completion, and FIM completion. Set `https://api.deepseek.com` or `/v1` explicitly to opt out of beta-only features. |
+| `deepseek-anthropic` | `[providers.deepseek_anthropic]` | `DEEPSEEK_API_KEY` | `DEEPSEEK_ANTHROPIC_BASE_URL`; default `https://api.deepseek.com/anthropic` | `deepseek-v4-pro`, `deepseek-v4-flash`; compatibility aliases `deepseek-chat`, `deepseek-reasoner` | Opt-in DeepSeek route for the Anthropic Messages wire protocol. Uses `/v1/messages`, `x-api-key`, and `anthropic-version: 2023-06-01`. Keep `provider = "deepseek"` for the default Chat Completions path. |
 | `nvidia-nim` | `[providers.nvidia_nim]` | `NVIDIA_API_KEY`, `NVIDIA_NIM_API_KEY`, fallback `DEEPSEEK_API_KEY` | `NVIDIA_NIM_BASE_URL`, `NIM_BASE_URL`, `NVIDIA_BASE_URL`; default `https://integrate.api.nvidia.com/v1` | `deepseek-ai/deepseek-v4-pro`, `deepseek-ai/deepseek-v4-flash` | Hosted DeepSeek V4 through NVIDIA NIM. `NVIDIA_NIM_MODEL` is accepted by the TUI config path. |
 | `openai` | `[providers.openai]` | `OPENAI_API_KEY` | `OPENAI_BASE_URL`; default `https://api.openai.com/v1` | Registry entries: `deepseek-v4-pro`, `deepseek-v4-flash`; default config model `deepseek-v4-pro` | Generic OpenAI-compatible route for gateways and custom endpoints, including Alibaba Bailian / Model Studio DashScope when configured with that endpoint. Use this for explicit third-party OpenAI-compatible routes instead of inventing a new provider ID. `OPENAI_MODEL` is accepted. |
 | `atlascloud` | `[providers.atlascloud]` | `ATLASCLOUD_API_KEY` | `ATLASCLOUD_BASE_URL`; default `https://api.atlascloud.ai/v1` | Default `deepseek-ai/deepseek-v4-flash`; explicit `vendor/model-id` values pass through when AtlasCloud is selected | OpenAI-compatible hosted route. `ATLASCLOUD_MODEL` is accepted by the TUI config path, the static `ModelRegistry` keeps DeepSeek V4 fallback rows, and provider-hinted CLI model IDs are sent to AtlasCloud exactly as requested. Use Atlas Cloud's own catalog or Coding Plan page for the current provider-owned model list and pricing. |
@@ -202,6 +267,8 @@ the same links where possible.
 | `qianfan` | `[providers.qianfan]` | `QIANFAN_API_KEY`, `BAIDU_QIANFAN_API_KEY` | `QIANFAN_BASE_URL`, `BAIDU_QIANFAN_BASE_URL`; default `https://api.baiduqianfan.ai/v1` | `ernie-4.0-turbo-8k`; provider-scoped custom Qianfan service/model IDs pass through | Baidu Qianfan OpenAI-compatible route. Requests use Bearer auth and Chat Completions payloads. `QIANFAN_MODEL` and `BAIDU_QIANFAN_MODEL` are accepted; aliases `baidu-qianfan`, `baidu_qianfan`, and `baidu` resolve to this provider. Tool/function calling is model-scoped in Qianfan docs, so CodeWhale preserves the selected wire model and leaves live capability proof to follow-up route/capability work. |
 | `openai-codex` | `[providers.openai_codex]` | OAuth via `codex login` (`~/.codex/auth.json`); env override `OPENAI_CODEX_ACCESS_TOKEN`, `CODEX_ACCESS_TOKEN` | `OPENAI_CODEX_BASE_URL`/`CODEX_BASE_URL`; default `https://chatgpt.com/backend-api` | `gpt-5.5` | **Experimental.** Reuses your existing ChatGPT/Codex CLI OAuth login and talks to the OpenAI Responses API at `/codex/responses`. The access token is read and refreshed from `~/.codex/auth.json`; no API key is stored. `OPENAI_CODEX_MODEL`/`CODEX_MODEL` and `OPENAI_CODEX_ACCOUNT_ID`/`CODEX_ACCOUNT_ID` are accepted. CodeWhale budgets this route with the 400K Codex-family effective context window even when the public API model table lists a larger native `gpt-5.5` window. |
 | `anthropic` | `[providers.anthropic]` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL`; default `https://api.anthropic.com` | `claude-opus-4-8`, `claude-sonnet-4-6` (default), `claude-haiku-4-5` | Native Anthropic Messages API route (`/v1/messages`, `x-api-key` + `anthropic-version: 2023-06-01`) — not OpenAI-compatible. Prompt caching via `cache_control` breakpoints, adaptive thinking + `output_config.effort`, signed thinking blocks replayed verbatim, cache telemetry normalized per #2961. `ANTHROPIC_MODEL` is accepted. |
+| `openmodel` | `[providers.openmodel]` | `OPENMODEL_API_KEY` | `OPENMODEL_BASE_URL`; default `https://api.openmodel.ai` | `deepseek-v4-flash`; provider-scoped custom model IDs pass through | OpenModel Anthropic-compatible Messages route. Uses `/v1/messages`, Bearer auth, and `anthropic-version: 2023-06-01`; OpenModel selects DeepSeek, DashScope, Xiaomi, Claude, and other routes by model id. `OPENMODEL_MODEL` is accepted. |
+| `sakana` | `[providers.sakana]` | `FUGU_API_KEY`, `SAKANA_API_KEY` | `SAKANA_BASE_URL`; default `https://api.sakana.ai/v1` | `fugu` (default), `fugu-ultra-20260615` | Sakana AI Fugu OpenAI-compatible route. Standard Chat Completions wire protocol; streaming supported. `fugu-ultra-20260615` is the heavy/reasoning variant. Env var aliases: `FUGU_API_KEY` (primary), `SAKANA_API_KEY`; provider aliases: `sakana-ai`, `sakana_ai`, `fugu`. |
 
 ### Hugging Face Provider vs MCP vs Hub
 
@@ -307,7 +374,7 @@ endpoint when the endpoint supports model listing.
 | `atlascloud` | `deepseek-ai/deepseek-v4-flash`, `deepseek-ai/deepseek-v4-pro` | yes | yes |
 | `wanjie-ark` | `deepseek-reasoner` | yes | yes |
 | `volcengine` | `DeepSeek-V4-Pro`, `DeepSeek-V4-Flash` | yes | yes |
-| `openrouter` | `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash`, `arcee-ai/trinity-large-thinking`, `minimax/minimax-m3`, `minimax/minimax-2.7`, `xiaomi/mimo-v2.5-pro`, `xiaomi/mimo-v2.5`, `qwen/qwen3.6-flash`, `qwen/qwen3.6-35b-a3b`, `qwen/qwen3.6-max-preview`, `qwen/qwen3.6-27b`, `qwen/qwen3.6-plus`, `qwen/qwen3.7-max`, `moonshotai/kimi-k2.7-code`, `moonshotai/kimi-k2.6`, `z-ai/glm-5.1`, `z-ai/glm-5.2`, `z-ai/glm-5-turbo`, `tencent/hy3-preview`, `google/gemma-4-31b-it`, `google/gemma-4-26b-a4b-it`, `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`, `nvidia/nemotron-3-ultra-550b-a55b` | yes | yes |
+| `openrouter` | `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash`, `arcee-ai/trinity-large-thinking`, `minimax/minimax-m3`, `minimax/minimax-m2.7`, `xiaomi/mimo-v2.5-pro`, `xiaomi/mimo-v2.5`, `qwen/qwen3.6-flash`, `qwen/qwen3.6-35b-a3b`, `qwen/qwen3.6-max-preview`, `qwen/qwen3.6-27b`, `qwen/qwen3.6-plus`, `qwen/qwen3.7-max`, `moonshotai/kimi-k2.7-code`, `moonshotai/kimi-k2.6`, `z-ai/glm-5.1`, `z-ai/glm-5.2`, `z-ai/glm-5-turbo`, `tencent/hy3-preview`, `google/gemma-4-31b-it`, `google/gemma-4-26b-a4b-it`, `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`, `nvidia/nemotron-3-ultra-550b-a55b` | yes | yes |
 | `xiaomi-mimo` | `mimo-v2.5-pro`, `mimo-v2.5-pro-ultraspeed`, `mimo-v2.5`; speech/TTS IDs are selected through `codewhale speech` / `tts` | yes | yes for chat models; no for speech/TTS models |
 | `novita` | `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash` | yes | yes |
 | `fireworks` | `accounts/fireworks/models/deepseek-v4-pro` | yes | yes |
@@ -325,6 +392,8 @@ endpoint when the endpoint supports model listing.
 | `together` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | yes | yes |
 | `openai-codex` | `gpt-5.5` | yes | yes |
 | `anthropic` | `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5` | yes | yes for `claude-opus-4-8` and `claude-sonnet-4-6`; no for `claude-haiku-4-5` |
+| `openmodel` | `deepseek-v4-flash`; provider-scoped custom model IDs pass through | yes | model-dependent |
+| `sakana` | `fugu`, `fugu-ultra-20260615` | yes | yes for `fugu-ultra-20260615` |
 
 AtlasCloud keeps the same default model as the config layer and adds
 provider-scoped aliases for the Pro and Flash rows. Other AtlasCloud model IDs
@@ -340,7 +409,12 @@ metadata, not a live API probe. Current fields are:
 `thinking_supported`, `cache_telemetry_supported`, and `request_payload_mode`.
 
 Most shipped providers use the Chat Completions request payload mode. Native
-Anthropic uses Messages, and `openai-codex` uses Responses.
+Anthropic and OpenModel use Messages, and `openai-codex` uses Responses.
+
+For OpenAI-compatible gateways or self-hosted runtimes whose real window
+differs from the static table, set `[providers.<name>] context_window = N`.
+The configured value becomes the route-effective context window for prompts,
+context-pressure checks, compaction, and output-cap budgeting.
 
 | Provider/model class | Context window | Max output metadata | Thinking support | Cache telemetry | FIM endpoint |
 | --- | --- | --- | --- | --- | --- |
@@ -355,6 +429,7 @@ Anthropic uses Messages, and `openai-codex` uses Responses.
 | OpenRouter Qwen 3.6 Max Preview | 262,144 | 65,536 | yes | no | not documented in code |
 | OpenAI API `gpt-5.5` | 1,050,000 | 128,000 | yes | no | not documented in code |
 | OpenAI Codex / ChatGPT route (`openai-codex`) | 400,000 effective | 128,000 | yes | no | route uses Responses payload at `/codex/responses` |
+| OpenModel default/custom model IDs | 200,000 fallback unless model metadata or config overrides it | 64,000 fallback | model-dependent | no | route uses Messages payload at `/v1/messages` |
 | Wanjie Ark `reasoner` / `r1` model IDs | 128,000 | 4,096 | yes | no | not documented in code |
 | Direct Arcee API `trinity-large-thinking` | 262,144 | 262,144 | yes | no | not documented in code |
 | Direct Arcee API `trinity-large-preview` | 262,144 | 4,096 | no in doctor capability metadata | no | not documented in code |
@@ -430,6 +505,7 @@ receive no reasoning fields at all for that tier.
 | `arcee`, `huggingface` | omitted | `reasoning_effort` pass-through | `reasoning_effort: "high"` |
 | `fireworks` | omitted | `reasoning_effort: "high"` | `reasoning_effort: "max"` |
 | `openai`, `wanjie-ark` | omitted | omitted | omitted |
+| `openmodel` | Anthropic Messages adapter handles thinking/output configuration | Anthropic Messages adapter handles thinking/output configuration | Anthropic Messages adapter handles thinking/output configuration |
 | `openai-codex` | Responses API `reasoning` field (handled by the Responses bridge) | Responses API `reasoning` field | Responses API `reasoning` field |
 
 AtlasCloud serves DeepSeek models, so it speaks the DeepSeek reasoning dialect,

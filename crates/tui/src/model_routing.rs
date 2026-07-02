@@ -393,6 +393,26 @@ pub(crate) async fn resolve_auto_route_with_flash(
     selected_model_mode: &str,
     selected_thinking_mode: &str,
 ) -> AutoRouteSelection {
+    resolve_auto_route_with_flash_for_session(
+        config,
+        latest_request,
+        recent_context,
+        "agent",
+        selected_model_mode,
+        selected_thinking_mode,
+    )
+    .await
+}
+
+#[allow(dead_code)] // superseded by the route-effective inventory resolver (#3205).
+pub(crate) async fn resolve_auto_route_with_flash_for_session(
+    config: &Config,
+    latest_request: &str,
+    recent_context: &str,
+    session_mode: &str,
+    selected_model_mode: &str,
+    selected_thinking_mode: &str,
+) -> AutoRouteSelection {
     let cost_saving = config.auto_cost_saving();
     // #3018: derive the candidate pair from the active provider. The
     // config-resolved default model stands in for the session model — with
@@ -419,6 +439,7 @@ pub(crate) async fn resolve_auto_route_with_flash(
         &candidates,
         latest_request,
         recent_context,
+        session_mode,
         selected_model_mode,
         selected_thinking_mode,
     )
@@ -467,6 +488,25 @@ pub(crate) async fn resolve_auto_route_with_inventory(
     selected_model_mode: &str,
     selected_thinking_mode: &str,
 ) -> Result<AutoRouteSelection> {
+    resolve_auto_route_with_inventory_for_session(
+        config,
+        latest_request,
+        recent_context,
+        "agent",
+        selected_model_mode,
+        selected_thinking_mode,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_auto_route_with_inventory_for_session(
+    config: &Config,
+    latest_request: &str,
+    recent_context: &str,
+    session_mode: &str,
+    selected_model_mode: &str,
+    selected_thinking_mode: &str,
+) -> Result<AutoRouteSelection> {
     let inventory = ModelInventory::from_config(config);
     if !inventory.router_available {
         // Fall back to heuristic-only auto routing when the flash router
@@ -488,6 +528,7 @@ pub(crate) async fn resolve_auto_route_with_inventory(
         &inventory,
         latest_request,
         recent_context,
+        session_mode,
         selected_model_mode,
         selected_thinking_mode,
     )
@@ -522,7 +563,12 @@ pub(crate) fn resolve_explicit_route_with_inventory(
         return Some(AutoRouteSelection {
             provider: candidate.provider,
             model: candidate.model.clone(),
-            reasoning_effort: config.reasoning_effort().map(ReasoningEffort::from_setting),
+            reasoning_effort: config.reasoning_effort().map(|setting| {
+                normalize_auto_route_effort_for_provider(
+                    candidate.provider,
+                    ReasoningEffort::from_setting(setting),
+                )
+            }),
             source: AutoRouteSource::Heuristic,
         });
     }
@@ -539,7 +585,12 @@ pub(crate) fn resolve_explicit_route_with_inventory(
     Some(AutoRouteSelection {
         provider: candidate.provider,
         model: candidate.model.clone(),
-        reasoning_effort: config.reasoning_effort().map(ReasoningEffort::from_setting),
+        reasoning_effort: config.reasoning_effort().map(|setting| {
+            normalize_auto_route_effort_for_provider(
+                candidate.provider,
+                ReasoningEffort::from_setting(setting),
+            )
+        }),
         source: AutoRouteSource::Heuristic,
     })
 }
@@ -609,6 +660,7 @@ async fn auto_route_inventory_recommendation(
     inventory: &ModelInventory,
     latest_request: &str,
     recent_context: &str,
+    session_mode: &str,
     selected_model_mode: &str,
     selected_thinking_mode: &str,
 ) -> Result<Option<InventoryAutoRouteRecommendation>> {
@@ -626,6 +678,7 @@ async fn auto_route_inventory_recommendation(
                 text: auto_route_prompt(
                     latest_request,
                     recent_context,
+                    session_mode,
                     selected_model_mode,
                     selected_thinking_mode,
                 ),
@@ -696,6 +749,7 @@ async fn auto_route_flash_recommendation(
     candidates: &RouterCandidates,
     latest_request: &str,
     recent_context: &str,
+    session_mode: &str,
     selected_model_mode: &str,
     selected_thinking_mode: &str,
 ) -> Result<Option<AutoRouteRecommendation>> {
@@ -718,6 +772,7 @@ async fn auto_route_flash_recommendation(
                 text: auto_route_prompt(
                     latest_request,
                     recent_context,
+                    session_mode,
                     selected_model_mode,
                     selected_thinking_mode,
                 ),
@@ -747,11 +802,13 @@ async fn auto_route_flash_recommendation(
 fn auto_route_prompt(
     latest_request: &str,
     recent_context: &str,
+    session_mode: &str,
     selected_model_mode: &str,
     selected_thinking_mode: &str,
 ) -> String {
     format!(
-        "Session mode: agent\nSelected model mode: {}\nSelected thinking mode: {}\n\nRecent context:\n{}\n\nLatest user request:\n{}\n\nReturn JSON only.",
+        "Session mode: {}\nSelected model mode: {}\nSelected thinking mode: {}\n\nRecent context:\n{}\n\nLatest user request:\n{}\n\nReturn JSON only.",
+        session_mode,
         selected_model_mode,
         selected_thinking_mode,
         if recent_context.trim().is_empty() {
@@ -903,6 +960,22 @@ mod tests {
     }
 
     #[test]
+    fn auto_route_prompt_uses_current_session_mode() {
+        let prompt = auto_route_prompt(
+            "Please explain the change before editing files.",
+            "No prior context.",
+            "plan",
+            "auto",
+            "auto",
+        );
+
+        assert!(
+            prompt.starts_with("Session mode: plan\n"),
+            "auto-route prompt should reflect the active session mode, got: {prompt}"
+        );
+    }
+
+    #[test]
     fn auto_route_recommendation_parses_strict_json() {
         let rec =
             parse_auto_route_recommendation(r#"{"model":"deepseek-v4-pro","thinking":"max"}"#)
@@ -1042,6 +1115,35 @@ mod tests {
         assert_eq!(route.provider, ApiProvider::WanjieArk);
         assert_eq!(route.model, "deepseek-v4-flash");
         assert_eq!(route.reasoning_effort, Some(ReasoningEffort::Off));
+    }
+
+    #[test]
+    fn explicit_route_to_nonactive_provider_uses_that_providers_effort() {
+        // Active provider is DeepSeek (whose effort floor is low/medium), but the
+        // explicit model `GLM-5.2` only routes to Z.ai. The resolved effort must
+        // be normalized for Z.ai — not left at DeepSeek's raw `low` setting.
+        let _env_lock = crate::test_support::lock_test_env();
+        let _deepseek = crate::test_support::EnvVarGuard::set("DEEPSEEK_API_KEY", "ds-key");
+        let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-key");
+        let config = Config {
+            provider: Some("deepseek".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            ..Default::default()
+        };
+
+        let route = resolve_explicit_route_with_inventory(&config, "GLM-5.2")
+            .expect("explicit GLM route should resolve to its provider");
+
+        assert_eq!(
+            route.provider,
+            ApiProvider::Zai,
+            "GLM-5.2 must route to Z.ai, not the active DeepSeek provider"
+        );
+        assert_eq!(
+            route.reasoning_effort,
+            Some(ReasoningEffort::High),
+            "low must be normalized up to high for the Z.ai route, not passed through"
+        );
     }
 
     #[tokio::test]

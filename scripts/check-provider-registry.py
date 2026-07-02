@@ -21,13 +21,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_RS = ROOT / "crates" / "config" / "src" / "lib.rs"
+# ProviderKind's enum + identity impl were split out of lib.rs into this module.
+PROVIDER_KIND_RS = ROOT / "crates" / "config" / "src" / "provider_kind.rs"
 PROVIDER_RS = ROOT / "crates" / "config" / "src" / "provider.rs"
 TUI_CONFIG_RS = ROOT / "crates" / "tui" / "src" / "config.rs"
+# Default provider model/base-URL constants were split out of config.rs into
+# this leaf module (#3311); read them from there for the default-string check.
+TUI_CONFIG_MODELS_RS = ROOT / "crates" / "tui" / "src" / "config" / "models.rs"
 AGENT_RS = ROOT / "crates" / "agent" / "src" / "lib.rs"
 PROVIDERS_MD = ROOT / "docs" / "PROVIDERS.md"
 
 
 API_PROVIDER_ONLY_IDS = {"deepseek-cn"}
+
+# `custom` is the dynamic OpenAI-compatible meta-provider (#1519): a single
+# catch-all `[providers.custom]` table that backs arbitrary user-defined
+# endpoints, not a canonical shipped provider with a docs row. It is excluded
+# from the provider-table drift check.
+META_PROVIDER_TABLES = {"custom"}
 SHARED_PROVIDER_TABLES = {
     "siliconflow-CN": "siliconflow_cn",
 }
@@ -91,6 +102,12 @@ def extract_match_block(
 
 
 def parse_aliases_for_variant(source: str, enum_name: str, variant: str, context: str) -> set[str]:
+    # `ProviderKind`'s enum + identity impl (incl. `parse`) live in
+    # provider_kind.rs after the config module split; read the impl from there
+    # regardless of the file the caller passed for other lookups.
+    if enum_name == "ProviderKind":
+        source = read(PROVIDER_KIND_RS)
+        context = "crates/config/src/provider_kind.rs"
     impl_start = require_index(source, f"impl {enum_name}", context)
     block = extract_match_block(
         source,
@@ -126,10 +143,13 @@ def provider_kind_ids(config_rs: str) -> dict[str, str]:
         provider_rs,
     )
     ids: dict[str, str] = {variant: provider_id for variant, provider_id in pairs}
-    # OpenaiCodex and Anthropic use manual impls rather than the provider!() macro
+    # OpenaiCodex, Anthropic, and DeepseekAnthropic use manual impls rather
+    # than the provider!() macro.
     for variant_name, id_literal in [
+        ("DeepseekAnthropic", "deepseek-anthropic"),
         ("OpenaiCodex", "openai-codex"),
         ("Anthropic", "anthropic"),
+        ("Openmodel", "openmodel"),
     ]:
         match = re.search(
             rf'impl\s+Provider\s+for\s+{variant_name}.*?fn\s+id.*?\"({id_literal})\"',
@@ -191,10 +211,13 @@ def model_registry_providers(agent_rs: str, variant_to_id: dict[str, str]) -> se
 
 
 def default_strings(tui_config_rs: str) -> set[str]:
+    # Model/base-URL constants now live in config/models.rs (#3311); scan it
+    # alongside config.rs so the check follows the leaf split.
+    sources = tui_config_rs + "\n" + read(TUI_CONFIG_MODELS_RS)
     defaults = set()
     for name, value in re.findall(
         r'const\s+(DEFAULT_[A-Z0-9_]+(?:MODEL|BASE_URL)):\s*&str\s*=\s*"([^"]+)"',
-        tui_config_rs,
+        sources,
     ):
         if name == "DEFAULT_DEEPSEEKCN_BASE_URL":
             continue
@@ -352,7 +375,11 @@ def main() -> int:
             canonical_ids,
             shipped_provider_rows(providers_md),
         )
-        errors += report_set("provider TOML tables", expected_tables, provider_tables(config_rs))
+        errors += report_set(
+            "provider TOML tables",
+            expected_tables,
+            provider_tables(config_rs) - META_PROVIDER_TABLES,
+        )
         errors += report_set(
             "documented provider TOML tables",
             expected_tables,

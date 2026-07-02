@@ -1,7 +1,6 @@
 # CodeWhale
 
-> An open source terminal coding agent, built to bring the best available models
-> to as many people as possible.
+> The terminal coding agent for any model — open models first.
 
 CodeWhale is a terminal coding agent — a TUI and a CLI. You point it at a model
 and a project, and it gets to work: reading code, making edits, running
@@ -9,16 +8,19 @@ commands, checking results, planning multi-step tasks, and correcting itself
 when something fails.
 
 It's open source (MIT, Rust), it runs on your machine, and it works with the
-models people actually use. DeepSeek and open-weight models are first-class,
-but Claude, GPT, Kimi, and a local vLLM/Ollama box on your LAN are all full
-peers. The goal is simple: keep the local terminal workflow current with the
-best research and practical features in coding agents.
+models people actually use. DeepSeek and open-weight models are first-class, and
+a local vLLM/SGLang/Ollama box on your LAN needs no key at all — but Claude, GPT,
+Kimi, and GLM are full peers through the same runtime and the same tools. You
+pick a provider and a model; CodeWhale resolves a real route and runs.
 
-Developers from all over the world have shaped CodeWhale into what it is. If
-there's a model, endpoint, or feature you don't see that you want, open an issue
-— that's how the project grows.
+The project began as `deepseek-tui`, a coding harness built around DeepSeek
+workflows. The developer community — much of it in China — adopted it, filed
+reports, and contributed fixes, and it became clear the harness was bigger than
+one model. Multi-provider support followed, and the project became CodeWhale to
+match. If there's a model, endpoint, or feature you don't see that you want,
+open an issue — that's how the project grows.
 
-[简体中文 README](README.zh-CN.md) · [日本語 README](README.ja-JP.md) · [Tiếng Việt README](README.vi.md) · [codewhale.net](https://codewhale.net/) · [Install guide](docs/INSTALL.md) · [Provider registry](docs/PROVIDERS.md) · [Changelog](CHANGELOG.md)
+[简体中文 README](README.zh-CN.md) · [日本語 README](README.ja-JP.md) · [Tiếng Việt README](README.vi.md) · [한국어 README](README.ko-KR.md) · [codewhale.net](https://codewhale.net/) · [Install guide](docs/INSTALL.md) · [Provider registry](docs/PROVIDERS.md) · [Changelog](CHANGELOG.md)
 
 [![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
@@ -31,7 +33,7 @@ there's a model, endpoint, or feature you don't see that you want, open an issue
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.63
+codewhale --version   # 0.8.66
 ```
 
 The npm wrapper (Node 18+) downloads SHA-256-verified binaries from GitHub
@@ -60,8 +62,12 @@ scoop install codewhale        # or the NSIS installer from GitHub Releases
 docker build -t codewhale .
 
 # CNB mirror for users who cannot reliably reach GitHub
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.64 codewhale-cli --locked --force
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.64 codewhale-tui --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-cli --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-tui --locked --force
+
+# Legacy Homebrew compatibility while the formula is renamed
+brew tap Hmbown/deepseek-tui
+brew install deepseek-tui
 ```
 
 Prebuilt archives for every platform — including Linux riscv64 — are attached
@@ -73,7 +79,7 @@ China mirrors, Windows specifics, and troubleshooting live in
 skills, and MCP settings are preserved. See [docs/REBRAND.md](docs/REBRAND.md),
 then run `codewhale doctor` to confirm.
 
-## First Run
+## First run
 
 ```bash
 codewhale auth set --provider deepseek
@@ -83,7 +89,7 @@ codewhale
 ```
 
 Every provider is the same one-line shape: `--provider openrouter`,
-`--provider moonshot`, or point `vllm`, `sglang`, or `ollama` at your own
+`--provider moonshot`, `--provider openmodel`, or point `vllm`, `sglang`, or `ollama` at your own
 localhost runtime with no key at all. Have a Claude key instead? Run
 `codewhale auth set --provider anthropic` — or just export
 `ANTHROPIC_API_KEY` — and the native Messages adapter takes it from there.
@@ -93,11 +99,15 @@ read for compatibility.
 
 Useful in-session commands:
 
-- `/provider` and `/model` switch the route and model mid-session.
+- `/provider` opens the readiness dashboard — per provider it shows auth state,
+  the resolved default route, and the cost/usage meter. `/model` picks the model
+  and reasoning effort. Both also take arguments (`/provider nvidia-nim`,
+  `/model auto`) to switch mid-session.
 - `/restore` rolls back a prior turn from side-git snapshots.
+- `/fleet` opens the Fleet setup view — roles, profiles, loadouts, and policy.
 - `/skills` loads reusable workflows from `~/.codewhale/skills/`.
-- `/config` edits runtime settings; `/statusline` shows the current route,
-  cost, and session state.
+- `/config` edits runtime settings; `/statusline` chooses which footer chips
+  show route, cost, and session state.
 - `! cargo test -p codewhale-tui` runs any shell command through the normal
   approval and sandbox path.
 
@@ -107,89 +117,112 @@ Headless, for scripts and CI:
 codewhale exec --allowed-tools read_file,exec_shell --max-turns 10 "fix the failing test"
 ```
 
-## The models
+## Providers and routing
 
-A terminal-native agent harness — TUI + CLI, 16 Rust crates — where the safety
-rails are runtime mechanisms, not advice the model has to remember:
+You pick a provider and a model, and CodeWhale resolves a **real route** — a
+concrete endpoint, wire protocol, model ID, context limit, and price — instead
+of just swapping a base URL. A `RouteResolver` is the only thing that can mint a
+resolved route, so the same selection logic backs the TUI picker, the CLI, and
+headless runs. The catalog behind it is a committed, network-free snapshot in
+the Models.dev shape, optionally refreshed from a provider's live `/models`
+endpoint.
 
-- **Approval-gated tools with OS sandboxing.** File, shell, git, web, MCP, and
-  sub-agent tools run behind explicit approval gates and sandbox backends
-  (bwrap, Landlock, Seatbelt, seccomp).
-- **Rollback you can trust.** Side-git snapshots and `/restore`, kept outside
-  your repo's `.git` — undoing a turn never touches your history.
-- **Hooks v2** *(0.8.58)*. `tool_call_before` hooks return JSON
-  `allow`/`deny`/`ask` decisions with deny-wins precedence, glob matchers, and
-  project-local `.codewhale/hooks.toml`.
-- **Concurrent sub-agents with per-role model routing** *(0.8.61)*. Parallel
-  investigation and implementation with heterogeneous models per worker role —
-  verifiers can use a fast model while synthesis uses a large one, resolved per
-  provider.
-- **Durable goal mode** *(0.8.61)*. Cross-turn goal progress with token/time
-  accounting and a verifier-as-judge gate before a goal may complete.
-- **Constitution v4** *(0.8.61)*. Six articles, zero ceremony — the runtime
-  authority and safety rails live in the harness, not in the model's prompt.
-- **Durable sessions.** Forks, relay handoffs, and a cross-session
-  disk-backed prompt cache that stays byte-stable across Plan/Agent/YOLO mode
-  flips *(0.8.56)*. Turns survive system sleep *(0.8.57)*: suspend mid-stream,
-  wake, and the request is silently re-issued instead of failing the turn.
-- **Headless mode.** `codewhale exec` with `--allowed-tools`,
-  `--disallowed-tools` (deny wins), `--max-turns`, and
-  `--append-system-prompt` *(0.8.58)* for scripts and CI.
-- **Remote setup** *(0.8.61)*. `codewhale remote-setup` — guided cloud
-  deployment and chat-bridge (Telegram/Feishu) provisioning in one command.
-- **Embedded everywhere.** HTTP/SSE and ACP runtime APIs, a VS Code extension
-  (Phase 0), and Telegram/Feishu bridges (Weixin bridge experimental).
-- **Provider balance query** *(0.8.61)*. `/balance` and `codewhale balance` query
-  the active provider's account credits over the network — DeepSeek surfaces
-  granted promotional credit, OpenRouter reports total credits. The footer chip
-  shows live balance at a glance.
-- **Daily-driver polish.** MCP client *and* server, reusable skills, 7-locale
-  localization (approval dialogs included since 0.8.56), and speech/TTS via
-  Xiaomi MiMo.
+Because the route is resolved, the rest of the harness can be honest about it:
 
-### Any model, open models first
+- **Route-aware context budgets.** The compaction threshold and usable window
+  come from the resolved route's real context limit, not a hardcoded guess.
+- **Honest cost display.** A route reports exactly one cost state: per-token
+  pricing, a subscription/quota meter, account credits, *local / not
+  applicable*, or *unknown / stale*. CodeWhale never invents a price it doesn't
+  have — an unmatched model shows as unknown rather than $0.
+- **Explicit wire protocol.** Whether a route speaks Chat Completions, the
+  OpenAI Responses API, or native Anthropic Messages is carried on the resolved
+  route, not inferred from a prompt. Reasoning effort is translated into each
+  provider's own dialect.
 
-Twenty-five providers route through the same harness, same constitution, same
-tools:
+Switch the route mid-session with `/provider` and `/model`. The full registry —
+credentials, base URLs, capability boundaries — lives in
+[docs/PROVIDERS.md](docs/PROVIDERS.md).
 
-- **Open models, hosted:** `deepseek` (first among equals), `openrouter`,
-  `huggingface` (Inference Providers), `moonshot` (Kimi — OAuth temporarily
-  broken), `zai` (GLM — recommended), `minimax`, `volcengine` (Ark),
-  `nvidia-nim`, `together`, `fireworks`, `novita`, `siliconflow` /
-  `siliconflow-CN`, `arcee`, `xiaomi-mimo`, `deepinfra`, `stepfun`,
-  `atlascloud`, `wanjie-ark`, plus a generic `openai`-compatible route for any
-  gateway.
+### Supported providers
+
+Every provider routes through the same runtime and the same tools. If the one
+you want isn't here, that's a good issue to open.
+
+- **Open models, hosted:** `deepseek` (the default), `openrouter`,
+  `huggingface` (Inference Providers), `moonshot` (Kimi), `zai` (GLM),
+  `minimax`, `volcengine` (Ark), `nvidia-nim`, `together`, `fireworks`,
+  `novita`, `siliconflow` / `siliconflow-CN`, `arcee`, `xiaomi-mimo`,
+  `openmodel`, `deepinfra`, `stepfun`, `atlascloud`, `qianfan`, `wanjie-ark`, plus a generic
+  `openai`-compatible route for any gateway.
 - **Open models, self-hosted:** `vllm`, `sglang`, and `ollama` against your own
   localhost endpoints — no key required.
 - **Closed providers, natively:** `anthropic` through a dedicated
   `/v1/messages` adapter with adaptive thinking, prompt-cache breakpoints, and
-  signed-thinking replay — and `openai-codex`, which reuses an existing
-  ChatGPT/Codex CLI login (working).
+  signed-thinking replay; `deepseek-anthropic`, DeepSeek's opt-in Messages-API
+  route; and `openai-codex` (experimental), which reuses an existing
+  ChatGPT/Codex CLI login instead of an API key.
 
-Routing is more than a base URL swap: `/reasoning` effort is translated into
-each provider's wire dialect, sub-agent tiers resolve per provider, and the
-system prompt's model facts are templated per-model instead of hardcoded.
-Switch mid-session with `/provider` and `/model`. The full registry —
-credentials, base URLs, capability boundaries — lives in
-[docs/PROVIDERS.md](docs/PROVIDERS.md).
+## Fleet
 
-The version tags above mark what landed in the last several releases
-(0.8.56 → 0.8.61). Full details in [CHANGELOG.md](CHANGELOG.md).
+Fleet is CodeWhale's durable control plane for multi-worker runs. A fleet worker
+is a headless `codewhale exec` run, but the fleet launches and tracks it durably:
+work is recorded in an append-only ledger (`.codewhale/fleet.jsonl`), so a run
+survives a manager exit, laptop sleep, or a runtime restart.
 
-Sub-agent fanout is config-first. Set global `[subagents]` defaults, then add
-`[subagents.providers.deepseek]`, `[subagents.providers.glm]`,
-`[subagents.providers.openrouter]`, or other provider profiles to match the API
-you are actually using. Direct DeepSeek can stay wide; subscription or
-rate-limited routes can stay at 3-5 concurrent agents without changing prompts
-or code. See [docs/SUBAGENTS.md](docs/SUBAGENTS.md#concurrency-cap).
+```bash
+codewhale fleet run tasks.json --max-workers 4
+codewhale fleet status
+codewhale fleet resume <run-id>
+```
 
-Atlas Cloud is included as an OpenAI-compatible hosted route for users who want
-its curated catalog behind one key: set `DEEPSEEK_PROVIDER=atlascloud`,
-`ATLASCLOUD_API_KEY`, and optionally `ATLASCLOUD_MODEL`, for example
-`deepseek-ai/deepseek-v4-pro`. Atlas model IDs pass through as selected; use
-Atlas's model catalog or Coding Plan page for the current list and pricing.
+`fleet resume` replays the ledger, reconciles any in-flight task whose worker
+stopped heartbeating (retrying within budget, else failing and escalating), and
+is idempotent — safe to run after anything that interrupted the manager. Each
+worker records a typed receipt (`pass` / `fail` / `partial` / `skip` /
+`timeout`) so `fleet status` can report what actually happened.
 
-## What makes CodeWhale different
+Workers are shaped by **roles**, **profiles**, **loadouts**, and **slots**,
+configured under `[fleet]` in your config or authored from the in-app Fleet
+setup view. Loadouts express model intent as a class — `strong`, `balanced`, or
+`fast` — and the route resolver turns that into a concrete provider/model. This
+is the same headless runtime that backs in-session sub-agents; Fleet is the
+durable layer on top. See [docs/FLEET.md](docs/FLEET.md).
+
+## Safety
+
+CodeWhale edits files and runs commands, so the safety posture is part of the
+product, not an afterthought.
+
+- **Three modes.** Plan (read-only investigation), Agent (executes, asks per
+  action), and YOLO (auto-approve). Switch with `Tab` or `/mode`.
+- **Approval-gated tools.** A `.codewhale/hooks.toml` hook system can allow,
+  deny, or ask before any tool call, and the exec policy decides whether a
+  command runs, needs approval, or is forbidden outright.
+- **OS sandboxing.** Seatbelt on macOS, Landlock plus a seccomp syscall filter
+  on Linux, and bubblewrap (bwrap) where it's available.
+- **Rollback.** Side-git snapshots live outside your repo's `.git`, so
+  `/restore` can undo a turn without ever touching your real history.
+
+## Features
+
+- **Persistent goal loop.** Set an objective with `/goal` and the agent keeps
+  working across turns — reading, editing, running, checking results — until the
+  goal is done, it's blocked, or you stop it. No turn cap. `/task` tracks
+  background tasks; the Work sidebar shows live plan and checklist state.
+- **Durable sessions.** Persist across restarts and system sleep; a task that
+  takes forty tool calls survives the forty-first.
+- **Headless mode.** `codewhale exec` with `--allowed-tools`,
+  `--disallowed-tools` (deny wins), `--max-turns`, and `--append-system-prompt`
+  for scripts and CI.
+- **MCP, bidirectionally.** Consume tools from external MCP servers, or expose
+  CodeWhale itself as an MCP server via `codewhale mcp`.
+- **Skills.** Reusable workflows in `~/.codewhale/skills/`, loaded with
+  `/skills`.
+- **Embedded everywhere.** HTTP/SSE and ACP runtime APIs, a VS Code extension,
+  and Telegram/Feishu bridges (Weixin experimental).
+
+## How instructions are ranked
 
 As a project evolves, the instructions pile up and they inevitably conflict: the
 original spec, a later refactor that contradicts it, stale memory, a previous
@@ -211,47 +244,34 @@ code (there are tests asserting it can't drift):
 4. **Live evidence** — what the tools actually returned. Ground truth; the model
    may be ordered past it, but it may never report a fact that isn't there.
 
-When two instructions conflict, each yields to the one above. The model isn't
-renegotiating the stack each turn — the order is fixed, so it can act on the
-mountain of overlapping context without being paralyzed or quietly wrong. And
-because the law lives in the harness, not the model, swapping models keeps the
-structure intact.
+When two instructions conflict, each yields to the one above. Because the law
+lives in the harness, not the model, swapping models keeps the structure intact.
 
-## Features
+## Where details live
 
-- **Three modes.** Plan (read-only investigation), Agent (executes, asks per
-  action), YOLO (auto-approve). Switch with `Tab` or `/mode`.
-- **Persistent goal loop.** Set an objective with `/goal` and the agent keeps
-  working across turns — reading, editing, running, checking results — until the
-  goal is done, it's blocked, or you stop it. No turn cap. `/task` tracks
-  background tasks; the Work sidebar shows live plan and checklist state.
-- **Sub-agents.** Independent investigations and implementation slices run in
-  parallel with provider-specific fanout caps, clean context, and
-  provider-aware model tiers (big vs. cheap).
-- **Broad provider support.** DeepSeek, GLM, Claude, GPT, Kimi, MiniMax,
-  OpenRouter, and local vLLM/SGLang/Ollama, all behind the same runtime and tools. Switch
-  mid-session with `/provider` and `/model`.
-- **Rollback.** Side-git snapshots and `/restore`, kept outside your repo's
-  `.git` — undoing a turn never touches your history.
-- **Sandboxing & approval gates.** OS sandboxing (bwrap, Landlock, Seatbelt,
-  seccomp) and a `.codewhale/hooks.toml` hook system that can allow, deny, or ask
-  before any tool call.
-- **Durable sessions.** Persist across restarts and system sleep; a task that
-  takes forty tool calls survives the forty-first.
-- **Headless mode.** `codewhale exec` with `--allowed-tools`, `--disallowed-tools`
-  (deny wins), `--max-turns`, and `--append-system-prompt` for scripts and CI.
-- **MCP, bidirectionally.** Consume tools from external servers, or expose
-  CodeWhale itself as an MCP server via `codewhale mcp`.
-- **Skills.** Reusable workflows in `~/.codewhale/skills/`, loaded with `/skills`.
-- **Embedded everywhere.** HTTP/SSE and ACP runtime APIs, a VS Code extension,
-  and Telegram/Feishu bridges (Weixin experimental).
+The README is the short version. The rest is in docs and on
+[codewhale.net](https://codewhale.net/):
+
+- [User guide](docs/GUIDE.md) · [Install guide](docs/INSTALL.md) ·
+  [Configuration](docs/CONFIGURATION.md) · [Provider registry](docs/PROVIDERS.md)
+- [Modes](docs/MODES.md) — Agent, Plan, and YOLO.
+- [Fleet](docs/FLEET.md) · [Sub-agents](docs/SUBAGENTS.md) — roles, lifecycle,
+  output contract, and recovery behavior.
+- [Architecture](docs/ARCHITECTURE.md) — crate layout, runtime flow, tool system,
+  extension points, and security model.
+- [WhaleFlow authoring](docs/WHALEFLOW_AUTHORING.md) · [MCP](docs/MCP.md) ·
+  [Runtime API](docs/RUNTIME_API.md) · [Model Lab](docs/MODEL_LAB.md)
+- [Keybindings](docs/KEYBINDINGS.md) · [Sandbox & approvals](docs/SANDBOX.md)
+  · [Accessibility](docs/ACCESSIBILITY.md) · [Docker](docs/DOCKER.md)
+  · [Memory](docs/MEMORY.md)
+- [Full docs index](docs) — everything else.
 
 ## The project
 
 CodeWhale started as one person's DeepSeek side project. Developers from
 countries all over the world have made it what it is — the contributor list on
-every release is the proof. The project is built in the open, issues are
-triaged in the open, and releases cut from `main`.
+every release is the proof. The project is built in the open, issues are triaged
+in the open, and releases cut from `main`.
 
 Something I learned early in teaching: **all feedback is a gift.** Issues, PRs,
 bug reports, feature ideas, "first PR"s, and curious questions all count as real
@@ -268,26 +288,6 @@ most useful thing you can tell the project.
 - [Contributors](docs/CONTRIBUTORS.md) — the people who've shaped CodeWhale.
 
 Support: [Buy me a coffee](https://www.buymeacoffee.com/hmbown).
-
-## Where details live
-
-The README is the short version. The rest is in docs and on
-[codewhale.net](https://codewhale.net/):
-
-- [User guide](docs/GUIDE.md) · [Install guide](docs/INSTALL.md) ·
-  [Configuration](docs/CONFIGURATION.md) · [Provider registry](docs/PROVIDERS.md)
-- [Modes](docs/MODES.md) — Agent, Plan, and YOLO.
-- [Sub-agents](docs/SUBAGENTS.md) — roles, lifecycle, output contract, and
-  recovery behavior.
-- [Architecture](docs/ARCHITECTURE.md) — crate layout, runtime flow, tool system,
-  extension points, and security model.
-- [Fleet](docs/FLEET.md) · [WhaleFlow authoring](docs/WHALEFLOW_AUTHORING.md) ·
-  [MCP](docs/MCP.md) · [Runtime API](docs/RUNTIME_API.md) ·
-  [Model Lab](docs/MODEL_LAB.md)
-- [Keybindings](docs/KEYBINDINGS.md) · [Sandbox & approvals](docs/SANDBOX.md)
-  · [Accessibility](docs/ACCESSIBILITY.md) · [Docker](docs/DOCKER.md)
-  · [Memory](docs/MEMORY.md)
-- [Full docs index](docs) — everything else.
 
 ## Thanks
 

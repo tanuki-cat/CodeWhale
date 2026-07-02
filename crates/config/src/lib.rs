@@ -1,6 +1,20 @@
 pub mod auth_source;
+pub mod catalog;
+mod harness;
+pub mod model_reference;
+pub mod models_dev;
+pub mod pricing;
 pub mod provider;
+mod provider_defaults;
+mod provider_kind;
 pub mod route;
+pub use harness::{
+    HarnessCompactionStrategy, HarnessPosture, HarnessPostureKind, HarnessProfile,
+    HarnessSafetyPosture, HarnessToolSurface, built_in_harness_profiles,
+};
+pub use model_reference::{Modality, ModelReferenceCard, ModelReferenceDatabase};
+pub(crate) use provider_defaults::*;
+pub use provider_kind::ProviderKind;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -25,277 +39,21 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const PERMISSIONS_FILE_NAME: &str = "permissions.toml";
-const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-pro";
-const DEFAULT_NVIDIA_NIM_MODEL: &str = "deepseek-ai/deepseek-v4-pro";
-const DEFAULT_NVIDIA_NIM_FLASH_MODEL: &str = "deepseek-ai/deepseek-v4-flash";
-const DEFAULT_OPENAI_MODEL: &str = "deepseek-v4-pro";
-const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/beta";
-const DEFAULT_NVIDIA_NIM_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
-const DEFAULT_OPENAI_CODEX_MODEL: &str = "gpt-5.5";
-const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
-const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
-const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
-const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_ATLASCLOUD_MODEL: &str = "deepseek-ai/deepseek-v4-flash";
-const DEFAULT_ATLASCLOUD_BASE_URL: &str = "https://api.atlascloud.ai/v1";
-const DEFAULT_WANJIE_ARK_MODEL: &str = "deepseek-reasoner";
-const DEFAULT_WANJIE_ARK_BASE_URL: &str = "https://maas-openapi.wanjiedata.com/api/v1";
-const DEFAULT_VOLCENGINE_MODEL: &str = "DeepSeek-V4-Pro";
-const DEFAULT_VOLCENGINE_BASE_URL: &str = "https://ark.cn-beijing.volces.com/api/coding/v3";
-const DEFAULT_OPENROUTER_MODEL: &str = "deepseek/deepseek-v4-pro";
-const DEFAULT_OPENROUTER_FLASH_MODEL: &str = "deepseek/deepseek-v4-flash";
-const OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL: &str = "arcee-ai/trinity-large-thinking";
-const OPENROUTER_GEMMA_4_31B_MODEL: &str = "google/gemma-4-31b-it";
-const OPENROUTER_GEMMA_4_26B_A4B_MODEL: &str = "google/gemma-4-26b-a4b-it";
-const OPENROUTER_GLM_5_1_MODEL: &str = "z-ai/glm-5.1";
-const OPENROUTER_GLM_5_2_MODEL: &str = "z-ai/glm-5.2";
-const OPENROUTER_KIMI_K2_7_CODE_MODEL: &str = "moonshotai/kimi-k2.7-code";
-const OPENROUTER_KIMI_K2_6_MODEL: &str = "moonshotai/kimi-k2.6";
-const OPENROUTER_MINIMAX_M3_MODEL: &str = "minimax/minimax-m3";
-const OPENROUTER_MINIMAX_2_7_MODEL: &str = "minimax/minimax-2.7";
-const OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL: &str =
-    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
-const OPENROUTER_QWEN_3_6_FLASH_MODEL: &str = "qwen/qwen3.6-flash";
-const OPENROUTER_QWEN_3_6_35B_A3B_MODEL: &str = "qwen/qwen3.6-35b-a3b";
-const OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL: &str = "qwen/qwen3.6-max-preview";
-const OPENROUTER_QWEN_3_6_27B_MODEL: &str = "qwen/qwen3.6-27b";
-const OPENROUTER_QWEN_3_6_PLUS_MODEL: &str = "qwen/qwen3.6-plus";
-const OPENROUTER_QWEN_3_7_MAX_MODEL: &str = "qwen/qwen3.7-max";
-const OPENROUTER_TENCENT_HY3_PREVIEW_MODEL: &str = "tencent/hy3-preview";
-const OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL: &str = "xiaomi/mimo-v2.5-pro";
-const OPENROUTER_XIAOMI_MIMO_V2_5_MODEL: &str = "xiaomi/mimo-v2.5";
-const DEFAULT_XIAOMI_MIMO_MODEL: &str = "mimo-v2.5-pro";
-const XIAOMI_MIMO_V2_5_PRO_ULTRASPEED_MODEL: &str = "mimo-v2.5-pro-ultraspeed";
-const XIAOMI_MIMO_V2_5_OMNI_MODEL: &str = "mimo-v2.5";
-const XIAOMI_MIMO_ASR_MODEL: &str = "mimo-v2.5-asr";
-const XIAOMI_MIMO_TTS_MODEL: &str = "mimo-v2.5-tts";
-const XIAOMI_MIMO_TTS_VOICE_DESIGN_MODEL: &str = "mimo-v2.5-tts-voicedesign";
-const XIAOMI_MIMO_TTS_VOICE_CLONE_MODEL: &str = "mimo-v2.5-tts-voiceclone";
-const XIAOMI_MIMO_V2_TTS_MODEL: &str = "mimo-v2-tts";
-const DEFAULT_NOVITA_MODEL: &str = "deepseek/deepseek-v4-pro";
-const DEFAULT_NOVITA_FLASH_MODEL: &str = "deepseek/deepseek-v4-flash";
-const DEFAULT_FIREWORKS_MODEL: &str = "accounts/fireworks/models/deepseek-v4-pro";
-const DEFAULT_SILICONFLOW_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
-const DEFAULT_SILICONFLOW_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
-const DEFAULT_ARCEE_MODEL: &str = "trinity-large-thinking";
-const ARCEE_TRINITY_LARGE_PREVIEW_MODEL: &str = "trinity-large-preview";
-const ARCEE_TRINITY_MINI_MODEL: &str = "trinity-mini";
-const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.7-code";
-const MOONSHOT_KIMI_K2_6_MODEL: &str = "kimi-k2.6";
-const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
-const DEFAULT_KIMI_CODE_MODEL: &str = "kimi-for-coding";
-const DEFAULT_KIMI_CODE_BASE_URL: &str = "https://api.kimi.com/coding/v1";
-const DEFAULT_SGLANG_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
-const DEFAULT_SGLANG_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
-const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
-const XIAOMI_MIMO_PAY_AS_YOU_GO_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
-const DEFAULT_XIAOMI_MIMO_BASE_URL: &str = "https://token-plan-sgp.xiaomimimo.com/v1";
-const XIAOMI_MIMO_TOKEN_PLAN_CN_BASE_URL: &str = "https://token-plan-cn.xiaomimimo.com/v1";
-const XIAOMI_MIMO_TOKEN_PLAN_SGP_BASE_URL: &str = DEFAULT_XIAOMI_MIMO_BASE_URL;
-const XIAOMI_MIMO_TOKEN_PLAN_AMS_BASE_URL: &str = "https://token-plan-ams.xiaomimimo.com/v1";
-const DEFAULT_NOVITA_BASE_URL: &str = "https://api.novita.ai/openai/v1";
-const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
-const DEFAULT_SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.com/v1";
-const DEFAULT_SILICONFLOW_CN_BASE_URL: &str = "https://api.siliconflow.cn/v1";
-const DEFAULT_ARCEE_BASE_URL: &str = "https://api.arcee.ai/api/v1";
-const DEFAULT_HUGGINGFACE_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
-const DEFAULT_HUGGINGFACE_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
-const DEFAULT_HUGGINGFACE_BASE_URL: &str = "https://router.huggingface.co/v1";
-const DEFAULT_TOGETHER_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
-const DEFAULT_TOGETHER_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
-const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
-const DEFAULT_QIANFAN_MODEL: &str = "ernie-4.0-turbo-8k";
-const DEFAULT_QIANFAN_BASE_URL: &str = "https://api.baiduqianfan.ai/v1";
-const DEFAULT_SGLANG_BASE_URL: &str = "http://localhost:30000/v1";
-const DEFAULT_VLLM_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
-const DEFAULT_VLLM_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
-const DEFAULT_VLLM_BASE_URL: &str = "http://localhost:8000/v1";
-const DEFAULT_OLLAMA_MODEL: &str = "deepseek-coder:1.3b";
-const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
-
-// Z.ai (GLM Coding Plan) defaults
-const DEFAULT_ZAI_MODEL: &str = "GLM-5.2";
-const ZAI_GLM_5_1_MODEL: &str = "GLM-5.1";
-// GLM-5.2 is both the default and a named tier; the alias arm resolves the
-// `glm-5.2` spelling to DEFAULT_ZAI_MODEL directly, so this constant is only
-// referenced by the invariant test below.
-#[allow(dead_code)]
-const ZAI_GLM_5_2_MODEL: &str = "GLM-5.2";
-const ZAI_GLM_5_TURBO_MODEL: &str = "GLM-5-Turbo";
-const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
-// StepFun / StepFlash defaults
-const DEFAULT_STEPFUN_MODEL: &str = "step-3.7-flash";
-const DEFAULT_STEPFUN_BASE_URL: &str = "https://api.stepfun.ai/v1";
-// MiniMax defaults
-const DEFAULT_MINIMAX_MODEL: &str = "MiniMax-M3";
-const MINIMAX_M2_7_MODEL: &str = "MiniMax-M2.7";
-const MINIMAX_M2_7_HIGHSPEED_MODEL: &str = "MiniMax-M2.7-highspeed";
-const MINIMAX_M2_5_MODEL: &str = "MiniMax-M2.5";
-const MINIMAX_M2_5_HIGHSPEED_MODEL: &str = "MiniMax-M2.5-highspeed";
-const MINIMAX_M2_1_MODEL: &str = "MiniMax-M2.1";
-const MINIMAX_M2_1_HIGHSPEED_MODEL: &str = "MiniMax-M2.1-highspeed";
-const MINIMAX_M2_MODEL: &str = "MiniMax-M2";
-const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
-const DEFAULT_DEEPINFRA_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
-const DEFAULT_DEEPINFRA_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
-const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum ProviderKind {
-    #[default]
-    #[serde(
-        alias = "deepseek-cn",
-        alias = "deepseek_china",
-        alias = "deepseekcn",
-        alias = "deepseek-china"
-    )]
-    Deepseek,
-    NvidiaNim,
-    #[serde(alias = "open-ai")]
-    Openai,
-    Atlascloud,
-    #[serde(
-        alias = "wanjie",
-        alias = "wanjie_ark",
-        alias = "ark-wanjie",
-        alias = "ark_wanjie",
-        alias = "wanjie-maas",
-        alias = "wanjie_maas"
-    )]
-    WanjieArk,
-    #[serde(alias = "volcengine-ark", alias = "volcengine_ark", alias = "ark")]
-    Volcengine,
-    Openrouter,
-    #[serde(alias = "mimo", alias = "xiaomi", alias = "xiaomi_mimo")]
-    XiaomiMimo,
-    Novita,
-    Fireworks,
-    #[serde(alias = "silicon-flow", alias = "silicon_flow")]
-    Siliconflow,
-    #[serde(alias = "arcee-ai", alias = "arcee_ai")]
-    Arcee,
-    #[serde(alias = "siliconflow-cn", alias = "siliconflow-CN")]
-    SiliconflowCN,
-    Moonshot,
-    Sglang,
-    Vllm,
-    Ollama,
-    #[serde(alias = "hugging-face", alias = "hugging_face", alias = "hf")]
-    Huggingface,
-    #[serde(alias = "together-ai", alias = "together_ai")]
-    Together,
-    #[serde(alias = "baidu-qianfan", alias = "baidu_qianfan", alias = "baidu")]
-    Qianfan,
-    #[serde(
-        alias = "openai-codex",
-        alias = "openai_codex",
-        alias = "codex",
-        alias = "chatgpt",
-        alias = "chatgpt-codex",
-        alias = "chatgpt_codex"
-    )]
-    OpenaiCodex,
-    #[serde(alias = "claude")]
-    Anthropic,
-    #[serde(alias = "z-ai", alias = "z_ai", alias = "z.ai")]
-    Zai,
-    #[serde(
-        alias = "step-fun",
-        alias = "step_fun",
-        alias = "stepfun",
-        alias = "stepflash",
-        alias = "step-flash",
-        alias = "step_flash"
-    )]
-    Stepfun,
-    #[serde(alias = "mini-max", alias = "mini_max", alias = "minimax")]
-    Minimax,
-    #[serde(alias = "deep-infra", alias = "deep_infra")]
-    Deepinfra,
-}
-
-impl ProviderKind {
-    pub const ALL: [Self; 26] = [
-        Self::Deepseek,
-        Self::NvidiaNim,
-        Self::Openai,
-        Self::Atlascloud,
-        Self::WanjieArk,
-        Self::Volcengine,
-        Self::Openrouter,
-        Self::XiaomiMimo,
-        Self::Novita,
-        Self::Fireworks,
-        Self::Siliconflow,
-        Self::Arcee,
-        Self::SiliconflowCN,
-        Self::Moonshot,
-        Self::Sglang,
-        Self::Vllm,
-        Self::Ollama,
-        Self::Huggingface,
-        Self::Together,
-        Self::Qianfan,
-        Self::OpenaiCodex,
-        Self::Anthropic,
-        Self::Zai,
-        Self::Stepfun,
-        Self::Minimax,
-        Self::Deepinfra,
-    ];
-
-    #[must_use]
-    pub fn all() -> &'static [Self] {
-        &Self::ALL
-    }
-
-    #[must_use]
-    pub fn names_hint() -> String {
-        Self::all()
-            .iter()
-            .map(|provider| provider.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        self.provider().id()
-    }
-
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        let trimmed = value.trim();
-        provider::all_providers()
-            .iter()
-            .find(|p| {
-                trimmed.eq_ignore_ascii_case(p.id())
-                    || p.aliases().iter().any(|a| trimmed.eq_ignore_ascii_case(a))
-            })
-            .map(|p| p.kind())
-    }
-
-    #[must_use]
-    pub fn is_siliconflow(self) -> bool {
-        matches!(self, Self::Siliconflow | Self::SiliconflowCN)
-    }
-
-    /// Return the built-in metadata entry for this provider.
-    ///
-    /// This is a metadata foundation only; runtime routing still resolves
-    /// through [`ConfigToml::resolve_runtime_options`].
-    #[must_use]
-    pub fn provider(self) -> &'static dyn provider::Provider {
-        provider::provider_for_kind(self)
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderConfigToml {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    #[serde(
+        default,
+        alias = "contextWindow",
+        alias = "context_window_tokens",
+        alias = "contextWindowTokens",
+        alias = "context_length",
+        alias = "contextLength"
+    )]
+    pub context_window: Option<u32>,
     pub mode: Option<String>,
     pub auth_mode: Option<String>,
     pub insecure_skip_tls_verify: Option<bool>,
@@ -310,6 +68,14 @@ pub struct ProviderConfigToml {
 pub struct ProvidersToml {
     #[serde(default)]
     pub deepseek: ProviderConfigToml,
+    #[serde(
+        default,
+        alias = "deepseek-anthropic",
+        alias = "deepseekAnthropic",
+        alias = "deepseek-claude",
+        alias = "deepseek_claude"
+    )]
+    pub deepseek_anthropic: ProviderConfigToml,
     #[serde(default)]
     pub nvidia_nim: ProviderConfigToml,
     #[serde(default)]
@@ -364,7 +130,18 @@ pub struct ProvidersToml {
     pub openai_codex: ProviderConfigToml,
     #[serde(default)]
     pub anthropic: ProviderConfigToml,
-    #[serde(default, alias = "z-ai", alias = "z_ai", alias = "z.ai")]
+    #[serde(default, alias = "open-model", alias = "open_model")]
+    pub openmodel: ProviderConfigToml,
+    #[serde(
+        default,
+        alias = "z-ai",
+        alias = "z_ai",
+        alias = "z.ai",
+        alias = "zhipu",
+        alias = "zhipuai",
+        alias = "bigmodel",
+        alias = "big-model"
+    )]
     pub zai: ProviderConfigToml,
     #[serde(
         default,
@@ -380,13 +157,22 @@ pub struct ProvidersToml {
     pub minimax: ProviderConfigToml,
     #[serde(default, alias = "deep-infra", alias = "deep_infra")]
     pub deepinfra: ProviderConfigToml,
+    #[serde(default, alias = "sakana-ai", alias = "sakana_ai", alias = "fugu")]
+    pub sakana: ProviderConfigToml,
+    /// Catch-all table for the dynamic OpenAI-compatible custom provider
+    /// identity (#1519). Arbitrary `[providers.<name>]` tables are handled by
+    /// the tui-side flatten map; this named slot keeps the canonical
+    /// `ProviderKind::Custom` lookups total without leaking into another
+    /// provider's config.
+    #[serde(default)]
+    pub custom: ProviderConfigToml,
 }
 
 /// Sibling `permissions.toml` schema.
 ///
-/// This slice is intentionally ask-only: each rule is a typed condition that
-/// means "ask before this tool invocation." Typed allow/deny records and UI
-/// actions are expected to land in follow-up PRs.
+/// Each rule is a typed condition that can deny, allow, or ask before a tool
+/// invocation. UI actions that persist deny/allow rules are future work; the
+/// approval card still saves ask rules.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionsToml {
@@ -402,7 +188,39 @@ impl PermissionsToml {
 
     #[must_use]
     pub fn ruleset(&self) -> Ruleset {
-        Ruleset::user(Vec::new(), Vec::new()).with_ask_rules(self.rules.clone())
+        use codewhale_execpolicy::PermissionAction;
+        let mut denied = Vec::new();
+        let mut trusted = Vec::new();
+        let mut ask_rules = Vec::new();
+
+        for rule in &self.rules {
+            match rule.action {
+                PermissionAction::Deny => {
+                    // Command-based deny rules are promoted to denied_prefixes
+                    // so they are caught by execpolicy's deny-always-wins check.
+                    if let Some(cmd) = &rule.command {
+                        denied.push(cmd.clone());
+                    }
+                    // Always keep in ask_rules for path-based and tool-only matching.
+                    ask_rules.push(rule.clone());
+                }
+                PermissionAction::Allow => {
+                    // Command-based allow rules are promoted to trusted_prefixes
+                    // for arity-aware matching.  Path-only allow rules are
+                    // handled through ask_rules (they skip the approval prompt).
+                    if let Some(cmd) = &rule.command {
+                        trusted.push(cmd.clone());
+                    }
+                    // Keep in ask_rules so path-only allow rules also work.
+                    ask_rules.push(rule.clone());
+                }
+                PermissionAction::Ask => {
+                    ask_rules.push(rule.clone());
+                }
+            }
+        }
+
+        Ruleset::user(trusted, denied).with_ask_rules(ask_rules)
     }
 }
 
@@ -411,6 +229,7 @@ impl ProvidersToml {
     pub fn for_provider(&self, provider: ProviderKind) -> &ProviderConfigToml {
         match provider {
             ProviderKind::Deepseek => &self.deepseek,
+            ProviderKind::DeepseekAnthropic => &self.deepseek_anthropic,
             ProviderKind::NvidiaNim => &self.nvidia_nim,
             ProviderKind::Openai => &self.openai,
             ProviderKind::Atlascloud => &self.atlascloud,
@@ -432,16 +251,20 @@ impl ProvidersToml {
             ProviderKind::Qianfan => &self.qianfan,
             ProviderKind::OpenaiCodex => &self.openai_codex,
             ProviderKind::Anthropic => &self.anthropic,
+            ProviderKind::Openmodel => &self.openmodel,
             ProviderKind::Zai => &self.zai,
             ProviderKind::Stepfun => &self.stepfun,
             ProviderKind::Minimax => &self.minimax,
             ProviderKind::Deepinfra => &self.deepinfra,
+            ProviderKind::Sakana => &self.sakana,
+            ProviderKind::Custom => &self.custom,
         }
     }
 
     pub fn for_provider_mut(&mut self, provider: ProviderKind) -> &mut ProviderConfigToml {
         match provider {
             ProviderKind::Deepseek => &mut self.deepseek,
+            ProviderKind::DeepseekAnthropic => &mut self.deepseek_anthropic,
             ProviderKind::NvidiaNim => &mut self.nvidia_nim,
             ProviderKind::Openai => &mut self.openai,
             ProviderKind::Atlascloud => &mut self.atlascloud,
@@ -463,155 +286,14 @@ impl ProvidersToml {
             ProviderKind::Qianfan => &mut self.qianfan,
             ProviderKind::OpenaiCodex => &mut self.openai_codex,
             ProviderKind::Anthropic => &mut self.anthropic,
+            ProviderKind::Openmodel => &mut self.openmodel,
             ProviderKind::Zai => &mut self.zai,
             ProviderKind::Stepfun => &mut self.stepfun,
             ProviderKind::Minimax => &mut self.minimax,
             ProviderKind::Deepinfra => &mut self.deepinfra,
+            ProviderKind::Sakana => &mut self.sakana,
+            ProviderKind::Custom => &mut self.custom,
         }
-    }
-}
-
-/// Kinds of built-in harness postures.
-///
-/// A posture names the runtime strategy CodeWhale should use for a
-/// provider/model route: how much context to preload, how aggressively to lean
-/// on sub-agents, and how to balance prompt-cache stability against quick
-/// exploration. Runtime selection is wired in later v0.9 slices; this config
-/// model intentionally keeps the policy data explicit first.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum HarnessPostureKind {
-    /// Full-featured default: rich constitution, broad tool catalog, and normal
-    /// sub-agent posture.
-    #[default]
-    Standard,
-    /// Cache-heavy: deeper prompt layering and prefix-cache-oriented context.
-    CacheHeavy,
-    /// Lean: smaller starting context, faster compaction, and stronger
-    /// exploration/delegation bias.
-    Lean,
-    /// User-defined posture assembled from explicit knobs below.
-    Custom,
-}
-
-/// How this posture should approach compaction and prompt-cache stability.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum HarnessCompactionStrategy {
-    #[default]
-    Default,
-    PrefixCache,
-    Aggressive,
-}
-
-/// Which tool catalog shape this posture prefers.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum HarnessToolSurface {
-    #[default]
-    Full,
-    ReadOnly,
-    Auto,
-}
-
-/// Safety posture applied when the runtime consumes a harness profile.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum HarnessSafetyPosture {
-    #[default]
-    Standard,
-    Strict,
-    Permissive,
-}
-
-/// A concrete harness posture with policy knobs.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct HarnessPosture {
-    /// Named posture kind.
-    #[serde(default)]
-    pub kind: HarnessPostureKind,
-    /// Maximum number of concurrent sub-agents (0 = runtime default).
-    #[serde(default)]
-    pub max_subagents: usize,
-    /// Prefer search-based/on-demand context over always-on documentation.
-    #[serde(default)]
-    pub prefer_codebase_search: bool,
-    /// Compaction and prompt-cache strategy.
-    #[serde(default)]
-    pub compaction_strategy: HarnessCompactionStrategy,
-    /// Preferred tool catalog shape.
-    #[serde(default)]
-    pub tool_surface: HarnessToolSurface,
-    /// Safety posture for runtime consumers.
-    #[serde(default)]
-    pub safety_posture: HarnessSafetyPosture,
-}
-
-impl Default for HarnessPosture {
-    fn default() -> Self {
-        Self {
-            kind: HarnessPostureKind::Standard,
-            max_subagents: 0,
-            prefer_codebase_search: false,
-            compaction_strategy: HarnessCompactionStrategy::default(),
-            tool_surface: HarnessToolSurface::default(),
-            safety_posture: HarnessSafetyPosture::default(),
-        }
-    }
-}
-
-impl HarnessPosture {
-    /// A cache-heavy posture tuned for DeepSeek V4 / MiMo-style models.
-    #[must_use]
-    pub fn cache_heavy() -> Self {
-        Self {
-            kind: HarnessPostureKind::CacheHeavy,
-            max_subagents: 10,
-            prefer_codebase_search: false,
-            compaction_strategy: HarnessCompactionStrategy::PrefixCache,
-            tool_surface: HarnessToolSurface::Full,
-            safety_posture: HarnessSafetyPosture::Standard,
-        }
-    }
-
-    /// A lean posture for smaller-context or weaker tool-use models.
-    #[must_use]
-    pub fn lean() -> Self {
-        Self {
-            kind: HarnessPostureKind::Lean,
-            max_subagents: 20,
-            prefer_codebase_search: true,
-            compaction_strategy: HarnessCompactionStrategy::Aggressive,
-            tool_surface: HarnessToolSurface::Full,
-            safety_posture: HarnessSafetyPosture::Standard,
-        }
-    }
-}
-
-/// A harness profile binds a posture to a provider route and model pattern.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct HarnessProfile {
-    /// Provider route this profile applies to, e.g. "deepseek" or
-    /// "xiaomi-mimo".
-    pub provider_route: String,
-    /// Regex or glob pattern for model names, e.g. "deepseek-v4.*".
-    pub model_pattern: String,
-    /// The posture to apply.
-    #[serde(default)]
-    pub posture: HarnessPosture,
-}
-
-impl HarnessProfile {
-    /// Return true when this profile applies to the provider/model route.
-    ///
-    /// This is a pure config helper: matching a profile must not mutate runtime
-    /// provider selection, prompts, auth, tools, context, or persisted config.
-    #[must_use]
-    pub fn matches_route(&self, provider_route: &str, model: &str) -> bool {
-        provider_routes_equal(&self.provider_route, provider_route)
-            && wildcard_pattern_matches(&self.model_pattern, model)
     }
 }
 
@@ -651,6 +333,10 @@ pub struct ConfigToml {
     /// to a permissive default that mirrors pre-v0.7.0 behavior.
     #[serde(default)]
     pub network: Option<NetworkPolicyToml>,
+    /// Verifier-preview behavior (#2093). When absent, verifier tools keep the
+    /// shipped defaults: disabled automatic preview and hunt verdict mapping.
+    #[serde(default)]
+    pub verifier: Option<VerifierConfigToml>,
     /// Community skill installer settings (#140). Mirrors
     /// [`SkillsToml`] from the TUI side; the dispatcher consults
     /// `registry_url` when running `deepseek skill install`.
@@ -689,6 +375,7 @@ enum ProviderConfigField {
     ApiKey,
     BaseUrl,
     Model,
+    ContextWindow,
     Mode,
     AuthMode,
     InsecureSkipTlsVerify,
@@ -702,6 +389,7 @@ impl ProviderConfigField {
             "api_key" => Self::ApiKey,
             "base_url" => Self::BaseUrl,
             "model" => Self::Model,
+            "context_window" | "context_window_tokens" => Self::ContextWindow,
             "mode" => Self::Mode,
             "auth_mode" => Self::AuthMode,
             "insecure_skip_tls_verify" => Self::InsecureSkipTlsVerify,
@@ -716,6 +404,7 @@ impl ProviderConfigField {
             Self::ApiKey => "api_key",
             Self::BaseUrl => "base_url",
             Self::Model => "model",
+            Self::ContextWindow => "context_window",
             Self::Mode => "mode",
             Self::AuthMode => "auth_mode",
             Self::InsecureSkipTlsVerify => "insecure_skip_tls_verify",
@@ -752,6 +441,7 @@ fn get_provider_config_value(
         ProviderConfigField::ApiKey => config.api_key.clone(),
         ProviderConfigField::BaseUrl => config.base_url.clone(),
         ProviderConfigField::Model => config.model.clone(),
+        ProviderConfigField::ContextWindow => config.context_window.map(|value| value.to_string()),
         ProviderConfigField::Mode => config.mode.clone(),
         ProviderConfigField::AuthMode => config.auth_mode.clone(),
         ProviderConfigField::InsecureSkipTlsVerify => config
@@ -773,6 +463,16 @@ fn get_provider_config_display_value(
         }
         _ => get_provider_config_value(config, field),
     }
+}
+
+fn parse_context_window(value: &str) -> Result<u32> {
+    let parsed = value.trim().parse::<u32>().with_context(|| {
+        format!("invalid context_window '{value}': expected a positive token count")
+    })?;
+    if parsed == 0 {
+        bail!("context_window must be greater than 0");
+    }
+    Ok(parsed)
 }
 
 fn set_provider_config_value(
@@ -802,6 +502,10 @@ fn set_provider_config_value(
             if provider == ProviderKind::Deepseek {
                 config.default_text_model = Some(value);
             }
+        }
+        ProviderConfigField::ContextWindow => {
+            config.providers.for_provider_mut(provider).context_window =
+                Some(parse_context_window(value)?);
         }
         ProviderConfigField::Mode => {
             config.providers.for_provider_mut(provider).mode = Some(value.to_string());
@@ -853,6 +557,9 @@ fn unset_provider_config_value(
                 config.default_text_model = None;
             }
         }
+        ProviderConfigField::ContextWindow => {
+            config.providers.for_provider_mut(provider).context_window = None;
+        }
         ProviderConfigField::Mode => {
             config.providers.for_provider_mut(provider).mode = None;
         }
@@ -902,6 +609,12 @@ fn insert_provider_config_values(
         out.insert(
             provider_config_key(provider, ProviderConfigField::Model),
             v.clone(),
+        );
+    }
+    if let Some(v) = config.context_window {
+        out.insert(
+            provider_config_key(provider, ProviderConfigField::ContextWindow),
+            v.to_string(),
         );
     }
     if let Some(v) = config.mode.as_ref() {
@@ -963,95 +676,6 @@ impl ConfigToml {
     pub fn resolve_hotbar_bindings(&self, known_action_ids: &[&str]) -> HotbarConfigResolution {
         resolve_hotbar_bindings(self.hotbar.as_deref(), known_action_ids)
     }
-}
-
-/// Built-in profile seeds for common provider/model families.
-///
-/// User-configured profiles are always checked first; these seeds only provide
-/// a stable resolver result when config has no narrower match.
-#[must_use]
-pub fn built_in_harness_profiles() -> &'static [HarnessProfile] {
-    static PROFILES: OnceLock<Vec<HarnessProfile>> = OnceLock::new();
-    PROFILES.get_or_init(|| {
-        vec![
-            HarnessProfile {
-                provider_route: "deepseek".to_string(),
-                model_pattern: "deepseek-v4*".to_string(),
-                posture: HarnessPosture::cache_heavy(),
-            },
-            HarnessProfile {
-                provider_route: "xiaomi-mimo".to_string(),
-                model_pattern: "mimo-v2.5*".to_string(),
-                posture: HarnessPosture::cache_heavy(),
-            },
-            HarnessProfile {
-                provider_route: "arcee".to_string(),
-                model_pattern: "trinity-large-thinking".to_string(),
-                posture: HarnessPosture::cache_heavy(),
-            },
-            HarnessProfile {
-                provider_route: "huggingface".to_string(),
-                model_pattern: "*".to_string(),
-                posture: HarnessPosture::lean(),
-            },
-            HarnessProfile {
-                provider_route: "sglang".to_string(),
-                model_pattern: "*".to_string(),
-                posture: HarnessPosture::lean(),
-            },
-            HarnessProfile {
-                provider_route: "vllm".to_string(),
-                model_pattern: "*".to_string(),
-                posture: HarnessPosture::lean(),
-            },
-            HarnessProfile {
-                provider_route: "ollama".to_string(),
-                model_pattern: "*".to_string(),
-                posture: HarnessPosture::lean(),
-            },
-        ]
-    })
-}
-
-fn provider_routes_equal(expected: &str, actual: &str) -> bool {
-    match (ProviderKind::parse(expected), ProviderKind::parse(actual)) {
-        (Some(expected), Some(actual)) => expected == actual,
-        _ => expected.trim().eq_ignore_ascii_case(actual.trim()),
-    }
-}
-
-fn wildcard_pattern_matches(pattern: &str, value: &str) -> bool {
-    wildcard_chars_match(
-        &pattern.chars().collect::<Vec<_>>(),
-        &value.chars().collect::<Vec<_>>(),
-    )
-}
-
-fn wildcard_chars_match(pattern: &[char], value: &[char]) -> bool {
-    let (mut pattern_idx, mut value_idx) = (0, 0);
-    let mut star_idx: Option<usize> = None;
-    let mut star_value_idx = 0;
-
-    while value_idx < value.len() {
-        if pattern_idx < pattern.len()
-            && (pattern[pattern_idx] == '?' || pattern[pattern_idx] == value[value_idx])
-        {
-            pattern_idx += 1;
-            value_idx += 1;
-        } else if pattern_idx < pattern.len() && pattern[pattern_idx] == '*' {
-            star_idx = Some(pattern_idx);
-            pattern_idx += 1;
-            star_value_idx = value_idx;
-        } else if let Some(star) = star_idx {
-            pattern_idx = star + 1;
-            star_value_idx += 1;
-            value_idx = star_value_idx;
-        } else {
-            return false;
-        }
-    }
-
-    pattern[pattern_idx..].iter().all(|ch| *ch == '*')
 }
 
 /// Ordered primary-plus-fallback provider list for future provider routing.
@@ -1156,6 +780,23 @@ pub fn default_hotbar_bindings() -> Vec<HotbarBinding> {
         .collect()
 }
 
+/// The default hotbar slots in on-disk (`[[hotbar]]`) form. Since #3807 an
+/// absent `hotbar` key means "hidden", so `/hotbar on` persists these explicit
+/// bindings rather than deleting the key. Kept in terms of
+/// [`default_hotbar_bindings`] so `DEFAULT_HOTBAR_ACTIONS` stays the single
+/// source of truth.
+#[must_use]
+pub fn default_hotbar_bindings_toml() -> Vec<HotbarBindingToml> {
+    default_hotbar_bindings()
+        .into_iter()
+        .map(|binding| HotbarBindingToml {
+            slot: binding.slot,
+            action: binding.action,
+            label: binding.label,
+        })
+        .collect()
+}
+
 #[must_use]
 pub fn resolve_hotbar_bindings(
     configured: Option<&[HotbarBindingToml]>,
@@ -1173,7 +814,10 @@ pub fn resolve_hotbar_bindings(
                 label: binding.label.clone(),
             })
             .collect::<Vec<_>>(),
-        None => default_hotbar_bindings(),
+        // #3807: an absent `hotbar` key means the Hotbar is hidden until the
+        // user opts in (via the setup wizard or `/hotbar on`). Only an explicit
+        // `[[hotbar]]` config produces bindings. `Some([])` stays "disabled".
+        None => Vec::new(),
     };
 
     let mut by_slot: BTreeMap<u8, HotbarBinding> = BTreeMap::new();
@@ -1459,6 +1103,12 @@ pub struct FleetProfile {
     /// Model class / route-role hint. This is data only in this slice.
     #[serde(default)]
     pub loadout: FleetLoadout,
+    /// Optional explicit model id for this profile on the active/resolved route.
+    ///
+    /// This is not an auth or endpoint selector. Provider-scoped routing still
+    /// validates the executable provider/model/wire-model decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Permission defaults requested by the profile.
     #[serde(default)]
     pub permissions: FleetProfilePermissions,
@@ -1604,6 +1254,7 @@ impl<'de> Deserialize<'de> for FleetSlot {
 pub enum FleetLoadout {
     #[default]
     Inherit,
+    Strong,
     Fast,
     Balanced,
     DeepReasoning,
@@ -1618,6 +1269,7 @@ impl FleetLoadout {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Inherit => "inherit",
+            Self::Strong => "strong",
             Self::Fast => "fast",
             Self::Balanced => "balanced",
             Self::DeepReasoning => "deep-reasoning",
@@ -1632,6 +1284,7 @@ impl FleetLoadout {
     pub fn from_name(value: &str) -> Self {
         match value.trim() {
             "inherit" | "default" | "auto" | "" => Self::Inherit,
+            "strong" => Self::Strong,
             "fast" => Self::Fast,
             "balanced" => Self::Balanced,
             "deep-reasoning" | "deep_reasoning" | "reasoning" => Self::DeepReasoning,
@@ -1829,6 +1482,40 @@ pub fn built_in_role_presets() -> BTreeMap<String, FleetRolePreset> {
     .into()
 }
 
+/// Verdict policy for the verifier-preview surface (#2093).
+///
+/// Only the hunt vocabulary is shipped today. Keeping this typed lets future
+/// policy additions reject misspellings instead of silently accepting unknown
+/// strings.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifierVerdictPolicy {
+    #[default]
+    Hunt,
+}
+
+/// On-disk schema for `[verifier]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifierConfigToml {
+    /// Enable automatic verifier preview when the runtime wires a
+    /// claim-of-done trigger. Manual `run_verifiers` remains available
+    /// regardless.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How verifier verdicts map into the goal/hunt system.
+    #[serde(default)]
+    pub verdict_policy: VerifierVerdictPolicy,
+}
+
+impl Default for VerifierConfigToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            verdict_policy: VerifierVerdictPolicy::Hunt,
+        }
+    }
+}
+
 /// On-disk schema for the `[network]` table (#135). See `config.example.toml`
 /// for documentation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1873,6 +1560,19 @@ impl Default for NetworkPolicyToml {
     }
 }
 
+/// User-defined LSP server for one file extension (used inside
+/// [`LspConfigToml::custom`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CustomLspDef {
+    /// LSP `languageId` value used in `textDocument/didOpen`.
+    pub language_id: String,
+    /// Executable to spawn.
+    pub command: String,
+    /// Arguments passed to the executable.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// On-disk schema for the `[lsp]` table (#136). See `config.example.toml`
 /// for documentation. All fields are optional so the TUI runtime can fall
 /// back to its own defaults when keys are absent.
@@ -1888,6 +1588,9 @@ pub struct LspConfigToml {
     pub include_warnings: Option<bool>,
     /// Optional override for the `language -> [cmd, ...args]` table.
     pub servers: Option<BTreeMap<String, Vec<String>>>,
+    /// User-defined LSP servers for file extensions not in the built-in
+    /// registry. Keyed by extension (e.g. `"php"`, `"rb"`).
+    pub custom: Option<BTreeMap<String, CustomLspDef>>,
 }
 
 impl ConfigToml {
@@ -2227,6 +1930,7 @@ impl ConfigToml {
         } else {
             configured_base_url.unwrap_or_else(|| match provider {
                 ProviderKind::Deepseek => DEFAULT_DEEPSEEK_BASE_URL.to_string(),
+                ProviderKind::DeepseekAnthropic => DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL.to_string(),
                 ProviderKind::NvidiaNim => DEFAULT_NVIDIA_NIM_BASE_URL.to_string(),
                 ProviderKind::Openai => DEFAULT_OPENAI_BASE_URL.to_string(),
                 ProviderKind::Atlascloud => DEFAULT_ATLASCLOUD_BASE_URL.to_string(),
@@ -2254,10 +1958,16 @@ impl ConfigToml {
                 ProviderKind::Qianfan => DEFAULT_QIANFAN_BASE_URL.to_string(),
                 ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_BASE_URL.to_string(),
                 ProviderKind::Anthropic => DEFAULT_ANTHROPIC_BASE_URL.to_string(),
+                ProviderKind::Openmodel => DEFAULT_OPENMODEL_BASE_URL.to_string(),
                 ProviderKind::Zai => DEFAULT_ZAI_BASE_URL.to_string(),
                 ProviderKind::Stepfun => DEFAULT_STEPFUN_BASE_URL.to_string(),
                 ProviderKind::Minimax => DEFAULT_MINIMAX_BASE_URL.to_string(),
                 ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL.to_string(),
+                ProviderKind::Sakana => DEFAULT_SAKANA_BASE_URL.to_string(),
+                // The custom provider has no built-in endpoint; fall back to its
+                // descriptor placeholder so the lookup is total. Real custom
+                // routes always supply a configured base_url before this point.
+                ProviderKind::Custom => provider.provider().default_base_url().to_string(),
             })
         };
         // CLI flag wins outright. Otherwise: config-file → injected secrets/env.
@@ -2753,13 +2463,13 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
         OPENROUTER_MINIMAX_M3_MODEL | "minimax-m3" | "minimax-m-3" => {
             Some(OPENROUTER_MINIMAX_M3_MODEL)
         }
-        OPENROUTER_MINIMAX_2_7_MODEL
+        OPENROUTER_MINIMAX_M2_7_MODEL
         | "minimax-2.7"
         | "minimax-2-7"
         | "minimax-m2.7"
         | "minimax-m2-7"
         | "minimax-m-2.7"
-        | "minimax-m-2-7" => Some(OPENROUTER_MINIMAX_2_7_MODEL),
+        | "minimax-m-2-7" => Some(OPENROUTER_MINIMAX_M2_7_MODEL),
         OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL
         | "nemotron-3-nano-omni"
         | "nemotron-3-nano-omni-reasoning" => Some(OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL),
@@ -2803,6 +2513,7 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
 fn default_model_for_provider(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Deepseek => DEFAULT_DEEPSEEK_MODEL,
+        ProviderKind::DeepseekAnthropic => DEFAULT_DEEPSEEK_ANTHROPIC_MODEL,
         ProviderKind::NvidiaNim => DEFAULT_NVIDIA_NIM_MODEL,
         ProviderKind::Openai => DEFAULT_OPENAI_MODEL,
         ProviderKind::Atlascloud => DEFAULT_ATLASCLOUD_MODEL,
@@ -2823,16 +2534,21 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Qianfan => DEFAULT_QIANFAN_MODEL,
         ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_MODEL,
         ProviderKind::Anthropic => DEFAULT_ANTHROPIC_MODEL,
+        ProviderKind::Openmodel => DEFAULT_OPENMODEL_MODEL,
         ProviderKind::Zai => DEFAULT_ZAI_MODEL,
         ProviderKind::Stepfun => DEFAULT_STEPFUN_MODEL,
         ProviderKind::Minimax => DEFAULT_MINIMAX_MODEL,
         ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_MODEL,
+        ProviderKind::Sakana => DEFAULT_SAKANA_MODEL,
+        // No built-in default model; the registry placeholder keeps this total.
+        ProviderKind::Custom => provider.provider().default_model(),
     }
 }
 
 fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Deepseek => DEFAULT_DEEPSEEK_BASE_URL,
+        ProviderKind::DeepseekAnthropic => DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL,
         ProviderKind::NvidiaNim => DEFAULT_NVIDIA_NIM_BASE_URL,
         ProviderKind::Openai => DEFAULT_OPENAI_BASE_URL,
         ProviderKind::Atlascloud => DEFAULT_ATLASCLOUD_BASE_URL,
@@ -2854,10 +2570,14 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Qianfan => DEFAULT_QIANFAN_BASE_URL,
         ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_BASE_URL,
         ProviderKind::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
+        ProviderKind::Openmodel => DEFAULT_OPENMODEL_BASE_URL,
         ProviderKind::Zai => DEFAULT_ZAI_BASE_URL,
         ProviderKind::Stepfun => DEFAULT_STEPFUN_BASE_URL,
         ProviderKind::Minimax => DEFAULT_MINIMAX_BASE_URL,
         ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL,
+        ProviderKind::Sakana => DEFAULT_SAKANA_BASE_URL,
+        // No built-in default base URL; the registry placeholder keeps this total.
+        ProviderKind::Custom => provider.provider().default_base_url(),
     }
 }
 
@@ -3633,42 +3353,92 @@ pub fn resolve_state_dir(subdir: &str) -> Result<PathBuf> {
 /// stops growing (#3240). After migration, [`resolve_state_dir`] finds the
 /// data in the primary location; the read resolver itself is unchanged.
 pub fn ensure_state_dir(subdir: &str) -> Result<PathBuf> {
+    let (dir, migration) = ensure_state_dir_with_migration(subdir)?;
+    if let Some(migration) = migration {
+        eprintln!("{}", migration.user_notice());
+    }
+    Ok(dir)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateMigrationKind {
+    Relocated,
+    Copied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateMigration {
+    pub subdir: String,
+    pub legacy_path: PathBuf,
+    pub primary_path: PathBuf,
+    pub kind: StateMigrationKind,
+}
+
+impl StateMigration {
+    pub fn user_notice(&self) -> String {
+        let action = match self.kind {
+            StateMigrationKind::Relocated => "relocated",
+            StateMigrationKind::Copied => "copied",
+        };
+        let legacy_detail = match self.kind {
+            StateMigrationKind::Relocated => {
+                "The legacy .deepseek copy for this state path was removed by the move."
+            }
+            StateMigrationKind::Copied => {
+                "The legacy .deepseek copy was left in place because a direct move failed."
+            }
+        };
+
+        format!(
+            "CodeWhale migrated legacy state ({action}):\n  {} -> {}\nYour data was preserved. Use .codewhale as the canonical state location from now on.\n{legacy_detail}\nIf no other apps use it, you can remove the legacy .deepseek tree after confirming everything looks right.",
+            self.legacy_path.display(),
+            self.primary_path.display(),
+        )
+    }
+}
+
+/// Variant of [`ensure_state_dir`] that exposes whether a legacy state path was
+/// migrated. Most callers should use [`ensure_state_dir`]; this is kept for
+/// tests and future UI surfaces that want to render the notice themselves.
+pub fn ensure_state_dir_with_migration(subdir: &str) -> Result<(PathBuf, Option<StateMigration>)> {
     ensure_safe_state_subdir(subdir)?;
     let explicit_codewhale_home = codewhale_home_env_override().is_some();
     let dir = codewhale_home()?.join(subdir);
-    if !explicit_codewhale_home {
-        migrate_legacy_state_dir(&dir, subdir)?;
-    }
+    let migration = if !explicit_codewhale_home {
+        migrate_legacy_state_dir(&dir, subdir)?
+    } else {
+        None
+    };
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create {}/", dir.display()))?;
-    Ok(dir)
+    Ok((dir, migration))
 }
 
 /// One-time relocation of a legacy `~/.deepseek/<subdir>` state directory into
 /// the primary `~/.codewhale/<subdir>` location (#3240). No-op once the primary
 /// exists, for the root sentinel `"."` (a whole-tree move is owned by the
 /// config-file migration), or when no legacy directory is present.
-fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<()> {
+fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<Option<StateMigration>> {
     if primary.exists() || subdir == "." || subdir.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let legacy = match legacy_deepseek_home() {
         Ok(home) => home.join(subdir),
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(None),
     };
     if !legacy.exists() {
-        return Ok(());
+        return Ok(None);
     }
     // The primary's parent (the ~/.codewhale root) must exist for the rename.
-    if let Some(parent) = primary.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            tracing::warn!(
-                target: "config::migration",
-                "Could not create {} for state migration ({}); writing to primary anyway",
-                parent.display(),
-                err
-            );
-        }
+    if let Some(parent) = primary.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            target: "config::migration",
+            "Could not create {} for state migration ({}); writing to primary anyway",
+            parent.display(),
+            err
+        );
     }
     match std::fs::rename(&legacy, primary) {
         Ok(()) => {
@@ -3678,6 +3448,12 @@ fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<()> {
                 legacy.display(),
                 primary.display()
             );
+            return Ok(Some(StateMigration {
+                subdir: subdir.to_string(),
+                legacy_path: legacy,
+                primary_path: primary.to_path_buf(),
+                kind: StateMigrationKind::Relocated,
+            }));
         }
         Err(err) => {
             // Cross-device rename or permission issue: fall back to a
@@ -3693,6 +3469,12 @@ fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<()> {
                         legacy.display(),
                         primary.display()
                     );
+                    return Ok(Some(StateMigration {
+                        subdir: subdir.to_string(),
+                        legacy_path: legacy,
+                        primary_path: primary.to_path_buf(),
+                        kind: StateMigrationKind::Copied,
+                    }));
                 }
                 Err(copy_err) => {
                     tracing::warn!(
@@ -3706,7 +3488,7 @@ fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Recursively copy a directory tree from `src` to `dst`, creating `dst`.
@@ -4281,6 +4063,7 @@ struct EnvRuntimeOverrides {
     verbosity: Option<String>,
     http_headers: Option<BTreeMap<String, String>>,
     deepseek_base_url: Option<String>,
+    deepseek_anthropic_base_url: Option<String>,
     nvidia_base_url: Option<String>,
     openai_base_url: Option<String>,
     atlascloud_base_url: Option<String>,
@@ -4307,6 +4090,8 @@ struct EnvRuntimeOverrides {
     openai_codex_model: Option<String>,
     anthropic_base_url: Option<String>,
     anthropic_model: Option<String>,
+    openmodel_base_url: Option<String>,
+    openmodel_model: Option<String>,
     zai_base_url: Option<String>,
     zai_model: Option<String>,
     stepfun_base_url: Option<String>,
@@ -4315,6 +4100,8 @@ struct EnvRuntimeOverrides {
     minimax_model: Option<String>,
     deepinfra_base_url: Option<String>,
     deepinfra_model: Option<String>,
+    sakana_base_url: Option<String>,
+    sakana_model: Option<String>,
 }
 
 impl EnvRuntimeOverrides {
@@ -4400,6 +4187,10 @@ impl EnvRuntimeOverrides {
                 .filter(|headers| !headers.is_empty()),
             deepseek_base_url: std::env::var("CODEWHALE_BASE_URL")
                 .or_else(|_| std::env::var("DEEPSEEK_BASE_URL"))
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            deepseek_anthropic_base_url: std::env::var("DEEPSEEK_ANTHROPIC_BASE_URL")
+                .or_else(|_| std::env::var("DEEPSEEK_CLAUDE_BASE_URL"))
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             nvidia_base_url: std::env::var("NVIDIA_NIM_BASE_URL")
@@ -4502,12 +4293,25 @@ impl EnvRuntimeOverrides {
             anthropic_model: std::env::var("ANTHROPIC_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            openmodel_base_url: std::env::var("OPENMODEL_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            openmodel_model: std::env::var("OPENMODEL_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             zai_base_url: std::env::var("ZAI_BASE_URL")
                 .or_else(|_| std::env::var("Z_AI_BASE_URL"))
+                .or_else(|_| std::env::var("ZHIPU_BASE_URL"))
+                .or_else(|_| std::env::var("ZHIPUAI_BASE_URL"))
+                .or_else(|_| std::env::var("BIGMODEL_BASE_URL"))
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             zai_model: std::env::var("ZAI_MODEL")
                 .or_else(|_| std::env::var("Z_AI_MODEL"))
+                .or_else(|_| std::env::var("ZHIPU_MODEL"))
+                .or_else(|_| std::env::var("ZHIPUAI_MODEL"))
+                .or_else(|_| std::env::var("BIGMODEL_MODEL"))
+                .or_else(|_| std::env::var("GLM_MODEL"))
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             stepfun_base_url: std::env::var("STEPFUN_BASE_URL")
@@ -4528,6 +4332,12 @@ impl EnvRuntimeOverrides {
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             deepinfra_model: std::env::var("DEEPINFRA_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            sakana_base_url: std::env::var("SAKANA_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            sakana_model: std::env::var("SAKANA_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
         }
@@ -4552,6 +4362,7 @@ impl EnvRuntimeOverrides {
         // values (`providers.<name>.base_url`) still win when env is unset.
         match provider {
             ProviderKind::Deepseek => self.deepseek_base_url.clone(),
+            ProviderKind::DeepseekAnthropic => self.deepseek_anthropic_base_url.clone(),
             ProviderKind::NvidiaNim => self.nvidia_base_url.clone(),
             ProviderKind::Openai => self.openai_base_url.clone(),
             ProviderKind::Atlascloud => self.atlascloud_base_url.clone(),
@@ -4574,10 +4385,15 @@ impl EnvRuntimeOverrides {
             ProviderKind::Qianfan => self.qianfan_base_url.clone(),
             ProviderKind::OpenaiCodex => self.openai_codex_base_url.clone(),
             ProviderKind::Anthropic => self.anthropic_base_url.clone(),
+            ProviderKind::Openmodel => self.openmodel_base_url.clone(),
             ProviderKind::Zai => self.zai_base_url.clone(),
             ProviderKind::Stepfun => self.stepfun_base_url.clone(),
             ProviderKind::Minimax => self.minimax_base_url.clone(),
             ProviderKind::Deepinfra => self.deepinfra_base_url.clone(),
+            ProviderKind::Sakana => self.sakana_base_url.clone(),
+            // No dedicated CODEWHALE_CUSTOM_BASE_URL env override: a custom
+            // provider's base URL comes from its `[providers.<name>]` table.
+            ProviderKind::Custom => None,
         }
     }
 
@@ -4599,10 +4415,12 @@ impl EnvRuntimeOverrides {
             ProviderKind::Qianfan => self.qianfan_model.clone(),
             ProviderKind::OpenaiCodex => self.openai_codex_model.clone(),
             ProviderKind::Anthropic => self.anthropic_model.clone(),
+            ProviderKind::Openmodel => self.openmodel_model.clone(),
             ProviderKind::Zai => self.zai_model.clone(),
             ProviderKind::Stepfun => self.stepfun_model.clone(),
             ProviderKind::Minimax => self.minimax_model.clone(),
             ProviderKind::Deepinfra => self.deepinfra_model.clone(),
+            ProviderKind::Sakana => self.sakana_model.clone(),
             _ => None,
         }?;
 

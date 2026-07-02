@@ -143,6 +143,8 @@ pub struct ProjectContext {
     /// CodeWhale-specific repo authority/prioritization policy — distinct from
     /// the cross-agent prose in `instructions`.
     pub constitution_block: Option<String>,
+    /// Path to the repo constitution file that produced `constitution_block`.
+    pub constitution_source_path: Option<PathBuf>,
     /// Project root directory
     #[allow(dead_code)] // Part of ProjectContext public interface
     pub project_root: PathBuf,
@@ -158,6 +160,7 @@ impl ProjectContext {
             source_path: None,
             warnings: Vec::new(),
             constitution_block: None,
+            constitution_source_path: None,
             project_root,
             is_trusted: false,
         }
@@ -290,12 +293,51 @@ impl RepoConstitution {
             body.trim_end()
         )
     }
+
+    fn policy_warnings(&self, source: &Path) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Some(policy) = self.branch_policy.as_deref()
+            && branch_policy_looks_stale(policy)
+        {
+            warnings.push(format!(
+                "{} branch_policy appears stale: hard-coded release branch guidance (`{}`). Use live branch/handoff truth and AGENTS.md instead of versioned integration-lane text.",
+                source.display(),
+                policy.trim()
+            ));
+        }
+        warnings
+    }
+}
+
+fn branch_policy_looks_stale(policy: &str) -> bool {
+    let lower = policy.to_ascii_lowercase();
+    lower.contains("codex/v")
+        || ((lower.contains("integration branch") || lower.contains("not main"))
+            && contains_release_version_token(policy))
+}
+
+fn contains_release_version_token(value: &str) -> bool {
+    value
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.'))
+        .any(|token| {
+            let token = token.trim_start_matches(['v', 'V']);
+            let mut parts = token.split('.');
+            matches!(
+                (parts.next(), parts.next(), parts.next(), parts.next()),
+                (Some(major), Some(minor), Some(patch), None)
+                    if major.chars().all(|ch| ch.is_ascii_digit())
+                        && minor.chars().all(|ch| ch.is_ascii_digit())
+                        && patch.chars().all(|ch| ch.is_ascii_digit())
+            )
+        })
 }
 
 /// Discover and render `.codewhale/constitution.json` from `workspace` or, if
 /// absent, its parent directories up to the git root. Returns the rendered
 /// authority block plus any parse warnings.
-fn load_repo_constitution_block(workspace: &Path) -> (Option<String>, Vec<String>) {
+fn load_repo_constitution_block(
+    workspace: &Path,
+) -> (Option<String>, Option<PathBuf>, Vec<String>) {
     let mut warnings = Vec::new();
     let git_root = crate::project_doc::find_git_root(workspace);
     let mut current = workspace.to_path_buf();
@@ -316,23 +358,24 @@ fn load_repo_constitution_block(workspace: &Path) -> (Option<String>, Vec<String
                                 path.display()
                             ));
                         }
-                        return (Some(constitution.render_block(&path)), warnings);
+                        warnings.extend(constitution.policy_warnings(&path));
+                        return (Some(constitution.render_block(&path)), Some(path), warnings);
                     }
                     Ok(_) => {
                         warnings.push(format!(
                             "{} has no authority/verification policy; ignoring.",
                             path.display()
                         ));
-                        return (None, warnings);
+                        return (None, None, warnings);
                     }
                     Err(e) => {
                         warnings.push(format!("Failed to parse {}: {e}", path.display()));
-                        return (None, warnings);
+                        return (None, None, warnings);
                     }
                 },
                 Err(e) => {
                     warnings.push(format!("Failed to read {}: {e}", path.display()));
-                    return (None, warnings);
+                    return (None, None, warnings);
                 }
             }
         }
@@ -346,7 +389,7 @@ fn load_repo_constitution_block(workspace: &Path) -> (Option<String>, Vec<String
             _ => break,
         }
     }
-    (None, warnings)
+    (None, None, warnings)
 }
 
 #[derive(Debug, Serialize)]
@@ -768,9 +811,11 @@ fn load_project_context_with_parents_and_home(
     // an AGENTS.md. When present it takes precedence over a legacy WHALE.md.
     // Loaded last so the auto-generate fallback above (which rebuilds `ctx`)
     // cannot clobber it.
-    let (constitution_block, constitution_warnings) = load_repo_constitution_block(workspace);
+    let (constitution_block, constitution_source_path, constitution_warnings) =
+        load_repo_constitution_block(workspace);
     ctx.warnings.extend(constitution_warnings);
     ctx.constitution_block = constitution_block;
+    ctx.constitution_source_path = constitution_source_path;
 
     ctx
 }
@@ -1386,7 +1431,7 @@ mod tests {
                 "schema_version": 1,
                 "authority": ["current user request", "live code and tests", "AGENTS.md"],
                 "protected_invariants": ["keep the tool-catalog head byte-stable"],
-                "branch_policy": "PRs target codex/v0.8.53, not main",
+                "branch_policy": "Start from live branch truth; open PRs into main",
                 "verification_policy": { "before_claiming_done": ["run focused tests"] },
                 "escalate_when": ["a destructive action was not authorized"]
             }"#,
@@ -1402,14 +1447,67 @@ mod tests {
         assert!(block.contains("current user request"));
         assert!(block.contains("run focused tests"));
         assert!(block.contains("keep the tool-catalog head byte-stable"));
-        assert!(block.contains("PRs target codex/v0.8.53"));
+        assert!(block.contains("Start from live branch truth"));
         assert!(block.contains("a destructive action was not authorized"));
         assert!(block.contains("takes precedence over a legacy WHALE.md"));
+        assert!(
+            ctx.constitution_source_path
+                .as_ref()
+                .is_some_and(|path| path.ends_with(".codewhale/constitution.json")),
+            "constitution source path should be visible: {:?}",
+            ctx.constitution_source_path
+        );
         // It also surfaces through the system block.
         assert!(
             ctx.as_system_block()
                 .expect("system block")
                 .contains("codewhale_repo_constitution")
+        );
+    }
+
+    #[test]
+    fn stale_constitution_branch_policy_warns() {
+        let tmp = tempdir().expect("tempdir");
+        fs::create_dir(tmp.path().join(".git")).expect("mkdir .git");
+        fs::create_dir(tmp.path().join(".codewhale")).expect("mkdir .codewhale");
+        fs::write(
+            tmp.path().join(".codewhale").join("constitution.json"),
+            r#"{
+                "schema_version": 1,
+                "authority": ["current user request"],
+                "branch_policy": "v0.8.53 work targets the codex/v0.8.53 integration branch, not main"
+            }"#,
+        )
+        .expect("write constitution");
+
+        let ctx = load_project_context_with_parents(tmp.path());
+        assert!(
+            ctx.constitution_block.is_some(),
+            "stale policy should warn but still render"
+        );
+        assert!(
+            ctx.warnings
+                .iter()
+                .any(|warning| warning.contains("branch_policy appears stale")),
+            "expected stale branch_policy warning, got {:?}",
+            ctx.warnings
+        );
+    }
+
+    #[test]
+    fn repository_constitution_avoids_hard_coded_release_lane_policy() {
+        let repo_constitution = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(".codewhale")
+            .join("constitution.json");
+        let raw = fs::read_to_string(&repo_constitution).expect("read repo constitution");
+        let constitution: RepoConstitution =
+            serde_json::from_str(&raw).expect("parse repo constitution");
+        let warnings = constitution.policy_warnings(&repo_constitution);
+        assert!(
+            warnings.is_empty(),
+            "repo constitution should not carry stale release-lane policy: {:?}",
+            warnings
         );
     }
 

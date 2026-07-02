@@ -5,26 +5,28 @@
 //! - Automatic tool discovery via `tools/list`
 //! - Configurable timeouts per-server and globally
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use reqwest::StatusCode;
-use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::Mutex as TokioMutex;
 
 mod headers;
+pub mod oauth;
+mod sse;
+mod stdio;
+mod streamable_http;
 
 use self::headers::{apply_safe_custom_headers, with_default_mcp_http_headers};
-use crate::child_env;
+use self::sse::SseTransport;
+use self::stdio::StdioTransport;
+#[cfg(all(test, unix))]
+use self::stdio::{STDIO_SHUTDOWN_GRACE, StderrTail};
+use self::streamable_http::{StreamableHttpTransport, StreamableSendError};
 use crate::network_policy::{Decision, NetworkPolicyDecider, host_from_url};
 use crate::utils::write_atomic;
 
@@ -44,6 +46,55 @@ fn validate_mcp_config_path(path: &Path) -> Result<()> {
         anyhow::bail!("MCP config path cannot contain '..' components");
     }
     Ok(())
+}
+
+/// Expand `${NAME}` placeholders in an MCP config value from the process
+/// environment. This lets secrets (API keys, bearer tokens, …) be supplied
+/// through environment variables instead of being written in cleartext into
+/// the MCP config file on disk.
+///
+/// On a missing or malformed placeholder the error names only the offending
+/// variable, never the surrounding value, so a secret-bearing string is never
+/// echoed into logs or error output.
+fn expand_env_placeholders(value: &str) -> Result<String> {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            anyhow::bail!("unterminated environment placeholder in MCP config value");
+        };
+        let name = &after[..end];
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            anyhow::bail!("invalid environment placeholder in MCP config value");
+        }
+        let env_value = std::env::var(name).with_context(|| {
+            format!("environment variable {name} required by MCP config is not set")
+        })?;
+        out.push_str(&env_value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Expand `${NAME}` placeholders across every value of an MCP config map
+/// (e.g. the stdio child `env`). `context` only labels expansion errors so a
+/// failure can be attributed to the right map.
+fn expand_env_placeholders_map(
+    values: &HashMap<String, String>,
+    context: &str,
+) -> Result<HashMap<String, String>> {
+    let mut expanded = HashMap::with_capacity(values.len());
+    for (key, value) in values {
+        expanded.insert(
+            key.clone(),
+            expand_env_placeholders(value)
+                .with_context(|| format!("failed to expand MCP {context} value for {key}"))?,
+        );
+    }
+    Ok(expanded)
 }
 
 /// Mask a URL so any embedded credentials in the userinfo portion (e.g.
@@ -260,6 +311,36 @@ pub struct McpServerConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
+    /// HTTP headers whose values are read from environment variables at request
+    /// time. This keeps common bearer/API-token integrations out of mcp.json.
+    #[serde(default, alias = "env_http_headers")]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub env_headers: HashMap<String, String>,
+    /// Environment variable containing a bearer token. When present and set,
+    /// CodeWhale sends `Authorization: Bearer <value>` for URL-based servers.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env_var: Option<String>,
+    /// OAuth scopes requested during `codewhale mcp login`.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    /// OAuth client override for MCP servers that require a pre-registered
+    /// public client instead of dynamic registration.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<McpServerOAuthConfig>,
+    /// Optional RFC 8707 resource parameter appended to the authorization URL.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_resource: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct McpServerOAuthConfig {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -377,174 +458,11 @@ pub trait McpTransport: Send + Sync {
     async fn shutdown(&mut self) {}
 }
 
-pub struct StdioTransport {
-    child: Child,
-    stdin: ChildStdin,
-    reader: tokio::io::BufReader<ChildStdout>,
-    /// Tail of stderr lines from the spawned MCP server. A background task
-    /// drains the child's stderr into this buffer so a mid-run crash leaves
-    /// some context behind instead of `Stdio::null` swallowing it.
-    stderr_tail: Arc<StderrTail>,
-}
-
-/// How long `StdioTransport::shutdown` waits for the child to exit on SIGTERM
-/// before `kill_on_drop` fires SIGKILL. Tuned short so a hung MCP server
-/// can't stall TUI exit; well-behaved servers almost always exit within
-/// a few hundred ms.
-const STDIO_SHUTDOWN_GRACE: Duration = Duration::from_millis(2_000);
-
-/// How many lines of MCP-server stderr to keep around for crash diagnostics.
-/// Bounded so a chatty server can't grow this without limit; large enough to
-/// catch typical Node/Python startup or panic output.
-const STDERR_TAIL_CAPACITY: usize = 64;
-
-/// Bounded ring buffer for the most recent stderr lines from a spawned MCP
-/// server. Used by `StdioTransport` to surface server-side context when the
-/// transport read side fails (server crashed, exited early, etc).
-#[derive(Default)]
-pub struct StderrTail {
-    lines: TokioMutex<VecDeque<String>>,
-}
-
-impl StderrTail {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            lines: TokioMutex::new(VecDeque::with_capacity(STDERR_TAIL_CAPACITY)),
-        })
-    }
-
-    async fn push(&self, line: String) {
-        let mut buf = self.lines.lock().await;
-        if buf.len() >= STDERR_TAIL_CAPACITY {
-            buf.pop_front();
-        }
-        buf.push_back(line);
-    }
-
-    async fn snapshot(&self) -> Vec<String> {
-        self.lines.lock().await.iter().cloned().collect()
-    }
-}
-
-/// Format the captured stderr tail for inclusion in an error message. Empty
-/// tails return `None` so the caller can fall back to its original message.
-async fn format_stderr_context(tail: &StderrTail) -> Option<String> {
-    let lines = tail.snapshot().await;
-    if lines.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "MCP server stderr (last {} line{}):\n{}",
-        lines.len(),
-        if lines.len() == 1 { "" } else { "s" },
-        lines.join("\n"),
-    ))
-}
-
-/// Best-effort SIGTERM. On Unix uses `libc::kill`; on Windows there's no
-/// equivalent so we let `kill_on_drop` (TerminateProcess) handle it via the
-/// subsequent Drop. Returns whether a signal was actually sent.
-fn send_sigterm(child: &Child) -> bool {
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            // SAFETY: pid was just obtained from `child.id()`. `libc::kill`
-            // with `SIGTERM` is async-signal-safe and never observes invalid
-            // memory. Worst case (pid wrap / process already gone) returns
-            // ESRCH, which we deliberately ignore.
-            unsafe {
-                let _ = libc::kill(pid as i32, libc::SIGTERM);
-            }
-            return true;
-        }
-        false
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child;
-        false
-    }
-}
-
-#[async_trait::async_trait]
-impl McpTransport for StdioTransport {
-    async fn send(&mut self, mut msg: Vec<u8>) -> Result<()> {
-        msg.push(b'\n');
-        self.stdin.write_all(&msg).await?;
-        self.stdin.flush().await?;
-        Ok(())
-    }
-
-    async fn recv(&mut self) -> Result<Vec<u8>> {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let bytes = match self.reader.read_line(&mut line).await {
-                Ok(b) => b,
-                Err(err) => {
-                    if let Some(stderr) = format_stderr_context(&self.stderr_tail).await {
-                        anyhow::bail!("Stdio transport read error: {err}\n{stderr}");
-                    }
-                    return Err(err.into());
-                }
-            };
-            if bytes == 0 {
-                if let Some(stderr) = format_stderr_context(&self.stderr_tail).await {
-                    anyhow::bail!("Stdio transport closed\n{stderr}");
-                }
-                anyhow::bail!("Stdio transport closed");
-            }
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            return Ok(trimmed.as_bytes().to_vec());
-        }
-    }
-
-    /// Send SIGTERM and wait up to `STDIO_SHUTDOWN_GRACE` for graceful exit
-    /// before letting Drop / `kill_on_drop` fire SIGKILL as the backstop.
-    async fn shutdown(&mut self) {
-        send_sigterm(&self.child);
-        // Give the child a window to exit cleanly. Discard the result —
-        // either it exits (success) or the timeout fires (Drop will SIGKILL).
-        let _ = tokio::time::timeout(STDIO_SHUTDOWN_GRACE, self.child.wait()).await;
-    }
-}
-
-/// Drop fallback (#420): if `shutdown` was never called explicitly, still
-/// fire SIGTERM before tokio's `kill_on_drop` sends SIGKILL. The two
-/// signals arrive back-to-back so well-behaved servers at least see the
-/// SIGTERM first; misbehaving ones get SIGKILL'd anyway.
-impl Drop for StdioTransport {
-    fn drop(&mut self) {
-        send_sigterm(&self.child);
-    }
-}
-
-pub struct SseTransport {
-    client: reqwest::Client,
-    base_url: String,
-    headers: HashMap<String, String>,
-    endpoint_url: Option<String>,
-    receiver: tokio::sync::mpsc::UnboundedReceiver<SseInbound>,
-    pending_messages: VecDeque<Vec<u8>>,
-    #[allow(dead_code)]
-    sse_task: tokio::task::JoinHandle<()>,
-}
-
-enum SseInbound {
-    Endpoint(String),
-    Message(Vec<u8>),
-}
-
 struct HttpTransport {
     mode: HttpTransportMode,
     client: reqwest::Client,
     base_url: String,
-    headers: HashMap<String, String>,
+    auth: McpHttpAuth,
     cancel_token: tokio_util::sync::CancellationToken,
     endpoint_timeout: Duration,
 }
@@ -554,232 +472,63 @@ enum HttpTransportMode {
     Sse(SseTransport),
 }
 
-struct StreamableHttpTransport {
-    client: reqwest::Client,
-    url: String,
-    /// Extra headers applied to every outbound POST. Populated from
-    /// [`McpServerConfig::headers`]; an empty map is the no-auth
-    /// default. See `apply_custom_headers` for the filtering pass that
-    /// runs before each request.
+#[derive(Clone, Default)]
+struct McpHttpAuth {
     headers: HashMap<String, String>,
-    pending_messages: VecDeque<Vec<u8>>,
-    /// Per-spec MCP session identifier returned by the server in the
-    /// first response (typically the `initialize` response). Attached
-    /// as the `Mcp-Session-Id` header on every subsequent outbound
-    /// request so the server can correlate messages within the same
-    /// session.
-    session_id: Option<String>,
+    env_headers: HashMap<String, String>,
+    bearer_token_env_var: Option<String>,
+    oauth: Option<oauth::McpOAuthRuntime>,
 }
 
-#[derive(Debug)]
-enum StreamableSendError {
-    Incompatible(String),
-    StaleSession(String),
-    Other(anyhow::Error),
+impl McpHttpAuth {
+    fn from_config(config: &McpServerConfig, oauth: Option<oauth::McpOAuthRuntime>) -> Self {
+        Self {
+            headers: config.headers.clone(),
+            env_headers: config.env_headers.clone(),
+            bearer_token_env_var: config.bearer_token_env_var.clone(),
+            oauth,
+        }
+    }
+
+    async fn resolved_headers(&self) -> Result<HashMap<String, String>> {
+        let mut headers = self.headers.clone();
+        for (name, env_var) in &self.env_headers {
+            if let Ok(value) = std::env::var(env_var)
+                && !value.trim().is_empty()
+            {
+                headers.insert(name.clone(), value);
+            }
+        }
+        if !mcp_headers_have_authorization(&headers)
+            && let Some(env_var) = self.bearer_token_env_var.as_deref()
+            && let Ok(token) = std::env::var(env_var)
+        {
+            let token = token.trim();
+            if !token.is_empty() {
+                headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+            }
+        }
+        if !mcp_headers_have_authorization(&headers)
+            && let Some(oauth) = &self.oauth
+            && let Some(value) = oauth.authorization_header().await?
+        {
+            headers.insert("Authorization".to_string(), value);
+        }
+        Ok(headers)
+    }
 }
 
-impl SseTransport {
-    pub async fn connect(
-        client: reqwest::Client,
-        url: String,
-        headers: HashMap<String, String>,
-        cancel_token: tokio_util::sync::CancellationToken,
-        endpoint_timeout: Duration,
-    ) -> Result<Self> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let client_clone = client.clone();
-        let url_clone = url.clone();
-        let headers_clone = headers.clone();
-        let wait_cancel_token = cancel_token.clone();
-
-        let sse_task = tokio::spawn(async move {
-            if cancel_token.is_cancelled() {
-                return;
-            }
-            use futures_util::FutureExt;
-            let result = std::panic::AssertUnwindSafe(Self::run_sse_loop(
-                client_clone,
-                url_clone,
-                headers_clone,
-                tx,
-                cancel_token,
-            ))
-            .catch_unwind()
-            .await;
-            match result {
-                Ok(res) => {
-                    if let Err(e) = res {
-                        tracing::error!("SSE loop error: {}", e);
-                    }
-                }
-                Err(panic_err) => {
-                    if let Some(msg) = panic_err.downcast_ref::<&str>() {
-                        tracing::error!("SSE loop panicked: {}", msg);
-                    } else if let Some(msg) = panic_err.downcast_ref::<String>() {
-                        tracing::error!("SSE loop panicked: {}", msg);
-                    } else {
-                        tracing::error!("SSE loop panicked with unknown error");
-                    }
-                }
-            }
-        });
-
-        let mut transport = Self {
-            client,
-            base_url: url,
-            headers,
-            endpoint_url: None,
-            receiver: rx,
-            pending_messages: VecDeque::new(),
-            sse_task,
-        };
-        transport
-            .wait_for_endpoint(&wait_cancel_token, endpoint_timeout)
-            .await?;
-        Ok(transport)
-    }
-
-    async fn run_sse_loop(
-        client: reqwest::Client,
-        url: String,
-        headers: HashMap<String, String>,
-        tx: tokio::sync::mpsc::UnboundedSender<SseInbound>,
-        cancel_token: tokio_util::sync::CancellationToken,
-    ) -> Result<()> {
-        let response = apply_safe_custom_headers(
-            with_default_mcp_http_headers(client.get(&url), false),
-            &headers,
-        )
-        .send()
-        .await
-        .with_context(|| {
-            format!(
-                "MCP SSE connect failed (transport=http url={})",
-                mask_url_secrets(&url),
-            )
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            let body_excerpt = bounded_body_excerpt(response, ERROR_BODY_PREVIEW_BYTES).await;
-            anyhow::bail!(
-                "MCP SSE rejected (transport=http url={} status={}): {}",
-                mask_url_secrets(&url),
-                status,
-                body_excerpt,
-            );
-        }
-
-        let mut stream = response.bytes_stream();
-        use futures_util::StreamExt;
-        let mut buffer = String::new();
-
-        loop {
-            if cancel_token.is_cancelled() {
-                tracing::debug!("SSE loop cancelled");
-                break;
-            }
-            let item = tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    tracing::debug!("SSE loop shutting down");
-                    break;
-                }
-                item = stream.next() => {
-                    match item {
-                        Some(i) => i,
-                        None => break,
-                    }
-                }
-            };
-            let chunk = item?;
-            let s = String::from_utf8_lossy(&chunk);
-            buffer.push_str(&s);
-
-            while let Some((pos, separator_len)) = find_sse_event_separator(&buffer) {
-                let event_block = buffer[..pos].to_string();
-                buffer = buffer[pos + separator_len..].to_string();
-
-                let mut event_type = "message";
-                let mut data = String::new();
-
-                for line in event_block.lines() {
-                    if let Some(value) = sse_field_value(line, "event:") {
-                        event_type = value;
-                    } else if let Some(value) = sse_field_value(line, "data:") {
-                        if !data.is_empty() {
-                            data.push('\n');
-                        }
-                        data.push_str(value);
-                    }
-                }
-
-                match event_type {
-                    "endpoint" => {
-                        let _ = tx.send(SseInbound::Endpoint(data));
-                    }
-                    "message" if !data.trim().is_empty() => {
-                        let _ = tx.send(SseInbound::Message(data.into_bytes()));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn wait_for_endpoint(
-        &mut self,
-        cancel_token: &tokio_util::sync::CancellationToken,
-        endpoint_timeout: Duration,
-    ) -> Result<()> {
-        let timeout = tokio::time::sleep(endpoint_timeout);
-        tokio::pin!(timeout);
-
-        loop {
-            let msg = tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    anyhow::bail!("SSE transport cancelled before endpoint was discovered");
-                }
-                _ = &mut timeout => {
-                    anyhow::bail!(
-                        "SSE endpoint not received within {}ms",
-                        endpoint_timeout.as_millis()
-                    );
-                }
-                msg = self.receiver.recv() => {
-                    msg.context("SSE transport closed before endpoint was discovered")?
-                }
-            };
-
-            match msg {
-                SseInbound::Endpoint(endpoint) => {
-                    self.store_endpoint(&endpoint)?;
-                    return Ok(());
-                }
-                SseInbound::Message(msg) => self.pending_messages.push_back(msg),
-            }
-        }
-    }
-
-    fn store_endpoint(&mut self, endpoint: &str) -> Result<()> {
-        self.endpoint_url = Some(Self::resolve_endpoint_url(&self.base_url, endpoint)?);
-        Ok(())
-    }
-
-    fn resolve_endpoint_url(base_url: &str, endpoint_url: &str) -> Result<String> {
-        if endpoint_url.starts_with("http://") || endpoint_url.starts_with("https://") {
-            return Ok(endpoint_url.to_string());
-        }
-        let base = reqwest::Url::parse(base_url)?;
-        let joined = base.join(endpoint_url)?;
-        Ok(joined.to_string())
-    }
+fn mcp_headers_have_authorization(headers: &HashMap<String, String>) -> bool {
+    headers
+        .keys()
+        .any(|key| key.trim().eq_ignore_ascii_case("authorization"))
 }
 
 impl HttpTransport {
     fn new(
         client: reqwest::Client,
         url: String,
-        headers: HashMap<String, String>,
+        auth: McpHttpAuth,
         cancel_token: tokio_util::sync::CancellationToken,
         endpoint_timeout: Duration,
     ) -> Self {
@@ -787,11 +536,11 @@ impl HttpTransport {
             mode: HttpTransportMode::Streamable(StreamableHttpTransport::new(
                 client.clone(),
                 url.clone(),
-                headers.clone(),
+                auth.clone(),
             )),
             client,
             base_url: url,
-            headers,
+            auth,
             cancel_token,
             endpoint_timeout,
         }
@@ -801,7 +550,7 @@ impl HttpTransport {
         let mut sse = SseTransport::connect(
             self.client.clone(),
             self.base_url.clone(),
-            self.headers.clone(),
+            self.auth.clone(),
             self.cancel_token.clone(),
             self.endpoint_timeout,
         )
@@ -842,9 +591,10 @@ impl HttpTransport {
             HttpTransportMode::Sse(_) => return Ok(()),
         };
 
+        let headers = transport.auth.resolved_headers().await?;
         let request = apply_safe_custom_headers(
             with_default_mcp_http_headers(transport.client.get(&transport.url), false),
-            &transport.headers,
+            &headers,
         );
         let response = tokio::time::timeout(Duration::from_secs(5), request.send())
             .await
@@ -920,141 +670,6 @@ impl McpTransport for HttpTransport {
             transport.shutdown().await;
         }
     }
-}
-
-impl StreamableHttpTransport {
-    fn new(client: reqwest::Client, url: String, headers: HashMap<String, String>) -> Self {
-        Self {
-            client,
-            url,
-            headers,
-            pending_messages: VecDeque::new(),
-            session_id: None,
-        }
-    }
-
-    async fn send(&mut self, msg: Vec<u8>) -> std::result::Result<(), StreamableSendError> {
-        // Apply user-configured custom headers after protocol framing so
-        // reserved Accept / Content-Type overrides can be filtered out.
-        let mut request = apply_safe_custom_headers(
-            with_default_mcp_http_headers(self.client.post(&self.url), true),
-            &self.headers,
-        );
-        // Attach any previously captured session ID per the Streamable
-        // HTTP spec so the server can correlate this request to the
-        // existing session.
-        if let Some(ref sid) = self.session_id {
-            request = request.header("Mcp-Session-Id", sid.as_str());
-        }
-        let response = request
-            .body(msg)
-            .send()
-            .await
-            .map_err(|err| StreamableSendError::Other(err.into()))?;
-
-        let status = response.status();
-
-        // Capture session ID from any response (2xx, 202, 4xx, …). The
-        // server may return it on the `initialize` response or on a
-        // best-effort GET preflight below.
-        if let Some(sid) = response
-            .headers()
-            .get("Mcp-Session-Id")
-            .and_then(|v| v.to_str().ok())
-            && self.session_id.as_deref() != Some(sid)
-        {
-            let session_ref = crate::utils::redacted_identifier_for_log(sid);
-            tracing::debug!(target: "mcp", session = %session_ref, "captured MCP session ID");
-            self.session_id = Some(sid.to_string());
-        }
-        if status == StatusCode::ACCEPTED || status == StatusCode::NO_CONTENT {
-            return Ok(());
-        }
-
-        if !status.is_success() {
-            let body_excerpt = bounded_body_excerpt(response, ERROR_BODY_PREVIEW_BYTES).await;
-            if self.session_id.is_some()
-                && is_streamable_http_stale_session_status(status, &body_excerpt)
-            {
-                return Err(StreamableSendError::StaleSession(format!(
-                    "status={status} body={body_excerpt}"
-                )));
-            }
-            if is_streamable_http_incompatible_status(status) {
-                return Err(StreamableSendError::Incompatible(format!(
-                    "status={status} body={body_excerpt}"
-                )));
-            }
-            return Err(StreamableSendError::Other(anyhow::anyhow!(
-                "MCP Streamable HTTP rejected (transport=http url={} status={}): {}",
-                mask_url_secrets(&self.url),
-                status,
-                body_excerpt,
-            )));
-        }
-
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let body = response
-            .text()
-            .await
-            .map_err(|err| StreamableSendError::Other(err.into()))?;
-        self.store_response_body(content_type.as_deref(), &body)
-            .map_err(StreamableSendError::Other)
-    }
-
-    async fn recv(&mut self) -> Result<Vec<u8>> {
-        self.pending_messages
-            .pop_front()
-            .context("MCP Streamable HTTP response queue is empty")
-    }
-
-    fn store_response_body(&mut self, content_type: Option<&str>, body: &str) -> Result<()> {
-        if body.trim().is_empty() {
-            return Ok(());
-        }
-
-        let is_event_stream = content_type
-            .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
-            .unwrap_or(false)
-            || body.trim_start().starts_with("event:")
-            || body.trim_start().starts_with("data:");
-
-        if is_event_stream {
-            for msg in parse_sse_message_data(body) {
-                self.pending_messages.push_back(msg);
-            }
-            return Ok(());
-        }
-
-        self.pending_messages.push_back(body.as_bytes().to_vec());
-        Ok(())
-    }
-}
-
-fn is_streamable_http_incompatible_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::NOT_FOUND
-            | StatusCode::METHOD_NOT_ALLOWED
-            | StatusCode::NOT_ACCEPTABLE
-            | StatusCode::UNSUPPORTED_MEDIA_TYPE
-            | StatusCode::NOT_IMPLEMENTED
-    )
-}
-
-fn is_streamable_http_stale_session_status(status: StatusCode, body_excerpt: &str) -> bool {
-    if status == StatusCode::NOT_FOUND {
-        return true;
-    }
-    if status != StatusCode::BAD_REQUEST && status != StatusCode::UNAUTHORIZED {
-        return false;
-    }
-    let body = body_excerpt.to_ascii_lowercase();
-    body.contains("session") && (body.contains("expired") || body.contains("invalid"))
 }
 
 fn is_mcp_stale_session_body(body: &str) -> bool {
@@ -1153,63 +768,6 @@ fn response_id_matches(id: Option<&serde_json::Value>, expected_id: &str) -> boo
         .unwrap_or(false)
 }
 
-#[async_trait::async_trait]
-impl McpTransport for SseTransport {
-    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
-        let endpoint = self
-            .endpoint_url
-            .as_ref()
-            .context("SSE endpoint not yet discovered")?;
-        let response = apply_safe_custom_headers(
-            with_default_mcp_http_headers(self.client.post(endpoint), true),
-            &self.headers,
-        )
-        .body(msg)
-        .send()
-        .await
-        .with_context(|| {
-            format!(
-                "MCP SSE POST send failed (transport=sse endpoint={})",
-                mask_url_secrets(endpoint)
-            )
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            let body_excerpt = bounded_body_excerpt(response, ERROR_BODY_PREVIEW_BYTES).await;
-            if is_mcp_stale_session_body(&body_excerpt) {
-                anyhow::bail!(
-                    "MCP session expired (transport=sse endpoint={} status={}): {}",
-                    mask_url_secrets(endpoint),
-                    status,
-                    body_excerpt
-                );
-            }
-            anyhow::bail!(
-                "MCP SSE POST rejected (transport=sse endpoint={} status={}): {}",
-                mask_url_secrets(endpoint),
-                status,
-                body_excerpt
-            );
-        }
-        Ok(())
-    }
-
-    async fn recv(&mut self) -> Result<Vec<u8>> {
-        loop {
-            if let Some(msg) = self.pending_messages.pop_front() {
-                return Ok(msg);
-            }
-
-            match self.receiver.recv().await.context("SSE transport closed")? {
-                SseInbound::Endpoint(endpoint) => {
-                    self.store_endpoint(&endpoint)?;
-                }
-                SseInbound::Message(msg) => return Ok(msg),
-            }
-        }
-    }
-}
-
 // === McpConnection - Async Connection Management ===
 
 /// Manages a single async connection to an MCP server
@@ -1304,12 +862,45 @@ impl McpConnection {
                 }
             }
             let client = client_builder.build()?;
+            let oauth_runtime = match oauth::build_default_headers(
+                &config.headers,
+                &config.env_headers,
+            ) {
+                Ok(default_headers) => match oauth::McpOAuthRuntime::from_server_config(
+                    &name,
+                    &config,
+                    default_headers,
+                )
+                .await
+                {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "mcp",
+                            server = %name,
+                            error = %err,
+                            "failed to prepare MCP OAuth runtime; continuing without stored OAuth token"
+                        );
+                        None
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        target: "mcp",
+                        server = %name,
+                        error = %err,
+                        "failed to prepare MCP OAuth default headers; continuing without stored OAuth token"
+                    );
+                    None
+                }
+            };
+            let http_auth = McpHttpAuth::from_config(&config, oauth_runtime);
             if is_legacy_sse_transport(&config) {
                 Box::new(
                     SseTransport::connect(
                         client,
                         url.clone(),
-                        config.headers.clone(),
+                        http_auth,
                         cancel_token.clone(),
                         Duration::from_secs(connect_timeout_secs),
                     )
@@ -1319,7 +910,7 @@ impl McpConnection {
                 let mut http = HttpTransport::new(
                     client,
                     url.clone(),
-                    config.headers.clone(),
+                    http_auth,
                     cancel_token.clone(),
                     Duration::from_secs(connect_timeout_secs),
                 );
@@ -1339,56 +930,7 @@ impl McpConnection {
                 Box::new(http)
             }
         } else if let Some(command) = &config.command {
-            let mut cmd = tokio::process::Command::new(command);
-            cmd.args(&config.args)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true);
-            if let Some(cwd) = &config.cwd {
-                cmd.current_dir(cwd);
-            }
-
-            // MCP stdio servers are user-configured integrations. Use the
-            // wider MCP allowlist so common Node/Python/proxy/CA-bundle
-            // bootstrap variables (NVM_DIR, NODE_OPTIONS, NPM_CONFIG_*,
-            // HTTP(S)_PROXY, …) reach the child. See `sanitized_mcp_env`
-            // and #1244 for context.
-            child_env::apply_to_tokio_command_mcp(&mut cmd, child_env::string_map_env(&config.env));
-
-            let mut child = cmd.spawn().with_context(|| {
-                let env_keys: Vec<&str> = config.env.keys().map(String::as_str).collect();
-                format!(
-                    "MCP stdio spawn failed (transport=stdio server={name} cmd={command:?} args={:?} env_keys={env_keys:?})",
-                    config.args,
-                )
-            })?;
-
-            let stdin = child.stdin.take().context("Failed to get MCP stdin")?;
-            let stdout = child.stdout.take().context("Failed to get MCP stdout")?;
-            let stderr = child.stderr.take().context("Failed to get MCP stderr")?;
-
-            // Drain stderr into a bounded ring buffer so a crash mid-run
-            // leaves diagnostic breadcrumbs instead of disappearing into
-            // `Stdio::null`. The task exits naturally when the child closes
-            // its stderr (kill_on_drop / exit / explicit shutdown).
-            let stderr_tail = StderrTail::new();
-            {
-                let tail = Arc::clone(&stderr_tail);
-                tokio::spawn(async move {
-                    let mut lines = tokio::io::BufReader::new(stderr).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        tail.push(line).await;
-                    }
-                });
-            }
-
-            Box::new(StdioTransport {
-                child,
-                stdin,
-                reader: tokio::io::BufReader::new(stdout),
-                stderr_tail,
-            })
+            Box::new(StdioTransport::spawn(&name, command, &config)?)
         } else {
             anyhow::bail!("MCP server '{name}' config must have either 'command' or 'url'");
         };
@@ -1949,6 +1491,31 @@ impl McpPool {
         self
     }
 
+    fn drop_connection(&mut self, server_name: &str, reason: &str) {
+        if self.connections.remove(server_name).is_some() {
+            tracing::debug!(
+                target: "mcp",
+                server = %server_name,
+                reason = %reason,
+                "dropped MCP connection"
+            );
+        }
+    }
+
+    fn drop_all_connections(&mut self, reason: &str) {
+        if self.connections.is_empty() {
+            return;
+        }
+        let count = self.connections.len();
+        tracing::debug!(
+            target: "mcp",
+            count,
+            reason = %reason,
+            "dropping MCP connections"
+        );
+        self.connections.clear();
+    }
+
     /// If the source config file's mtime has changed since the last check,
     /// re-read it and (only when the content hash also changed) drop all
     /// existing connections so the next `get_or_connect` reattaches under
@@ -1993,7 +1560,7 @@ impl McpPool {
         }
         // Real content change — drop all live connections so the next
         // get_or_connect picks up the new config (sandbox flags, env, args).
-        self.connections.clear();
+        self.drop_all_connections("config reload");
         self.config = new_config;
         self.config_hash = new_hash;
         Ok(true)
@@ -2020,7 +1587,7 @@ impl McpPool {
                 .ok_or_else(|| anyhow::anyhow!("MCP connection disappeared for {server_name}"));
         }
 
-        self.connections.remove(server_name);
+        self.drop_connection(server_name, "reconnect");
 
         let server_config = self
             .config
@@ -2146,11 +1713,14 @@ impl McpPool {
             return Ok(resources);
         }
 
+        let mut items = Vec::new();
         let errors = self.connect_all().await;
         for (server, err) in errors {
             tracing::warn!("Failed to connect MCP server '{server}' for resources: {err:#}");
+            if oauth::error_looks_auth_required(&err) {
+                items.push(Self::mcp_auth_required_error_item(&server));
+            }
         }
-        let mut items = Vec::new();
         for (server, conn) in &self.connections {
             for resource in conn.resources() {
                 items.push(serde_json::json!({
@@ -2187,13 +1757,16 @@ impl McpPool {
             return Ok(templates);
         }
 
+        let mut items = Vec::new();
         let errors = self.connect_all().await;
         for (server, err) in errors {
             tracing::warn!(
                 "Failed to connect MCP server '{server}' for resource templates: {err:#}"
             );
+            if oauth::error_looks_auth_required(&err) {
+                items.push(Self::mcp_auth_required_error_item(&server));
+            }
         }
-        let mut items = Vec::new();
         for (server, conn) in &self.connections {
             for template in conn.resource_templates() {
                 items.push(serde_json::json!({
@@ -2206,6 +1779,14 @@ impl McpPool {
             }
         }
         Ok(items)
+    }
+
+    fn mcp_auth_required_error_item(server: &str) -> serde_json::Value {
+        serde_json::json!({
+            "error": "authentication_required",
+            "server": server,
+            "message": oauth::auth_required_login_hint(server),
+        })
     }
 
     /// Get all discovered prompts with server-prefixed names
@@ -2491,7 +2072,7 @@ impl McpPool {
                     error = %err,
                     "retrying MCP tool call after stale session"
                 );
-                self.connections.remove(server_name);
+                self.drop_connection(server_name, "stale session retry");
                 let conn = self.get_or_connect(server_name).await?;
                 if !conn.config().is_tool_enabled(tool_name) {
                     anyhow::bail!("MCP tool '{tool_name}' is disabled for server '{server_name}'");
@@ -2514,6 +2095,7 @@ impl McpPool {
     }
 
     /// Get list of connected server names
+    #[allow(dead_code)] // Public API; the HTTP list endpoint no longer spawns a pool to call it (#3532)
     pub fn connected_servers(&self) -> Vec<&str> {
         self.connections
             .iter()
@@ -2525,7 +2107,7 @@ impl McpPool {
     /// Disconnect all connections
     #[allow(dead_code)] // Public API for MCP lifecycle management
     pub fn disconnect_all(&mut self) {
-        self.connections.clear();
+        self.drop_all_connections("disconnect all");
     }
 
     /// Graceful shutdown of every connection in the pool: send SIGTERM to
@@ -2677,7 +2259,58 @@ pub fn load_config_with_workspace(global_path: &Path, workspace: &Path) -> Resul
         }
     }
     merged.servers.extend(project.servers);
+
+    merged = merge_plugin_mcp_servers(merged)?;
+
     Ok(merged)
+}
+
+fn merge_plugin_mcp_servers(config: McpConfig) -> Result<McpConfig> {
+    let plugins = crate::plugins::try_with_registry(|r| {
+        r.list_enabled()
+            .into_iter()
+            .map(|(name, plugin)| (name.clone(), plugin.clone()))
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+
+    merge_plugin_mcp_servers_from_plugins(config, plugins)
+}
+
+fn merge_plugin_mcp_servers_from_plugins(
+    mut config: McpConfig,
+    plugins: impl IntoIterator<Item = (String, crate::plugins::manifest::LoadedPlugin)>,
+) -> Result<McpConfig> {
+    for (plugin_name, plugin) in plugins {
+        if let Some(mcp_servers) = &plugin.manifest.mcp_servers {
+            for (server_name, server_config) in mcp_servers {
+                let qualified_name = format!("{}-{}", plugin_name, server_name);
+                let mut server_config = server_config.clone();
+
+                if server_config.command.is_some() && server_config.url.is_none() {
+                    server_config.cwd = Some(resolve_plugin_mcp_cwd(
+                        &plugin.base_path,
+                        server_config.cwd.as_deref(),
+                    )?);
+                }
+
+                config.servers.insert(qualified_name, server_config);
+            }
+        }
+    }
+
+    Ok(config)
+}
+
+fn resolve_plugin_mcp_cwd(plugin_path: &Path, cwd: Option<&Path>) -> Result<PathBuf> {
+    let cwd = match cwd {
+        Some(cwd) if cwd.is_relative() => normalize_path_components(&plugin_path.join(cwd)),
+        Some(cwd) => normalize_path_components(cwd),
+        None => plugin_path.to_path_buf(),
+    };
+    Ok(cwd
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_path_components(&cwd)))
 }
 
 fn workspace_allows_project_mcp_config(workspace: &Path) -> bool {
@@ -2840,6 +2473,36 @@ fn mcp_template_json() -> Result<String> {
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: HashMap::new(),
+            env_headers: HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
+        },
+    );
+    cfg.servers.insert(
+        "moraine-mcp".to_string(),
+        McpServerConfig {
+            command: Some("moraine".to_string()),
+            args: vec!["mcp".to_string()],
+            env: HashMap::new(),
+            cwd: None,
+            url: None,
+            transport: None,
+            connect_timeout: None,
+            execute_timeout: None,
+            read_timeout: None,
+            disabled: true,
+            enabled: true,
+            required: false,
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            headers: HashMap::new(),
+            env_headers: HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         },
     );
     serde_json::to_string_pretty(&cfg).context("Failed to render MCP template JSON")
@@ -2897,6 +2560,11 @@ pub fn add_server_config(
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: HashMap::new(),
+            env_headers: HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         },
     );
     save_config(path, &cfg)

@@ -1,5 +1,6 @@
 //! Command traits and registry support.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::localization::{Locale, MessageId, tr};
@@ -13,6 +14,19 @@ pub struct CommandInfo {
     pub aliases: &'static [&'static str],
     pub usage: &'static str,
     pub description_id: MessageId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandDiscovery {
+    Primary,
+    Advanced,
+    Compatibility,
+}
+
+impl CommandDiscovery {
+    pub fn show_at_root(self) -> bool {
+        matches!(self, CommandDiscovery::Primary)
+    }
 }
 
 impl CommandInfo {
@@ -41,7 +55,7 @@ impl CommandInfo {
         }
     }
 
-    pub fn description_for(&self, locale: Locale) -> &'static str {
+    pub fn description_for(&self, locale: Locale) -> Cow<'static, str> {
         tr(locale, self.description_id)
     }
 
@@ -52,6 +66,26 @@ impl CommandInfo {
         } else {
             format!("{}  aliases: {}", desc, self.aliases.join(", "))
         }
+    }
+
+    pub fn discovery(&self) -> CommandDiscovery {
+        match self.name {
+            "subagents" => CommandDiscovery::Compatibility,
+            "anchor" | "balance" | "cache" | "change" | "context" | "debt" | "diff" | "edit"
+            | "goal" | "hf" | "hooks" | "lsp" | "modeldb" | "models" | "network" | "plugins"
+            | "profile" | "purge" | "relay" | "rename" | "rlm" | "settings" | "share"
+            | "sidebar" | "status" | "system" | "theme" | "tokens" | "translate" | "trust"
+            | "verbose" | "workspace" => CommandDiscovery::Advanced,
+            _ => CommandDiscovery::Primary,
+        }
+    }
+
+    pub fn show_in_empty_discovery(&self) -> bool {
+        self.discovery().show_at_root()
+    }
+
+    pub fn show_in_slash_completion(&self, prefix: &str) -> bool {
+        !prefix.trim_start_matches('/').trim().is_empty() || self.show_in_empty_discovery()
     }
 }
 

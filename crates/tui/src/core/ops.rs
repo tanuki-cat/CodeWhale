@@ -27,6 +27,15 @@ pub struct SessionSnapshot {
     pub mode: String,
 }
 
+/// Provider request runtime state surfaced by `/provider`.
+/// Returned by `Op::GetProviderRuntimeStatus` via a oneshot channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRuntimeStatus {
+    pub provider: ApiProvider,
+    pub request_concurrency_limit: Option<usize>,
+    pub active_provider_requests: usize,
+}
+
 /// Origin of text being introduced as a user-role turn.
 ///
 /// Chat providers force several runtime/control-plane signals through
@@ -114,6 +123,7 @@ pub enum Op {
     RunShellCommand {
         command: String,
         mode: AppMode,
+        allow_shell: bool,
         trust_mode: bool,
         auto_approve: bool,
         approval_mode: ApprovalMode,
@@ -150,11 +160,21 @@ pub enum Op {
 
     /// Change the operating mode
     #[allow(dead_code)]
-    ChangeMode { mode: AppMode },
+    ChangeMode {
+        mode: AppMode,
+        allow_shell: bool,
+        trust_mode: bool,
+        auto_approve: bool,
+        approval_mode: ApprovalMode,
+    },
 
     /// Update the model being used and refresh stable prompt context.
     #[allow(dead_code)]
-    SetModel { model: String, mode: AppMode },
+    SetModel {
+        model: String,
+        mode: AppMode,
+        route_limits: Option<codewhale_config::route::RouteLimits>,
+    },
 
     /// Update auto-compaction settings
     SetCompaction { config: CompactionConfig },
@@ -180,6 +200,7 @@ pub enum Op {
         system_prompt_override: bool,
         model: String,
         workspace: PathBuf,
+        mode: AppMode,
     },
 
     /// Run context compaction immediately.
@@ -190,6 +211,13 @@ pub enum Op {
     /// the caller doesn't have to compete with the SSE event stream.
     GetSessionSnapshot {
         tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<SessionSnapshot>>>>,
+    },
+
+    /// Get active provider request concurrency state for readiness surfaces.
+    GetProviderRuntimeStatus {
+        tx: std::sync::Arc<
+            std::sync::Mutex<Option<tokio::sync::oneshot::Sender<ProviderRuntimeStatus>>>,
+        >,
     },
 
     /// Run agent-driven context purging.

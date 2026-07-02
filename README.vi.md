@@ -8,7 +8,7 @@ CodeWhale nói chuyện native với Anthropic Claude và OpenAI khi đó là th
 đang có. Công cụ qua cổng phê duyệt, sandbox cấp hệ điều hành, và rollback
 bằng `/restore` cho mọi lượt.
 
-[English README](README.md) · [简体中文 README](README.zh-CN.md) · [日本語 README](README.ja-JP.md) · [codewhale.net](https://codewhale.net/) · [Hướng dẫn cài đặt](docs/INSTALL.md) · [Danh mục provider](docs/PROVIDERS.md) · [Changelog](CHANGELOG.md)
+[English README](README.md) · [简体中文 README](README.zh-CN.md) · [日本語 README](README.ja-JP.md) · [한국어 README](README.ko-KR.md) · [codewhale.net](https://codewhale.net/) · [Hướng dẫn cài đặt](docs/INSTALL.md) · [Danh mục provider](docs/PROVIDERS.md) · [Changelog](CHANGELOG.md)
 
 [![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
@@ -21,7 +21,7 @@ bằng `/restore` cho mọi lượt.
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.63
+codewhale --version   # 0.8.66
 ```
 
 Wrapper npm (Node 18+) tải binary đã xác minh SHA-256 từ GitHub Releases và
@@ -50,8 +50,8 @@ nix run github:Hmbown/CodeWhale
 scoop install codewhale        # hoặc trình cài NSIS từ GitHub Releases
 
 # CNB mirror cho người dùng khó truy cập GitHub ổn định
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.64 codewhale-cli --locked --force
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.64 codewhale-tui --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-cli --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-tui --locked --force
 
 # Homebrew legacy trong lúc formula đang được đổi tên
 brew tap Hmbown/deepseek-tui

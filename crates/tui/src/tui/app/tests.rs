@@ -1,10 +1,11 @@
 use super::*;
 use crate::config::{ApiProvider, Config, ProviderConfig, ProvidersConfig};
+use crate::settings::Settings;
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
 use crate::tools::todo::TodoStatus;
 use crate::tui::clipboard::PastedImage;
-use crate::tui::history::{GenericToolCell, ToolCell, ToolStatus};
+use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
 
 fn test_options(yolo: bool) -> TuiOptions {
     TuiOptions {
@@ -40,6 +41,80 @@ fn create_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::
 #[cfg(windows)]
 fn create_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[test]
+fn feature_intro_content_mentions_features_and_disable_paths() {
+    let content = App::feature_intro_content();
+    assert!(content.contains("Hotbar"));
+    assert!(content.contains("/hotbar") && content.contains("/hotbar off"));
+    assert!(content.contains("Fleet") && content.contains("/fleet setup"));
+}
+
+#[test]
+fn feature_intro_is_silent_while_onboarding_is_in_progress() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.onboarding = OnboardingState::Welcome;
+    let before = app.history.len();
+    app.maybe_show_feature_intro();
+    assert_eq!(
+        app.history.len(),
+        before,
+        "must not nudge while onboarding is in progress"
+    );
+}
+
+#[test]
+fn feature_intro_shows_once_persists_then_is_idempotent() {
+    let _env_lock = lock_test_env();
+    let tmp = std::env::temp_dir().join(format!("cw-feature-intro-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let config_path = tmp.join("config.toml");
+    let _env = EnvVarGuard::set(
+        "DEEPSEEK_CONFIG_PATH",
+        config_path.to_string_lossy().as_ref(),
+    );
+    let _ = std::fs::remove_file(tmp.join("settings.toml"));
+
+    let mut app = App::new(test_options(false), &Config::default());
+    app.onboarding = OnboardingState::None;
+    let before = app.history.len();
+
+    app.maybe_show_feature_intro();
+    assert_eq!(
+        app.history.len(),
+        before + 1,
+        "intro should be added on the first call"
+    );
+    let content = match app.history.last() {
+        Some(HistoryCell::System { content }) => content.clone(),
+        other => panic!("expected a System intro cell, got {other:?}"),
+    };
+    assert!(
+        content.contains("Hotbar") && content.contains("/hotbar off"),
+        "intro should explain Hotbar + the disable path: {content:?}"
+    );
+    assert!(
+        content.contains("Fleet") && content.contains("/fleet setup"),
+        "intro should explain Fleet setup: {content:?}"
+    );
+
+    // Persisted flag now set → a second call is a no-op.
+    assert!(
+        Settings::load()
+            .expect("settings should load")
+            .feature_intro_shown,
+        "feature_intro_shown should be persisted"
+    );
+    app.maybe_show_feature_intro();
+    assert_eq!(
+        app.history.len(),
+        before + 1,
+        "intro must not repeat once the flag is persisted"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -1391,6 +1466,43 @@ fn clear_todos_resets_plan_state() {
 }
 
 #[test]
+fn app_mode_helpers_centralize_parse_labels_and_cycle_order() {
+    assert_eq!(AppMode::parse("agent"), Some(AppMode::Agent));
+    assert_eq!(AppMode::parse("2"), Some(AppMode::Plan));
+    assert_eq!(AppMode::parse("auto"), Some(AppMode::Agent));
+    assert_eq!(AppMode::parse("3"), None);
+    assert_eq!(AppMode::parse("YOLO"), Some(AppMode::Yolo));
+    assert_eq!(AppMode::parse("4"), Some(AppMode::Yolo));
+    assert_eq!(AppMode::parse("fast"), None);
+
+    assert_eq!(AppMode::Agent.as_setting(), "agent");
+    assert_eq!(AppMode::Auto.as_setting(), "auto");
+    assert_eq!(AppMode::Plan.display_name(), "Plan");
+    assert_eq!(AppMode::Auto.label(), "AUTO");
+    assert_eq!(AppMode::Yolo.label(), "YOLO");
+    assert_eq!(AppMode::Agent.number(), '1');
+    assert_eq!(AppMode::Auto.number(), '3');
+    assert_eq!(AppMode::Yolo.number(), '4');
+    assert_eq!(
+        AppMode::CHOICES,
+        [AppMode::Agent, AppMode::Plan, AppMode::Yolo]
+    );
+    assert_eq!(
+        AppMode::CYCLE,
+        [AppMode::Plan, AppMode::Agent, AppMode::Yolo]
+    );
+
+    assert_eq!(AppMode::Plan.next(), AppMode::Agent);
+    assert_eq!(AppMode::Agent.next(), AppMode::Yolo);
+    assert_eq!(AppMode::Auto.next(), AppMode::Agent);
+    assert_eq!(AppMode::Yolo.next(), AppMode::Plan);
+    assert_eq!(AppMode::Plan.previous(), AppMode::Yolo);
+    assert_eq!(AppMode::Agent.previous(), AppMode::Plan);
+    assert_eq!(AppMode::Auto.previous(), AppMode::Agent);
+    assert_eq!(AppMode::Yolo.previous(), AppMode::Agent);
+}
+
+#[test]
 fn test_cycle_mode_transitions() {
     let mut app = App::new(test_options(false), &Config::default());
     let initial_mode = app.mode;
@@ -1407,11 +1519,15 @@ fn test_cycle_mode_reverse_transitions() {
     app.cycle_mode_reverse();
     assert_eq!(app.mode, AppMode::Yolo);
 
+    app.mode = AppMode::Yolo;
+    app.cycle_mode_reverse();
+    assert_eq!(app.mode, AppMode::Agent);
+
     app.mode = AppMode::Agent;
     app.cycle_mode_reverse();
     assert_eq!(app.mode, AppMode::Plan);
 
-    app.mode = AppMode::Yolo;
+    app.mode = AppMode::Auto;
     app.cycle_mode_reverse();
     assert_eq!(app.mode, AppMode::Agent);
 }
@@ -1419,21 +1535,9 @@ fn test_cycle_mode_reverse_transitions() {
 #[test]
 fn test_mode_switch_toasts_replace_previous_mode_switch_toast() {
     let mut app = App::new(test_options(false), &Config::default());
-    let first_mode = match app.mode {
-        AppMode::Plan => AppMode::Agent,
-        AppMode::Agent => AppMode::Yolo,
-        AppMode::Yolo => AppMode::Plan,
-    };
-    let second_mode = match first_mode {
-        AppMode::Plan => AppMode::Agent,
-        AppMode::Agent => AppMode::Yolo,
-        AppMode::Yolo => AppMode::Plan,
-    };
-    let third_mode = match second_mode {
-        AppMode::Plan => AppMode::Agent,
-        AppMode::Agent => AppMode::Yolo,
-        AppMode::Yolo => AppMode::Plan,
-    };
+    let first_mode = app.mode.next();
+    let second_mode = first_mode.next();
+    let third_mode = second_mode.next();
 
     app.set_mode(first_mode);
     app.sync_status_message_to_toasts();
@@ -1563,7 +1667,7 @@ fn set_mode_yolo_restores_previous_policies_on_exit() {
     app.set_mode(AppMode::Yolo);
     assert!(app.allow_shell);
     assert!(app.trust_mode);
-    assert_eq!(app.approval_mode, ApprovalMode::Auto);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
 
     app.set_mode(AppMode::Agent);
     assert!(!app.allow_shell);
@@ -1608,13 +1712,173 @@ fn set_mode_plan_to_yolo_keeps_yolo_permissions_and_restores_agent_baseline() {
     assert_eq!(app.mode, AppMode::Yolo);
     assert!(app.allow_shell);
     assert!(app.trust_mode);
-    assert_eq!(app.approval_mode, ApprovalMode::Auto);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
 
     app.set_mode(AppMode::Agent);
     assert_eq!(app.mode, AppMode::Agent);
     assert!(!app.allow_shell);
     assert!(!app.trust_mode);
     assert_eq!(app.approval_mode, ApprovalMode::Never);
+}
+
+#[test]
+fn base_policy_for_mode_projects_the_mode_permission_table() {
+    // Pure projection of (mode, prefs) — the single source of truth for #3386.
+    let prefs = ModeSessionPrefs {
+        agent_allow_shell: true,
+        agent_trust_mode: true,
+        agent_approval_mode: ApprovalMode::Never,
+    };
+
+    // Plan: read-only, no shell, no trust, Suggest — and it never inherits the
+    // (here elevated) Agent baseline.
+    let plan = base_policy_for_mode(AppMode::Plan, &prefs);
+    assert_eq!(plan.mode, AppMode::Plan);
+    assert!(!plan.allow_shell);
+    assert!(!plan.trust_mode);
+    assert_eq!(plan.approval_mode, ApprovalMode::Suggest);
+
+    // Agent: exactly the durable baseline.
+    let agent = base_policy_for_mode(AppMode::Agent, &prefs);
+    assert_eq!(agent.mode, AppMode::Agent);
+    assert!(agent.allow_shell);
+    assert!(agent.trust_mode);
+    assert_eq!(agent.approval_mode, ApprovalMode::Never);
+
+    // Auto: shell-enabled smart review, no trust authority.
+    let auto = base_policy_for_mode(AppMode::Auto, &prefs);
+    assert_eq!(auto.mode, AppMode::Auto);
+    assert!(auto.allow_shell);
+    assert!(!auto.trust_mode);
+    assert_eq!(auto.approval_mode, ApprovalMode::Auto);
+
+    // YOLO: full authority is represented by Bypass, not a separate
+    // auto-approve field (#3736).
+    let yolo = base_policy_for_mode(AppMode::Yolo, &prefs);
+    assert_eq!(yolo.mode, AppMode::Yolo);
+    assert!(yolo.allow_shell);
+    assert!(yolo.trust_mode);
+    assert_eq!(yolo.approval_mode, ApprovalMode::Bypass);
+
+    // A minimal Agent baseline projects through Agent unchanged.
+    let minimal = ModeSessionPrefs {
+        agent_allow_shell: false,
+        agent_trust_mode: false,
+        agent_approval_mode: ApprovalMode::Suggest,
+    };
+    let agent_min = base_policy_for_mode(AppMode::Agent, &minimal);
+    assert!(!agent_min.allow_shell);
+    assert!(!agent_min.trust_mode);
+    assert_eq!(agent_min.approval_mode, ApprovalMode::Suggest);
+}
+
+#[test]
+fn set_mode_agent_to_yolo_to_agent_restores_baseline_without_yolo_leak() {
+    // Round-trip Agent -> YOLO -> Agent must not leave YOLO's elevated authority
+    // (shell/trust/Auto) bleeding into the restored Agent surface (#3386).
+    let mut options = test_options(false);
+    options.allow_shell = false;
+    options.start_in_agent_mode = true;
+    let mut app = App::new(options, &Config::default());
+    // User's chosen Agent surface: shell on, trust off, Suggest approvals.
+    app.allow_shell = true;
+    app.trust_mode = false;
+    app.approval_mode = ApprovalMode::Suggest;
+
+    app.set_mode(AppMode::Yolo);
+    assert!(app.allow_shell);
+    assert!(app.trust_mode);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
+    assert!(app.yolo);
+
+    app.set_mode(AppMode::Agent);
+    assert_eq!(app.mode, AppMode::Agent);
+    assert!(app.allow_shell, "shell baseline preserved");
+    assert!(
+        !app.trust_mode,
+        "YOLO trust authority must not leak into Agent"
+    );
+    assert_eq!(
+        app.approval_mode,
+        ApprovalMode::Suggest,
+        "YOLO Auto approvals must not leak into Agent"
+    );
+    assert!(!app.yolo);
+}
+
+#[test]
+fn set_mode_plan_to_yolo_to_agent_does_not_bleed_yolo_into_agent() {
+    // Plan -> YOLO -> Agent: the Agent baseline captured before leaving Agent is
+    // what we land on, untouched by the transient Plan or YOLO policies (#3386).
+    let mut options = test_options(false);
+    options.allow_shell = false;
+    options.start_in_agent_mode = true;
+    let mut app = App::new(options, &Config::default());
+    app.allow_shell = false;
+    app.trust_mode = false;
+    app.approval_mode = ApprovalMode::Never;
+
+    app.set_mode(AppMode::Plan);
+    // Plan is read-only regardless of the baseline.
+    assert!(!app.allow_shell);
+    assert!(!app.trust_mode);
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+
+    app.set_mode(AppMode::Yolo);
+    assert!(app.allow_shell);
+    assert!(app.trust_mode);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
+
+    app.set_mode(AppMode::Agent);
+    assert_eq!(app.mode, AppMode::Agent);
+    assert!(!app.allow_shell);
+    assert!(!app.trust_mode);
+    assert_eq!(app.approval_mode, ApprovalMode::Never);
+}
+
+#[test]
+fn set_mode_captures_agent_edits_as_the_durable_baseline() {
+    // Editing the permission surface in Agent updates the baseline that a later
+    // Plan -> Agent (or YOLO -> Agent) restores to (#3386).
+    let mut options = test_options(false);
+    options.allow_shell = false;
+    options.start_in_agent_mode = true;
+    let mut app = App::new(options, &Config::default());
+    assert_eq!(app.mode, AppMode::Agent);
+
+    // Initial baseline restores to no-shell / Suggest.
+    app.set_mode(AppMode::Plan);
+    app.set_mode(AppMode::Agent);
+    assert!(!app.allow_shell);
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+
+    // User now turns shell on and tightens approvals while in Agent.
+    app.allow_shell = true;
+    app.approval_mode = ApprovalMode::Never;
+
+    // A Plan hop and back must restore the *edited* baseline, not the original.
+    app.set_mode(AppMode::Plan);
+    assert!(!app.allow_shell, "Plan is read-only");
+    app.set_mode(AppMode::Agent);
+    assert!(app.allow_shell, "edited shell baseline restored");
+    assert_eq!(app.approval_mode, ApprovalMode::Never);
+}
+
+#[test]
+fn yolo_start_with_default_config_restores_interactive_agent_shell_baseline() {
+    let mut app = App::new(test_options(true), &Config::default());
+    assert_eq!(app.mode, AppMode::Yolo);
+    assert!(app.allow_shell);
+    assert!(app.trust_mode);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
+
+    app.set_mode(AppMode::Agent);
+    assert!(
+        app.allow_shell,
+        "default interactive Agent baseline should expose approval-gated shell after YOLO downshift"
+    );
+    assert!(!app.trust_mode);
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
 }
 
 #[test]
@@ -1628,7 +1892,7 @@ fn leaving_yolo_after_startup_restores_baseline_policies() {
     assert_eq!(app.mode, AppMode::Yolo);
     assert!(app.allow_shell);
     assert!(app.trust_mode);
-    assert_eq!(app.approval_mode, ApprovalMode::Auto);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
 
     app.set_mode(AppMode::Agent);
     assert!(!app.allow_shell);
@@ -1790,6 +2054,8 @@ fn test_update_model_compaction_budget() {
     // depend on the developer's local `auto_compact_threshold_percent`
     // setting (App::new loads real settings) or on auto-model resolution.
     app.auto_model = false;
+    app.active_route_limits = None;
+    app.active_context_window_override = None;
     app.auto_compact_threshold_percent = 80.0;
 
     // A large-context model earns a proportionally larger compaction
@@ -2834,4 +3100,228 @@ fn delete_selection_noop_when_no_selection() {
     assert!(!app.delete_selection());
     assert_eq!(app.input, "hello");
     assert_eq!(app.cursor_position, 3);
+}
+
+// === #2574: capability-aware fallback eligibility ===============================
+
+/// Build an `App` whose fallback chain is `[active, fallbacks...]` with each
+/// provider's auth controlled via `config.providers` keys. Env-var keys for the
+/// providers under test are cleared so readiness is driven solely by config.
+fn app_with_fallback_chain(
+    active: ApiProvider,
+    fallbacks: &[codewhale_config::ProviderKind],
+    keyed: &[ApiProvider],
+) -> App {
+    let mut providers = ProvidersConfig::default();
+    for provider in keyed {
+        let entry = ProviderConfig {
+            api_key: Some(format!("test-key-{}", provider.as_str())),
+            ..Default::default()
+        };
+        match provider {
+            ApiProvider::Deepseek => providers.deepseek = entry,
+            ApiProvider::Openai => providers.openai = entry,
+            ApiProvider::Openrouter => providers.openrouter = entry,
+            ApiProvider::Together => providers.together = entry,
+            ApiProvider::Fireworks => providers.fireworks = entry,
+            other => panic!("unhandled keyed provider in test helper: {other:?}"),
+        }
+    }
+
+    let config = Config {
+        provider: Some(active.as_str().to_string()),
+        fallback_providers: fallbacks.to_vec(),
+        providers: Some(providers),
+        ..Default::default()
+    };
+
+    let mut options = test_options(false);
+    options.start_in_agent_mode = true;
+    options.skip_onboarding = true;
+    App::new(options, &config)
+}
+
+#[test]
+fn advance_fallback_skips_unauthed_middle_provider_and_lands_on_next_ready() {
+    let _lock = lock_test_env();
+    let _openai = EnvVarGuard::remove("OPENAI_API_KEY");
+    let _openrouter = EnvVarGuard::remove("OPENROUTER_API_KEY");
+    let _together = EnvVarGuard::remove("TOGETHER_API_KEY");
+
+    // Chain: Openai (active, keyed) -> Openrouter (no key) -> Together (keyed).
+    let mut app = app_with_fallback_chain(
+        ApiProvider::Openai,
+        &[
+            codewhale_config::ProviderKind::Openrouter,
+            codewhale_config::ProviderKind::Together,
+        ],
+        &[ApiProvider::Openai, ApiProvider::Together],
+    );
+    assert_eq!(app.fallback_chain_position(), Some(0));
+
+    // Openrouter is skipped (needs auth); we land on Together.
+    let next = app.advance_fallback("network error");
+    assert_eq!(next, Some(ApiProvider::Together));
+    assert_eq!(app.api_provider, ApiProvider::Together);
+    assert_eq!(app.fallback_chain_position(), Some(2));
+
+    let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("Fell back to together"),
+        "reason should name the landed provider: {reason}"
+    );
+    assert!(
+        reason.contains("skipped openrouter: needs auth"),
+        "reason should note the skipped provider: {reason}"
+    );
+}
+
+#[test]
+fn advance_fallback_local_provider_is_eligible_without_a_key() {
+    let _lock = lock_test_env();
+    let _openai = EnvVarGuard::remove("OPENAI_API_KEY");
+
+    // Chain: Openai (active, keyed) -> Ollama (local, no key needed).
+    let mut app = app_with_fallback_chain(
+        ApiProvider::Openai,
+        &[codewhale_config::ProviderKind::Ollama],
+        &[ApiProvider::Openai],
+    );
+
+    let next = app.advance_fallback("timeout");
+    assert_eq!(
+        next,
+        Some(ApiProvider::Ollama),
+        "self-hosted providers are ready without a key"
+    );
+    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
+    assert!(reason.contains("Fell back to ollama"), "{reason}");
+    assert!(
+        !reason.contains("skipped"),
+        "no providers should be skipped: {reason}"
+    );
+}
+
+#[test]
+fn advance_fallback_all_unready_exhausts_with_clear_reason() {
+    let _lock = lock_test_env();
+    let _openai = EnvVarGuard::remove("OPENAI_API_KEY");
+    let _openrouter = EnvVarGuard::remove("OPENROUTER_API_KEY");
+    let _together = EnvVarGuard::remove("TOGETHER_API_KEY");
+
+    // Chain: Openai (active, keyed) -> Openrouter (no key) -> Together (no key).
+    // Every fallback entry is unready, so the chain exhausts.
+    let mut app = app_with_fallback_chain(
+        ApiProvider::Openai,
+        &[
+            codewhale_config::ProviderKind::Openrouter,
+            codewhale_config::ProviderKind::Together,
+        ],
+        &[ApiProvider::Openai],
+    );
+
+    let next = app.advance_fallback("rate limited");
+    assert_eq!(next, None, "no ready fallback remains");
+    // Active provider is unchanged on exhaustion.
+    assert_eq!(app.api_provider, ApiProvider::Openai);
+
+    let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("Fallback chain exhausted"),
+        "reason should state exhaustion: {reason}"
+    );
+    assert!(
+        reason.contains("skipped openrouter: needs auth")
+            && reason.contains("skipped together: needs auth"),
+        "reason should note every skipped provider: {reason}"
+    );
+}
+
+#[test]
+fn advance_fallback_local_primary_does_not_fall_back_to_cloud() {
+    let _lock = lock_test_env();
+    let _openai = EnvVarGuard::remove("OPENAI_API_KEY");
+    let _deepseek = EnvVarGuard::remove("DEEPSEEK_API_KEY");
+
+    // Local primary (Ollama) -> cloud fallback (DeepSeek, fully keyed). The
+    // cloud entry is policy-blocked even though it is otherwise ready, so the
+    // chain exhausts rather than leaking a local/private route out to cloud.
+    let mut app = app_with_fallback_chain(
+        ApiProvider::Ollama,
+        &[codewhale_config::ProviderKind::Deepseek],
+        &[ApiProvider::Deepseek],
+    );
+
+    let next = app.advance_fallback("local runtime unavailable");
+    assert_eq!(next, None, "local->cloud fallback must be blocked");
+    assert_eq!(app.api_provider, ApiProvider::Ollama);
+
+    let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("local/private policy"),
+        "block reason must be visible and specific: {reason}"
+    );
+    assert!(
+        !reason.contains("needs auth"),
+        "the block is policy, not missing auth: {reason}"
+    );
+}
+
+#[test]
+fn advance_fallback_local_primary_may_fall_back_to_local_sibling() {
+    let _lock = lock_test_env();
+
+    // Local primary (Ollama) -> local sibling (vLLM). Both are self-hosted, so
+    // the local/private posture is preserved and the fallback is allowed.
+    let mut app = app_with_fallback_chain(
+        ApiProvider::Ollama,
+        &[codewhale_config::ProviderKind::Vllm],
+        &[],
+    );
+
+    let next = app.advance_fallback("local runtime unavailable");
+    assert_eq!(
+        next,
+        Some(ApiProvider::Vllm),
+        "local->local fallback stays within the private posture"
+    );
+    assert_eq!(app.api_provider, ApiProvider::Vllm);
+    let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
+    assert!(reason.contains("Fell back to vllm"), "{reason}");
+}
+
+#[test]
+fn advance_fallback_cloud_primary_can_hop_cloud_to_local_to_cloud() {
+    let _lock = lock_test_env();
+    let _openai = EnvVarGuard::remove("OPENAI_API_KEY");
+    let _deepseek = EnvVarGuard::remove("DEEPSEEK_API_KEY");
+
+    // The local/private guard is origin-based. A cloud primary may route to a
+    // local fallback and then to another cloud fallback if the cloud candidate
+    // is otherwise ready; only local/private primaries are blocked from leaking
+    // out to cloud.
+    let mut app = app_with_fallback_chain(
+        ApiProvider::Openai,
+        &[
+            codewhale_config::ProviderKind::Ollama,
+            codewhale_config::ProviderKind::Deepseek,
+        ],
+        &[ApiProvider::Openai, ApiProvider::Deepseek],
+    );
+
+    let local = app.advance_fallback("cloud provider timed out");
+    assert_eq!(local, Some(ApiProvider::Ollama));
+    assert_eq!(app.api_provider, ApiProvider::Ollama);
+
+    let cloud = app.advance_fallback("local runtime unavailable");
+    assert_eq!(cloud, Some(ApiProvider::Deepseek));
+    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+
+    let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
+    assert!(reason.contains("Fell back to deepseek"), "{reason}");
+    assert!(
+        !reason.contains("local/private policy"),
+        "cloud-primary chains should not trigger local/private blocking: {reason}"
+    );
 }

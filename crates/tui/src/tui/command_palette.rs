@@ -2,13 +2,13 @@
 
 use std::path::Path;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Padding, Paragraph, Widget, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -19,10 +19,13 @@ use crate::skills;
 use crate::tools::spec::ApprovalRequirement;
 use crate::tools::spec::ToolCapability;
 use crate::tools::{ToolContext, ToolRegistryBuilder};
-use crate::tui::views::{CommandPaletteAction, ModalKind, ModalView, ViewAction, ViewEvent};
+use crate::tui::views::{
+    ActionHint, CommandPaletteAction, ModalKind, ModalView, ViewAction, ViewEvent,
+    centered_modal_area, render_modal_footer, render_modal_surface,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum PaletteSection {
+pub enum PaletteSection {
     Action,
     Command,
     Skill,
@@ -37,6 +40,15 @@ pub struct CommandPaletteEntry {
     pub description: String,
     pub command: String,
     pub action: CommandPaletteAction,
+    show_on_empty_query: bool,
+}
+
+#[cfg(test)]
+impl CommandPaletteEntry {
+    #[must_use]
+    pub fn section(&self) -> PaletteSection {
+        self.section
+    }
 }
 
 pub struct CommandPaletteView {
@@ -81,6 +93,7 @@ pub fn build_entries(
                 description,
                 command: command.palette_command(),
                 action,
+                show_on_empty_query: command.show_in_empty_discovery(),
             });
         }
 
@@ -111,6 +124,7 @@ pub fn build_entries(
                 description,
                 command: slash_command,
                 action,
+                show_on_empty_query: true,
             });
         }
     });
@@ -129,6 +143,7 @@ pub fn build_entries(
             action: CommandPaletteAction::ExecuteCommand {
                 command: format!("${}", skill.name),
             },
+            show_on_empty_query: true,
         });
     }
 
@@ -196,6 +211,7 @@ pub fn build_entries(
                     title: format!("Tool: {}", tool.name()),
                     content: format_tool_details(tool.name(), tool.description(), &tags),
                 },
+                show_on_empty_query: true,
             })
         })
         .collect::<Vec<_>>();
@@ -251,6 +267,7 @@ fn build_mcp_entries(
         action: CommandPaletteAction::ExecuteCommand {
             command: "/mcp".to_string(),
         },
+        show_on_empty_query: true,
     }];
 
     let Some(snapshot) = snapshot else {
@@ -286,6 +303,7 @@ fn build_mcp_entries(
                 title: format!("MCP Server: {}", server.name),
                 content: format_mcp_server_details(snapshot, server),
             },
+            show_on_empty_query: true,
         });
 
         for tool in &server.tools {
@@ -309,6 +327,7 @@ fn build_mcp_entries(
                         tool.description.as_deref().unwrap_or("(no description)")
                     ),
                 },
+                show_on_empty_query: true,
             });
             // Add a "use" entry that inserts the tool's model_name into the input
             // so users can quickly reference the tool in their message to the AI.
@@ -327,6 +346,7 @@ fn build_mcp_entries(
                     action: CommandPaletteAction::InsertText {
                         text: tool.model_name.clone(),
                     },
+                    show_on_empty_query: true,
                 });
             }
         }
@@ -347,6 +367,7 @@ fn build_mcp_entries(
                         server.name, resource.name
                     ),
                 },
+                show_on_empty_query: true,
             });
         }
 
@@ -370,6 +391,7 @@ fn build_mcp_entries(
                         server.name, prompt.model_name
                     ),
                 },
+                show_on_empty_query: true,
             });
         }
     }
@@ -416,6 +438,7 @@ fn modal_block() -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::BORDER_COLOR))
+        .style(Style::default().bg(palette::DEEPSEEK_INK))
         .padding(Padding::uniform(1))
 }
 
@@ -465,7 +488,10 @@ fn command_runs_directly(name: &str) -> bool {
         "help"
             | "clear"
             | "exit"
+            | "provider"
+            | "model"
             | "models"
+            | "modeldb"
             | "queue"
             | "stash"
             | "hooks"
@@ -477,6 +503,9 @@ fn command_runs_directly(name: &str) -> bool {
             | "compact"
             | "export"
             | "config"
+            | "fleet"
+            | "mode"
+            | "statusline"
             | "yolo"
             | "agent"
             | "plan"
@@ -675,7 +704,12 @@ impl CommandPaletteView {
             .entries
             .iter()
             .enumerate()
-            .filter_map(|(idx, entry)| entry_match_score(entry, &terms).map(|score| (idx, score)))
+            .filter_map(|(idx, entry)| {
+                if terms.is_empty() && !entry.show_on_empty_query {
+                    return None;
+                }
+                entry_match_score(entry, &terms).map(|score| (idx, score))
+            })
             .collect::<Vec<_>>();
 
         filtered.sort_by_key(|(idx, score)| {
@@ -762,6 +796,15 @@ impl ModalView for CommandPaletteView {
         self
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.move_selection(-1),
+            MouseEventKind::ScrollDown => self.move_selection(1),
+            _ => {}
+        }
+        ViewAction::None
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         match key.code {
             KeyCode::Esc => ViewAction::Close,
@@ -824,16 +867,24 @@ impl ModalView for CommandPaletteView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_width = 90.min(area.width.saturating_sub(4));
-        let popup_height = 22.min(area.height.saturating_sub(4));
-        let popup_area = Rect {
-            x: (area.width.saturating_sub(popup_width)) / 2,
-            y: (area.height.saturating_sub(popup_height)) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
+        let popup_area = centered_modal_area(area, 90, 22, 44, 8);
+        let popup_width = popup_area.width;
 
-        Clear.render(popup_area, buf);
+        render_modal_surface(area, popup_area, buf);
+
+        let block = modal_block().title(" Command Palette ");
+        let inner = block.inner(popup_area);
+        block.render(popup_area, buf);
+
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("↑/↓/j/k", "move"),
+                ActionHint::new("Enter", "run/open"),
+                ActionHint::new("Esc", "close"),
+            ],
+        );
 
         let mut lines = Vec::new();
         let query_label = if self.query.is_empty() {
@@ -846,7 +897,11 @@ impl ModalView for CommandPaletteView {
             Style::default().fg(palette::TEXT_MUTED),
         )));
         let match_count = if self.query.is_empty() {
-            format!("{} entries", self.entries.len())
+            format!(
+                "{} shown / {} entries",
+                self.filtered.len(),
+                self.entries.len()
+            )
         } else {
             format!("{} / {} matches", self.filtered.len(), self.entries.len())
         };
@@ -863,9 +918,7 @@ impl ModalView for CommandPaletteView {
         // labels and separators, so the scroll window is sized against the real
         // rendered cost rather than a flat entry count (#2590).
         let header_lines = lines.len();
-        let available = (popup_height as usize)
-            .saturating_sub(2) // top + bottom border
-            .saturating_sub(header_lines);
+        let available = (content.height as usize).saturating_sub(header_lines);
         let mut action_count = 0usize;
         let mut command_count = 0usize;
         let mut skill_count = 0usize;
@@ -945,18 +998,9 @@ impl ModalView for CommandPaletteView {
             }
         }
 
-        let block = modal_block()
-            .title(" Command Palette ")
-            .title_bottom(Line::from(vec![
-                Span::styled(" ↑/↓/j/k move  ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::styled("Enter run/open  ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::styled("Esc close", Style::default().fg(palette::TEXT_MUTED)),
-            ]));
-
         Paragraph::new(lines)
-            .block(block)
             .wrap(Wrap { trim: false })
-            .render(popup_area, buf);
+            .render(content, buf);
     }
 }
 
@@ -1038,6 +1082,7 @@ mod tests {
             action: CommandPaletteAction::InsertText {
                 text: command.to_string(),
             },
+            show_on_empty_query: true,
         }
     }
 
@@ -1408,7 +1453,7 @@ mod tests {
             assert!(
                 entry
                     .description
-                    .contains(command.description_for(Locale::En)),
+                    .contains(&*command.description_for(Locale::En)),
                 "/{} palette description should include command help text",
                 command.name
             );
@@ -1424,7 +1469,44 @@ mod tests {
     }
 
     #[test]
-    fn command_palette_inserts_model_command_for_argument_entry() {
+    fn command_palette_hides_toolbox_commands_until_searched() {
+        let entries = build_entries(
+            Locale::En,
+            Path::new("."),
+            false,
+            Path::new("."),
+            Path::new("mcp.json"),
+            None,
+        );
+        let mut view = CommandPaletteView::new(entries);
+        let root_labels = view
+            .filtered
+            .iter()
+            .map(|idx| view.entries[*idx].label.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(root_labels.contains(&"/provider"));
+        assert!(root_labels.contains(&"/model"));
+        assert!(root_labels.contains(&"/fleet"));
+        assert!(root_labels.contains(&"/config"));
+        assert!(root_labels.contains(&"/statusline"));
+        assert!(!root_labels.contains(&"/rlm"));
+        assert!(!root_labels.contains(&"/modeldb"));
+        assert!(!root_labels.contains(&"/models"));
+        assert!(!root_labels.contains(&"/subagents"));
+
+        view.query = "rlm".to_string();
+        view.refilter();
+        assert!(
+            view.filtered
+                .iter()
+                .any(|idx| view.entries[*idx].label == "/rlm"),
+            "advanced /rlm should still be searchable"
+        );
+    }
+
+    #[test]
+    fn command_palette_runs_model_command_to_open_picker() {
         let entries = build_entries(
             Locale::En,
             Path::new("."),
@@ -1441,7 +1523,7 @@ mod tests {
         assert_eq!(model.command, "/model ");
         assert!(matches!(
             &model.action,
-            CommandPaletteAction::InsertText { text } if text == "/model "
+            CommandPaletteAction::ExecuteCommand { command } if command == "/model"
         ));
     }
 
@@ -1594,6 +1676,7 @@ mod tests {
             action: CommandPaletteAction::ExecuteCommand {
                 command: "/config".to_string(),
             },
+            show_on_empty_query: true,
         }];
         let mut view = CommandPaletteView::new(entries);
 
@@ -1604,5 +1687,66 @@ mod tests {
                 action: CommandPaletteAction::ExecuteCommand { .. }
             })
         ));
+    }
+
+    /// The four terminal sizes the v0.8.66 modal blocker (#3732) requires every
+    /// overlay to remain readable and fully operable at.
+    const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
+
+    fn sample_palette_view() -> CommandPaletteView {
+        let entries = vec![
+            palette_entry(PaletteSection::Command, "/config", "open config", "/config"),
+            palette_entry(PaletteSection::Command, "/model", "choose model", "/model"),
+            palette_entry(PaletteSection::Skill, "$search", "search skill", "$search"),
+            palette_entry(PaletteSection::Tool, "tool:git", "git tool", "git"),
+            palette_entry(PaletteSection::Mcp, "mcp:fs", "filesystem", "mcp_fs_read"),
+        ];
+        CommandPaletteView::new(entries)
+    }
+
+    #[test]
+    fn command_palette_is_usable_and_opaque_at_blocker_sizes() {
+        use crate::tui::views::ViewStack;
+        for (w, h) in BLOCKER_SIZES {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            for y in 0..h {
+                for x in 0..w {
+                    buf[(x, y)].set_symbol("X");
+                }
+            }
+            let mut stack = ViewStack::new();
+            stack.push(sample_palette_view());
+            stack.render(area, &mut buf);
+
+            let rows: Vec<String> = (0..h)
+                .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+                .collect();
+            let text = rows.join("\n");
+
+            // Footer keeps every action.
+            assert!(text.contains("move"), "{w}x{h}: missing 'move' hint");
+            assert!(
+                text.contains("run/open"),
+                "{w}x{h}: missing 'run/open' hint"
+            );
+            assert!(text.contains("close"), "{w}x{h}: missing 'close' hint");
+
+            // Composited frame is fully opaque.
+            assert!(!text.contains('X'), "{w}x{h}: background bleed-through");
+            assert_eq!(
+                buf[(w / 2, h / 2)].bg,
+                palette::DEEPSEEK_INK,
+                "{w}x{h}: modal interior must be opaque"
+            );
+
+            // No horizontal overflow.
+            for (y, row) in rows.iter().enumerate() {
+                assert!(
+                    UnicodeWidthStr::width(row.trim_end()) <= w as usize,
+                    "{w}x{h}: row {y} overflows width: {row:?}"
+                );
+            }
+        }
     }
 }

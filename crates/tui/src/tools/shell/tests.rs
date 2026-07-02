@@ -9,13 +9,11 @@ use windows::Win32::Foundation::{DUPLICATE_HANDLE_OPTIONS, DuplicateHandle, HAND
 #[cfg(windows)]
 use windows::Win32::System::Threading::GetCurrentProcess;
 
-// `env_lock` exists only to serialize Unix-only env-mutating tests.
-// Windows builds gate that test out, so the helper would be dead code
-// under `-Dwarnings` if the import + helper were unconditional.
-#[cfg(unix)]
+// `env_lock` serializes tests that mutate the process environment.
+#[cfg(any(unix, windows))]
 use std::sync::{Mutex, OnceLock};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -261,6 +259,42 @@ async fn read_only_shell_policy_allows_readonly_inspection() {
     );
 }
 
+#[tokio::test]
+async fn exec_shell_multiline_block_explains_allow_shell_boundary() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path());
+
+    let result = ExecShellTool
+        .execute(
+            json!({"command": "python3 -c \"print(1)\nprint(2)\""}),
+            &ctx,
+        )
+        .await
+        .expect("execute");
+
+    assert!(!result.success);
+    assert!(result.content.contains("Command contains multiple lines"));
+    assert!(
+        result
+            .content
+            .contains("allow_shell=true exposes shell tools"),
+        "{}",
+        result.content
+    );
+    assert!(
+        result
+            .content
+            .contains("Write multiline scripts to a file first"),
+        "{}",
+        result.content
+    );
+    assert!(
+        result.content.contains("task_shell_start"),
+        "{}",
+        result.content
+    );
+}
+
 #[test]
 fn exec_shell_wait_schema_defaults_to_nonblocking_snapshot() {
     let schema = ShellWaitTool::new("exec_shell_wait").input_schema();
@@ -459,6 +493,58 @@ fn shell_execution_scrubs_parent_env_and_keeps_explicit_env() {
 
     assert_eq!(result.status, ShellStatus::Completed);
     assert_eq!(result.stdout, "unset\nexplicit-value\n");
+}
+
+#[test]
+#[cfg(windows)]
+fn shell_execution_preserves_custom_windows_sdk_root_env() {
+    let _guard = env_lock().lock().expect("env lock");
+    let previous_sdk = std::env::var_os("BIMRV_SDK_ROOT");
+    let previous_secret = std::env::var_os("MY_SECRET_ROOT");
+    unsafe {
+        std::env::set_var("BIMRV_SDK_ROOT", r"F:\Lib\BimRv27.5");
+        std::env::set_var("MY_SECRET_ROOT", r"F:\Secrets");
+    }
+
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let command = if crate::shell_dispatcher::global_dispatcher()
+        .kind()
+        .is_powershell()
+    {
+        r#"[Console]::WriteLine($env:BIMRV_SDK_ROOT); if ($null -eq $env:MY_SECRET_ROOT) { [Console]::WriteLine("secret-unset") } else { [Console]::WriteLine("secret-set") }"#
+            .to_string()
+    } else {
+        r#"echo %BIMRV_SDK_ROOT% & if defined MY_SECRET_ROOT (echo secret-set) else (echo secret-unset)"#
+            .to_string()
+    };
+
+    let result = manager
+        .execute(&command, None, 5000, false)
+        .expect("execute");
+
+    unsafe {
+        match previous_sdk {
+            Some(value) => std::env::set_var("BIMRV_SDK_ROOT", value),
+            None => std::env::remove_var("BIMRV_SDK_ROOT"),
+        }
+        match previous_secret {
+            Some(value) => std::env::set_var("MY_SECRET_ROOT", value),
+            None => std::env::remove_var("MY_SECRET_ROOT"),
+        }
+    }
+
+    assert_eq!(result.status, ShellStatus::Completed);
+    assert!(
+        result.stdout.contains(r"F:\Lib\BimRv27.5"),
+        "custom SDK root should reach exec_shell stdout: {:?}",
+        result
+    );
+    assert!(
+        result.stdout.contains("secret-unset"),
+        "secret-like env should stay scrubbed: {:?}",
+        result
+    );
 }
 
 #[test]

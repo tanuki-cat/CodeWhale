@@ -35,9 +35,11 @@ use checklist::{
 use checklist::{ChecklistChange, ChecklistItemSnapshot, ChecklistSnapshot};
 use constants::{
     ASSISTANT_GLYPH, TOOL_CARD_SUMMARY_LINES, TOOL_COMMAND_LINE_LIMIT, TOOL_DONE_SYMBOL,
-    TOOL_FAILED_SYMBOL, TOOL_HEADER_SUMMARY_LIMIT, TOOL_OUTPUT_LINE_LIMIT, TOOL_RUNNING_SYMBOLS,
-    TOOL_STATUS_SYMBOL_MS, TRANSCRIPT_RAIL, USER_GLYPH,
+    TOOL_FAILED_SYMBOL, TOOL_HEADER_SUMMARY_LIMIT, TOOL_OUTPUT_LINE_LIMIT, TRANSCRIPT_RAIL,
+    USER_GLYPH,
 };
+#[cfg(test)]
+use constants::{TOOL_RUNNING_SYMBOLS, TOOL_STATUS_SYMBOL_MS};
 use message::{
     RenderedTranscriptLine, assistant_label_style_for, hard_break_copy_lines, message_body_style,
     render_message, render_message_with_copy_metadata, render_plain_message, render_user_message,
@@ -70,7 +72,7 @@ use std::process::Command;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderMode {
     /// Live in-stream view: thinking is collapsed to a summary, tool output is
-    /// truncated with a "Alt+V for details" affordance.
+    /// truncated with a visible details-pager affordance.
     Live,
     /// Full transcript view: every line of reasoning and tool output is
     /// emitted, no caps, no affordance.
@@ -281,23 +283,23 @@ impl HistoryCell {
                 folded ^ !options.verbose,
                 options.low_motion,
             ),
-            HistoryCell::Tool(cell) if !options.show_tool_details => {
+            HistoryCell::Tool(cell) if !options.show_tool_details && !cell.is_failed() => {
                 let mut lines = cell.lines_with_motion(width, options.low_motion);
                 if lines.len() > 2 {
                     lines.truncate(2);
                     lines.push(details_affordance_line(
-                        "details hidden",
+                        &crate::tui::key_shortcuts::tool_details_shortcut_action_hint("details"),
                         Style::default().fg(palette::TEXT_MUTED).italic(),
                     ));
                 }
                 lines
             }
-            HistoryCell::Tool(cell) if options.calm_mode => {
+            HistoryCell::Tool(cell) if options.calm_mode && !cell.is_failed() => {
                 let mut lines = cell.lines_with_motion(width, options.low_motion);
                 if lines.len() > TOOL_CARD_SUMMARY_LINES {
                     lines.truncate(TOOL_CARD_SUMMARY_LINES);
                     lines.push(details_affordance_line(
-                        "details hidden",
+                        &crate::tui::key_shortcuts::tool_details_shortcut_action_hint("details"),
                         Style::default().fg(palette::TEXT_MUTED).italic(),
                     ));
                 }
@@ -360,7 +362,7 @@ impl HistoryCell {
     }
 
     /// Render the cell in transcript mode: full content, no caps, no
-    /// "Alt+V for details" affordances.
+    /// visible details-pager affordances.
     ///
     /// Use this for full-detail pagers, clipboard exports, and any
     /// surface that wants the complete body rather than the live summary.
@@ -598,7 +600,7 @@ impl ToolCell {
     }
 
     /// Full-content rendering for the pager / clipboard. Tool output that
-    /// would be capped + suffixed with "Alt+V for details" in the live view
+    /// would be capped + suffixed with a details-pager hint in the live view
     /// is emitted in full here.
     pub fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
         self.render(width, /*low_motion*/ false, RenderMode::Transcript)
@@ -1355,7 +1357,8 @@ impl GenericToolCell {
                 ));
             }
         } else {
-            let show_args = matches!(self.status, ToolStatus::Running) || self.output.is_none();
+            let show_args = matches!(self.status, ToolStatus::Running | ToolStatus::Failed)
+                || self.output.is_none();
             if show_args && let Some(summary) = self.input_summary.as_ref() {
                 lines.extend(render_compact_kv(
                     "args",
@@ -1379,11 +1382,17 @@ impl GenericToolCell {
                 ));
                 lines.extend(diff_render::render_diff(output, width));
             } else {
+                let output_mode =
+                    if matches!(mode, RenderMode::Live) && self.status == ToolStatus::Failed {
+                        RenderMode::Transcript
+                    } else {
+                        mode
+                    };
                 lines.extend(render_tool_output_mode(
                     output,
                     width,
                     TOOL_OUTPUT_LINE_LIMIT,
-                    mode,
+                    output_mode,
                 ));
             }
 
@@ -1416,7 +1425,7 @@ impl GenericToolCell {
         // `checklist_update` always do on a successful match — render
         // only the changed item plus a `M/N · pct%` summary instead of
         // dumping the full list every time. The full list is still
-        // reachable via Alt+V on the tool detail record. This keeps the
+        // reachable via `v` on the tool detail record. This keeps the
         // transcript scannable in long sessions.
         if matches!(mode, RenderMode::Live)
             && let Some(change) = parse_update_prefix(output)
@@ -1477,7 +1486,7 @@ fn render_command_mode(command: &str, width: u16, mode: RenderMode) -> Vec<Line<
     {
         if count >= cap {
             lines.push(details_affordance_line(
-                "command clipped",
+                &crate::tui::key_shortcuts::tool_details_shortcut_action_hint("full command"),
                 Style::default().fg(palette::TEXT_MUTED),
             ));
             break;
@@ -1596,22 +1605,7 @@ fn render_cycle_boundary(content: &str, width: u16) -> Vec<Line<'static>> {
 fn status_symbol(started_at: Option<Instant>, status: ToolStatus, low_motion: bool) -> String {
     match status {
         ToolStatus::Running => {
-            if low_motion {
-                return TOOL_RUNNING_SYMBOLS[0].to_string();
-            }
-            let elapsed_ms = started_at.map_or_else(
-                || {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |duration| duration.as_millis())
-                },
-                |t| t.elapsed().as_millis(),
-            );
-            let cycle = u128::from(TOOL_STATUS_SYMBOL_MS);
-            let idx = elapsed_ms
-                .checked_div(cycle)
-                .map_or(0, |d| d % (TOOL_RUNNING_SYMBOLS.len() as u128));
-            TOOL_RUNNING_SYMBOLS[usize::try_from(idx).unwrap_or_default()].to_string()
+            crate::tui::spinner::braille_spinner_frame(started_at, low_motion).to_string()
         }
         ToolStatus::Success | ToolStatus::Hydrated => TOOL_DONE_SYMBOL.to_string(),
         ToolStatus::Failed => TOOL_FAILED_SYMBOL.to_string(),

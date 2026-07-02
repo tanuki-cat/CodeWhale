@@ -71,6 +71,7 @@ fn deepseek_api_key_reads_metadata_env_vars_for_newer_providers() -> Result<()> 
             "DEEPINFRA_API_KEY",
             "deepinfra-env-key",
         ),
+        (ApiProvider::Sakana, "FUGU_API_KEY", "fugu-env-key"),
         (
             ApiProvider::Together,
             "TOGETHER_API_KEY",
@@ -96,10 +97,47 @@ fn deepseek_api_key_reads_metadata_env_vars_for_newer_providers() -> Result<()> 
 }
 
 #[test]
+fn provider_context_window_loads_from_provider_table() -> Result<()> {
+    let config: Config = toml::from_str(
+        r#"
+provider = "openai"
+
+[providers.openai]
+model = "qwen3.7"
+context_window = 1000000
+"#,
+    )?;
+
+    config.validate()?;
+    assert_eq!(
+        config.context_window_for_provider_config(ApiProvider::Openai),
+        Some(1_000_000)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn provider_context_window_zero_is_invalid() {
+    let config: Config = toml::from_str(
+        r#"
+[providers.openai]
+context_window = 0
+"#,
+    )
+    .expect("zero is syntactically valid TOML");
+
+    let err = config
+        .validate()
+        .expect_err("zero context_window should be rejected");
+    assert!(err.to_string().contains("providers.openai.context_window"));
+}
+
+#[test]
 fn missing_provider_api_key_message_uses_provider_metadata() -> Result<()> {
     let message = missing_provider_api_key_message(ApiProvider::Zai)?;
 
-    assert!(message.contains("Z.ai (GLM Coding) API key not found"));
+    assert!(message.contains("Zhipu AI / Z.ai API key not found"));
     assert!(message.contains("https://z.ai/model-api"));
     assert!(message.contains("ZAI_API_KEY / Z_AI_API_KEY"));
     assert!(message.contains("[providers.zai] api_key"));
@@ -116,6 +154,34 @@ fn allow_shell_defaults_to_false_when_unset() {
         !config.allow_shell(),
         "Config::allow_shell() must default to false when no opt-in is recorded"
     );
+}
+
+// The interactive default is shell-on (approval-gated). Both interactive
+// startup and the durable Agent permission baseline (app.rs) read this single
+// method so the default cannot drift between launch modes; an explicit opt-out
+// is still honored.
+#[test]
+fn interactive_allow_shell_defaults_to_true_but_honors_explicit_opt_out() {
+    let default_config = Config::default();
+    assert!(
+        default_config.interactive_allow_shell(),
+        "interactive Agent sessions expose shell by default so approvals can gate commands"
+    );
+
+    let opted_out = Config {
+        allow_shell: Some(false),
+        ..Config::default()
+    };
+    assert!(
+        !opted_out.interactive_allow_shell(),
+        "explicit allow_shell = false still hides shell in interactive sessions"
+    );
+
+    let opted_in = Config {
+        allow_shell: Some(true),
+        ..Config::default()
+    };
+    assert!(opted_in.interactive_allow_shell());
 }
 
 #[test]
@@ -458,6 +524,84 @@ action = "session.compact"
 }
 
 #[test]
+fn tui_config_empty_hotbar_array_disables_defaults() {
+    let parsed: ConfigFile = toml::from_str("hotbar = []\n").expect("parse empty hotbar");
+
+    let resolved = parsed
+        .base
+        .resolve_hotbar_bindings(&["mode.plan", "session.compact"]);
+
+    assert_eq!(resolved.warnings, Vec::new());
+    assert_eq!(resolved.bindings, Vec::new());
+}
+
+#[test]
+fn profile_hotbar_override_replaces_entire_user_list() {
+    let mut profiles = HashMap::new();
+    profiles.insert(
+        "compact".to_string(),
+        Config {
+            hotbar: Some(vec![codewhale_config::HotbarBindingToml {
+                slot: 2,
+                action: "session.compact".to_string(),
+                label: Some("Compact".to_string()),
+            }]),
+            ..Config::default()
+        },
+    );
+    let config = ConfigFile {
+        base: Config {
+            hotbar: Some(vec![codewhale_config::HotbarBindingToml {
+                slot: 1,
+                action: "mode.plan".to_string(),
+                label: Some("Plan".to_string()),
+            }]),
+            ..Config::default()
+        },
+        profiles: Some(profiles),
+    };
+
+    let merged = apply_profile(config, Some("compact")).expect("profile");
+
+    assert_eq!(
+        merged.hotbar,
+        Some(vec![codewhale_config::HotbarBindingToml {
+            slot: 2,
+            action: "session.compact".to_string(),
+            label: Some("Compact".to_string()),
+        }])
+    );
+}
+
+#[test]
+fn profile_without_hotbar_keeps_base_hotbar() {
+    let mut profiles = HashMap::new();
+    profiles.insert("work".to_string(), Config::default());
+    let config = ConfigFile {
+        base: Config {
+            hotbar: Some(vec![codewhale_config::HotbarBindingToml {
+                slot: 1,
+                action: "mode.plan".to_string(),
+                label: None,
+            }]),
+            ..Config::default()
+        },
+        profiles: Some(profiles),
+    };
+
+    let merged = apply_profile(config, Some("work")).expect("profile");
+
+    assert_eq!(
+        merged.hotbar,
+        Some(vec![codewhale_config::HotbarBindingToml {
+            slot: 1,
+            action: "mode.plan".to_string(),
+            label: None,
+        }])
+    );
+}
+
+#[test]
 fn update_config_defaults_to_enabled_without_uri() {
     let config = Config::default();
     assert_eq!(config.update, None);
@@ -500,6 +644,44 @@ fn network_policy_toml_maps_proxy_hosts_to_runtime_policy() {
     assert_eq!(runtime.proxy, ["github.com", ".githubusercontent.com"]);
     assert!(runtime.trusts_proxy_fakeip_host("github.com"));
     assert!(runtime.trusts_proxy_fakeip_host("raw.githubusercontent.com"));
+}
+
+#[test]
+fn verifier_config_parses_hunt_policy_and_merges_overrides() {
+    let config: Config = toml::from_str(
+        r#"
+        [verifier]
+        enabled = true
+        verdict_policy = "hunt"
+        "#,
+    )
+    .expect("parse verifier config");
+
+    let verifier = config.verifier.expect("verifier table");
+    assert!(verifier.enabled);
+    assert_eq!(
+        verifier.verdict_policy,
+        codewhale_config::VerifierVerdictPolicy::Hunt
+    );
+
+    let merged = merge_config(
+        Config {
+            verifier: Some(codewhale_config::VerifierConfigToml {
+                enabled: false,
+                verdict_policy: codewhale_config::VerifierVerdictPolicy::Hunt,
+            }),
+            ..Config::default()
+        },
+        Config {
+            verifier: Some(codewhale_config::VerifierConfigToml {
+                enabled: true,
+                verdict_policy: codewhale_config::VerifierVerdictPolicy::Hunt,
+            }),
+            ..Config::default()
+        },
+    );
+
+    assert!(merged.verifier.expect("merged verifier").enabled);
 }
 
 #[test]
@@ -1565,6 +1747,61 @@ heartbeat_timeout_secs = 240
     assert_eq!(
         config.subagent_heartbeat_timeout_secs_for_provider(ApiProvider::Zai),
         240
+    );
+}
+
+#[test]
+fn provider_request_concurrency_defaults_to_zai_and_can_be_overridden() {
+    let default_zai: Config = toml::from_str(
+        r#"
+provider = "zai"
+"#,
+    )
+    .expect("parse zai provider config");
+    assert_eq!(
+        default_zai.provider_max_concurrency(ApiProvider::Zai),
+        Some(DEFAULT_ZAI_PROVIDER_MAX_CONCURRENCY)
+    );
+    assert_eq!(
+        default_zai.provider_max_concurrency(ApiProvider::Deepseek),
+        None
+    );
+
+    let configured: Config = toml::from_str(
+        r#"
+provider = "zai"
+
+[providers.zhipu]
+max-concurrency = 10
+"#,
+    )
+    .expect("parse zhipu concurrency alias");
+    assert_eq!(
+        configured.provider_max_concurrency(ApiProvider::Zai),
+        Some(10)
+    );
+
+    let disabled: Config = toml::from_str(
+        r#"
+provider = "zai"
+
+[providers.zai]
+maxConcurrency = 0
+"#,
+    )
+    .expect("parse disabled concurrency cap");
+    assert_eq!(disabled.provider_max_concurrency(ApiProvider::Zai), None);
+
+    let clamped: Config = toml::from_str(
+        r#"
+[providers.openai]
+concurrency = 999
+"#,
+    )
+    .expect("parse openai concurrency alias");
+    assert_eq!(
+        clamped.provider_max_concurrency(ApiProvider::Openai),
+        Some(MAX_PROVIDER_REQUEST_CONCURRENCY)
     );
 }
 
@@ -3029,7 +3266,7 @@ fn normalize_model_name_for_provider_maps_recent_openrouter_aliases() {
         ("kimi", OPENROUTER_KIMI_K2_7_CODE_MODEL),
         ("kimi-k2.6", OPENROUTER_KIMI_K2_6_MODEL),
         ("minimax-m3", OPENROUTER_MINIMAX_M3_MODEL),
-        ("minimax-2.7", OPENROUTER_MINIMAX_2_7_MODEL),
+        ("minimax-2.7", OPENROUTER_MINIMAX_M2_7_MODEL),
         ("gemma-4-31b-it", OPENROUTER_GEMMA_4_31B_MODEL),
         ("glm-5.1", OPENROUTER_GLM_5_1_MODEL),
         ("glm-5.2", OPENROUTER_GLM_5_2_MODEL),
@@ -3186,7 +3423,7 @@ fn model_completion_names_for_openrouter_include_recent_large_models() {
         OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL,
         OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL,
         OPENROUTER_MINIMAX_M3_MODEL,
-        OPENROUTER_MINIMAX_2_7_MODEL,
+        OPENROUTER_MINIMAX_M2_7_MODEL,
         OPENROUTER_QWEN_3_6_FLASH_MODEL,
         OPENROUTER_QWEN_3_6_35B_A3B_MODEL,
         OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL,
@@ -3266,6 +3503,14 @@ fn model_completion_names_for_minimax_include_direct_chat_models() {
     assert!(
         !models.contains(&OPENROUTER_MINIMAX_M3_MODEL),
         "direct MiniMax picker must not expose OpenRouter namespaced IDs"
+    );
+}
+
+#[test]
+fn model_completion_names_for_sakana_include_fugu_models() {
+    assert_eq!(
+        model_completion_names_for_provider(ApiProvider::Sakana),
+        vec![DEFAULT_SAKANA_MODEL, SAKANA_FUGU_ULTRA_MODEL]
     );
 }
 
@@ -3618,6 +3863,19 @@ fn nvidia_nim_provider_normalizes_deepseek_v4_pro_alias() -> Result<()> {
 
 #[test]
 fn nvidia_nim_provider_normalizes_deepseek_v4_flash_alias() -> Result<()> {
+    let _lock = lock_test_env();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_root = env::temp_dir().join(format!(
+        "codewhale-tui-nim-flash-model-alias-test-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&temp_root)?;
+    let _guard = EnvGuard::new(&temp_root);
+
     let config = Config {
         provider: Some("nvidia-nim".to_string()),
         default_text_model: Some("deepseek-v4-flash".to_string()),
@@ -4274,6 +4532,46 @@ model = "custom-qianfan-service-id"
         "https://qianfan.baidubce.com/v2"
     );
     assert_eq!(config.default_model(), "custom-qianfan-service-id");
+    Ok(())
+}
+
+#[test]
+fn provider_config_loads_reasoning_stream_style() -> Result<()> {
+    let _lock = lock_test_env();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_root = env::temp_dir().join(format!(
+        "codewhale-tui-reasoning-style-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&temp_root)?;
+    let _guard = EnvGuard::new(&temp_root);
+
+    let config_path = temp_root.join(".deepseek").join("config.toml");
+    ensure_parent_dir(&config_path)?;
+    fs::write(
+        &config_path,
+        r#"provider = "openai"
+
+[providers.openai]
+api_key = "openai-table-key"
+base_url = "https://openai-compatible.example/v1"
+model = "custom-reasoner"
+reasoning_stream_style = "inline_tags"
+"#,
+    )?;
+
+    let config = Config::load(None, None)?;
+    let openai = config
+        .provider_config_for(ApiProvider::Openai)
+        .expect("openai provider config");
+    assert_eq!(
+        openai.reasoning_stream_style.as_deref(),
+        Some("inline_tags")
+    );
     Ok(())
 }
 
@@ -6088,6 +6386,46 @@ fn provider_capability_deepseek_v4_pro_has_1m_window_and_thinking() {
 }
 
 #[test]
+fn provider_capability_deepseek_anthropic_uses_messages_payload() {
+    let cap = provider_capability(
+        ApiProvider::DeepseekAnthropic,
+        DEFAULT_DEEPSEEK_ANTHROPIC_MODEL,
+    );
+    assert_eq!(
+        cap.context_window,
+        crate::models::DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS
+    );
+    assert_eq!(cap.max_output, 384_000);
+    assert!(cap.thinking_supported);
+    assert!(!cap.cache_telemetry_supported);
+    assert_eq!(
+        cap.request_payload_mode,
+        RequestPayloadMode::AnthropicMessages
+    );
+    assert!(cap.alias_deprecation.is_none());
+}
+
+#[test]
+fn provider_capability_openmodel_uses_messages_payload() {
+    let cap = provider_capability(ApiProvider::Openmodel, DEFAULT_OPENMODEL_MODEL);
+    assert_eq!(cap.resolved_model, DEFAULT_OPENMODEL_MODEL);
+    assert_eq!(
+        cap.context_window,
+        crate::models::context_window_for_model(DEFAULT_OPENMODEL_MODEL).unwrap_or(200_000)
+    );
+    assert_eq!(
+        cap.max_output,
+        crate::models::max_output_tokens_for_model(DEFAULT_OPENMODEL_MODEL).unwrap_or(64_000)
+    );
+    assert!(!cap.cache_telemetry_supported);
+    assert_eq!(
+        cap.request_payload_mode,
+        RequestPayloadMode::AnthropicMessages
+    );
+    assert!(provider_passes_model_through(ApiProvider::Openmodel));
+}
+
+#[test]
 fn provider_capability_deepseek_v4_flash_has_1m_window_and_thinking() {
     let cap = provider_capability(ApiProvider::Deepseek, "deepseek-v4-flash");
     assert_eq!(
@@ -6220,7 +6558,7 @@ fn provider_capability_openrouter_recent_large_models_are_reasoning_aware() {
         (OPENROUTER_QWEN_3_6_PLUS_MODEL, 1_000_000, 65_536),
         (OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL, 1_000_000, 131_072),
         (OPENROUTER_MINIMAX_M3_MODEL, 1_000_000, 524_288),
-        (OPENROUTER_MINIMAX_2_7_MODEL, 204_800, 4096),
+        (OPENROUTER_MINIMAX_M2_7_MODEL, 204_800, 4096),
         (OPENROUTER_GLM_5_1_MODEL, 202_752, 131_072),
         (OPENROUTER_GLM_5_2_MODEL, 1_000_000, 131_072),
         (OPENROUTER_NEMOTRON_3_ULTRA_MODEL, 1_000_000, 16_384),
@@ -6779,4 +7117,129 @@ fn huggingface_short_env_fallbacks_configure_route() -> Result<()> {
     assert_eq!(config.deepseek_base_url(), "https://short-hf.example/v1");
     assert_eq!(config.default_model(), "org/short-model");
     Ok(())
+}
+
+// === #1519 custom OpenAI-compatible provider slice ===
+
+#[test]
+fn custom_provider_flatten_map_parses_alongside_named_provider() {
+    // A custom `[providers.my_thing]` table lands in the flatten map while a
+    // built-in `[providers.openai]` table still binds its named field.
+    let config: Config = toml::from_str(
+        r#"
+provider = "my_thing"
+
+[providers.openai]
+api_key = "openai-key"
+
+[providers.my_thing]
+kind = "openai-compatible"
+base_url = "https://api.example.com/v1"
+model = "custom-model-v1"
+api_key_env = "EXAMPLE_API_KEY"
+"#,
+    )
+    .expect("config with a custom provider table should parse");
+
+    let providers = config.providers.as_ref().expect("providers table present");
+    // Built-in named field still works.
+    assert_eq!(providers.openai.api_key.as_deref(), Some("openai-key"));
+    // The custom entry is captured by name in the flatten map.
+    let custom = providers
+        .custom_provider_config("my_thing")
+        .expect("custom entry parsed into flatten map");
+    assert_eq!(custom.kind.as_deref(), Some("openai-compatible"));
+    assert_eq!(
+        custom.base_url.as_deref(),
+        Some("https://api.example.com/v1")
+    );
+    assert_eq!(custom.model.as_deref(), Some("custom-model-v1"));
+    assert_eq!(custom.api_key_env.as_deref(), Some("EXAMPLE_API_KEY"));
+    assert!(custom.is_openai_compatible_custom());
+    // A built-in provider name never leaks into the custom map.
+    assert!(providers.custom_provider_config("openai").is_none());
+}
+
+#[test]
+fn api_provider_returns_custom_for_custom_name_and_deepseek_for_junk() {
+    // Names a real custom table → Custom (the #1519 silent-misroute fix).
+    let mut custom = HashMap::new();
+    custom.insert(
+        "my_thing".to_string(),
+        ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("https://api.example.com/v1".to_string()),
+            ..Default::default()
+        },
+    );
+    let config = Config {
+        provider: Some("my_thing".to_string()),
+        providers: Some(ProvidersConfig {
+            custom,
+            ..Default::default()
+        }),
+        ..Config::default()
+    };
+    assert_eq!(config.api_provider(), ApiProvider::Custom);
+
+    // Genuine junk that matches no built-in provider AND no custom table →
+    // falls back to DeepSeek, exactly as before this slice.
+    let junk = Config {
+        provider: Some("totally-not-a-provider".to_string()),
+        ..Config::default()
+    };
+    assert_eq!(junk.api_provider(), ApiProvider::Deepseek);
+}
+
+#[test]
+fn custom_provider_kind_only_accepts_openai_compatible() {
+    let ok = ProviderConfig {
+        kind: Some("openai-compatible".to_string()),
+        ..Default::default()
+    };
+    assert!(ok.is_openai_compatible_custom());
+
+    // Underscore spelling and case are tolerated.
+    let underscore = ProviderConfig {
+        kind: Some("OpenAI_Compatible".to_string()),
+        ..Default::default()
+    };
+    assert!(underscore.is_openai_compatible_custom());
+
+    // Any other declared wire format is rejected (callers error on these).
+    let other = ProviderConfig {
+        kind: Some("anthropic-messages".to_string()),
+        ..Default::default()
+    };
+    assert!(!other.is_openai_compatible_custom());
+
+    // Built-in providers leave `kind` unset.
+    assert!(!ProviderConfig::default().is_openai_compatible_custom());
+}
+
+#[test]
+fn custom_provider_base_url_and_model_resolve_from_named_table() {
+    let mut custom = HashMap::new();
+    custom.insert(
+        "my_thing".to_string(),
+        ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("https://api.example.com/v1".to_string()),
+            model: Some("custom-model-v1".to_string()),
+            ..Default::default()
+        },
+    );
+    let config = Config {
+        provider: Some("my_thing".to_string()),
+        providers: Some(ProvidersConfig {
+            custom,
+            ..Default::default()
+        }),
+        ..Config::default()
+    };
+
+    // Resolution reads the named table, not a DeepSeek default.
+    assert_eq!(config.api_provider(), ApiProvider::Custom);
+    assert_eq!(config.deepseek_base_url(), "https://api.example.com/v1");
+    assert_eq!(config.default_model(), "custom-model-v1");
 }

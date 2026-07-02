@@ -16,6 +16,9 @@ use wait_timeout::ChildExt;
 
 use crate::dependencies::ExternalTool;
 
+use rust_i18n::i18n;
+i18n!("locales", fallback = ["en"]);
+
 mod acp_server;
 mod artifacts;
 mod audit;
@@ -43,6 +46,7 @@ mod execpolicy;
 mod features;
 mod fleet;
 mod goal_loop;
+mod hashing;
 mod hooks;
 mod llm_client;
 mod llm_response_cache;
@@ -61,6 +65,7 @@ mod models;
 mod network_policy;
 mod oauth;
 mod palette;
+mod plugins;
 mod prefix_cache;
 mod pricing;
 mod project_context;
@@ -75,11 +80,16 @@ mod request_tuning;
 mod resource_telemetry;
 mod retry_status;
 pub mod rlm;
+mod route_budget;
+mod route_runtime;
 mod runtime_api;
 mod runtime_log;
 mod runtime_threads;
 mod sandbox;
+mod scorecard;
 mod seam_manager;
+#[allow(dead_code)]
+mod session_diagnostics;
 #[allow(dead_code)]
 mod session_manager;
 mod settings;
@@ -106,7 +116,7 @@ use crate::config::{Config, DEFAULT_TEXT_MODEL, MAX_SUBAGENTS, effective_home_di
 use crate::eval::{EvalHarness, EvalHarnessConfig, ScenarioStepKind};
 use crate::features::{Feature, render_feature_table};
 use crate::llm_client::LlmClient;
-use crate::mcp::{McpConfig, McpPool, McpServerConfig};
+use crate::mcp::{McpConfig, McpPool, McpServerConfig, McpServerOAuthConfig};
 use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt};
 use crate::session_manager::{SessionManager, create_saved_session, truncate_id};
 use crate::tui::history::{summarize_tool_args, summarize_tool_output};
@@ -215,6 +225,8 @@ struct Cli {
 enum Commands {
     /// Run system diagnostics and check configuration
     Doctor(DoctorArgs),
+    /// Summarize failure signals from a local JSONL session log without raw content
+    SessionDiagnostics(SessionDiagnosticsArgs),
     /// Bootstrap MCP config and/or skills directories
     Setup(SetupArgs),
     /// Generate a remote CodeWhale agent deploy bundle (cloud + chat bridge)
@@ -276,6 +288,8 @@ enum Commands {
     Apply(ApplyArgs),
     /// Run the offline evaluation harness (no network/LLM calls)
     Eval(EvalArgs),
+    /// Score a run's token/cache/cost from recorded turns; flag regressions vs a baseline (#3388)
+    Scorecard(ScorecardArgs),
     /// Manage MCP servers
     Mcp {
         #[command(subcommand)]
@@ -371,6 +385,68 @@ enum ExecOutputFormat {
     StreamJson,
 }
 
+const CODEWHALE_TOOL_SURFACE_ENV: &str = "CODEWHALE_TOOL_SURFACE";
+const SHELL_ONLY_EXEC_TOOLS: &[&str] = &["exec_shell", "exec_shell_wait", "exec_shell_interact"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecToolSurface {
+    ShellOnly,
+}
+
+fn exec_tool_surface_from_env() -> Option<ExecToolSurface> {
+    std::env::var(CODEWHALE_TOOL_SURFACE_ENV)
+        .ok()
+        .and_then(|value| {
+            if should_warn_unknown_exec_tool_surface(&value) {
+                eprintln!(
+                    "warning: unrecognized {CODEWHALE_TOOL_SURFACE_ENV}; leaving exec tool surface unchanged. Use `shell-only`, `full`, or `native-tools`."
+                );
+            }
+            parse_exec_tool_surface(&value)
+        })
+}
+
+fn parse_exec_tool_surface(value: &str) -> Option<ExecToolSurface> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "shell-only" | "shell_only" | "shell" => Some(ExecToolSurface::ShellOnly),
+        "full" | "native-tools" | "native_tools" | "" => None,
+        _ => None,
+    }
+}
+
+fn should_warn_unknown_exec_tool_surface(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    !matches!(
+        normalized.as_str(),
+        "" | "shell-only" | "shell_only" | "shell" | "full" | "native-tools" | "native_tools"
+    )
+}
+
+fn normalize_exec_tool_names(tools: &[String]) -> Vec<String> {
+    tools
+        .iter()
+        .map(|name| name.to_ascii_lowercase().trim().to_string())
+        .collect()
+}
+
+fn shell_only_exec_allowed_tools() -> Vec<String> {
+    SHELL_ONLY_EXEC_TOOLS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn resolve_exec_allowed_tools(
+    cli_allowed_tools: Option<&[String]>,
+    env_tool_surface: Option<ExecToolSurface>,
+) -> Option<Vec<String>> {
+    if let Some(tools) = cli_allowed_tools {
+        return Some(normalize_exec_tool_names(tools));
+    }
+
+    env_tool_surface.map(|ExecToolSurface::ShellOnly| shell_only_exec_allowed_tools())
+}
+
 #[derive(Args, Debug, Clone)]
 struct FleetArgs {
     #[command(subcommand)]
@@ -409,6 +485,14 @@ enum FleetCommand {
     Restart {
         /// Worker id printed by `codewhale fleet run`
         worker_id: String,
+    },
+    /// Resume a run from durable ledger state, reconciling orphaned/stale leases
+    Resume {
+        /// Run id printed by `codewhale fleet run`
+        run_id: String,
+        /// Seconds without heartbeat before a leased task is treated as stale
+        #[arg(long, default_value_t = 300)]
+        stale_after_seconds: u64,
     },
     /// Stop all queued and running fleet work
     Stop {
@@ -626,6 +710,34 @@ struct DoctorArgs {
     /// Emit only the diagnostic context source map as JSON
     #[arg(long, default_value_t = false, conflicts_with = "json")]
     context_json: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct SessionDiagnosticsArgs {
+    /// JSONL session log to inspect
+    #[arg(value_name = "JSONL")]
+    path: PathBuf,
+    /// Emit machine-readable JSON with redacted source handles
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ScorecardArgs {
+    /// JSON file with the recorded turns to score: an array of
+    /// `{ "turn_id", "model", "usage": {…} }` (the shape the TurnEnd hook emits).
+    #[arg(long, value_name = "FILE")]
+    input: PathBuf,
+    /// Optional baseline scorecard-metrics JSON to compare against. When set,
+    /// the command exits non-zero if any metric regresses past the threshold.
+    #[arg(long, value_name = "FILE")]
+    baseline: Option<PathBuf>,
+    /// Regression threshold, in percent increase over the baseline.
+    #[arg(long, default_value_t = 5.0)]
+    threshold: f64,
+    /// Emit machine-readable JSON instead of the human summary.
+    #[arg(long, default_value_t = false)]
+    json: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -886,9 +998,34 @@ enum McpCommand {
         /// Explicit URL transport override. Use "sse" for legacy SSE endpoints.
         #[arg(long, requires = "url")]
         transport: Option<String>,
+        /// Environment variable containing a bearer token for URL-based servers
+        #[arg(long, requires = "url")]
+        bearer_token_env_var: Option<String>,
+        /// OAuth client ID for servers that do not support dynamic registration
+        #[arg(long, requires = "url")]
+        oauth_client_id: Option<String>,
+        /// OAuth resource parameter to append to the authorization URL
+        #[arg(long, requires = "url")]
+        oauth_resource: Option<String>,
+        /// OAuth scope to request during login. Repeat or comma-separate.
+        #[arg(long = "scope", requires = "url", value_delimiter = ',')]
+        scopes: Vec<String>,
         /// Arguments for command-based servers
         #[arg(long = "arg")]
         args: Vec<String>,
+    },
+    /// Authenticate to a URL-based MCP server using OAuth
+    Login {
+        /// Server name
+        name: String,
+        /// OAuth scope to request. Repeat or comma-separate; defaults to config/discovery.
+        #[arg(long = "scope", value_delimiter = ',')]
+        scopes: Vec<String>,
+    },
+    /// Delete stored OAuth credentials for a URL-based MCP server
+    Logout {
+        /// Server name
+        name: String,
     },
     /// Remove an MCP server entry
     Remove {
@@ -1056,6 +1193,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     logging::set_verbose(cli.verbose || logging::env_requests_verbose_logging());
 
+    // Install any user prompt overrides from the config directory before an
+    // engine can compose a system prompt. The override cells are
+    // first-call-wins; doing this once here keeps every downstream turn
+    // consistent. Missing files are a no-op (bundled defaults). See #3638.
+    crate::prompts::load_prompt_overrides_from_config_home();
+
     // Handle subcommands first
     if let Some(command) = cli.command.clone() {
         return match command {
@@ -1071,6 +1214,7 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
             }
+            Commands::SessionDiagnostics(args) => run_session_diagnostics(args),
             Commands::Setup(args) => {
                 let config = load_config_from_cli(&cli)?;
                 let workspace = resolve_workspace(&cli);
@@ -1121,6 +1265,7 @@ async fn main() -> Result<()> {
                 // the DEEPSEEK_YOLO env var (which the config loader folds into
                 // `config.yolo`), not as a CLI flag. Honour either source.
                 let yolo = cli.yolo || config.yolo.unwrap_or(false);
+                let env_tool_surface = exec_tool_surface_from_env();
                 let needs_engine = args.auto
                     || yolo
                     || resume_session_id.is_some()
@@ -1128,7 +1273,8 @@ async fn main() -> Result<()> {
                     || args.max_turns.is_some()
                     || args.allowed_tools.is_some()
                     || args.disallowed_tools.is_some()
-                    || args.append_system_prompt.is_some();
+                    || args.append_system_prompt.is_some()
+                    || env_tool_surface.is_some();
                 if needs_engine {
                     let provider = config.api_provider();
                     let max_subagents = cli.max_subagents.map_or_else(
@@ -1137,16 +1283,12 @@ async fn main() -> Result<()> {
                     );
                     let auto_mode = args.auto || yolo;
                     let max_turns = args.max_turns.unwrap_or(100);
-                    let allowed_tools = args.allowed_tools.as_ref().map(|v| {
-                        v.iter()
-                            .map(|s| s.to_ascii_lowercase().trim().to_string())
-                            .collect::<Vec<_>>()
-                    });
-                    let disallowed_tools = args.disallowed_tools.as_ref().map(|v| {
-                        v.iter()
-                            .map(|s| s.to_ascii_lowercase().trim().to_string())
-                            .collect::<Vec<_>>()
-                    });
+                    let allowed_tools =
+                        resolve_exec_allowed_tools(args.allowed_tools.as_deref(), env_tool_surface);
+                    let disallowed_tools = args
+                        .disallowed_tools
+                        .as_deref()
+                        .map(normalize_exec_tool_names);
                     run_exec_agent(
                         &config,
                         &model,
@@ -1189,6 +1331,7 @@ async fn main() -> Result<()> {
             }
             Commands::Apply(args) => run_apply(args),
             Commands::Eval(args) => run_eval(args),
+            Commands::Scorecard(args) => run_scorecard(args),
             Commands::Mcp { command } => {
                 let config = load_config_from_cli(&cli)?;
                 let workspace = resolve_workspace(&cli);
@@ -1237,6 +1380,7 @@ async fn main() -> Result<()> {
                             insecure_no_auth: args.insecure_no_auth,
                             mobile: args.mobile,
                             show_qr: args.qr,
+                            config_path: cli.config.clone(),
                         },
                     )
                     .await
@@ -1267,6 +1411,7 @@ async fn main() -> Result<()> {
     // for follow-up messages. Use `codewhale exec` for explicit non-interactive
     // one-shot behavior (#2370).
     let config = load_config_from_cli(&cli)?;
+    crate::plugins::init_registry(&[]);
     if let Some(initial_input) = top_level_prompt_initial_input(&cli.prompt) {
         return run_interactive(&cli, &config, None, Some(initial_input)).await;
     }
@@ -1288,7 +1433,7 @@ async fn main() -> Result<()> {
     };
 
     // Default: Interactive TUI
-    // --yolo starts in YOLO mode (auto-approve; shell if allow_shell=true)
+    // --yolo starts in YOLO mode (auto-approve; shell enabled)
     run_interactive(&cli, &config, resume_session_id, None).await
 }
 
@@ -1365,6 +1510,68 @@ fn run_eval(args: EvalArgs) -> Result<()> {
         Ok(())
     } else {
         bail!("offline evaluation harness reported failure")
+    }
+}
+
+/// Score a run's token/cache/cost from recorded turns and (optionally) flag
+/// regressions against a committed baseline. Offline: reads recorded usage from
+/// a JSON file, reuses the pricing layer, never calls a model. Exits non-zero
+/// when a baseline is supplied and a metric regresses past the threshold, so it
+/// can be wired as a release gate (#3388).
+fn run_scorecard(args: ScorecardArgs) -> Result<()> {
+    use crate::scorecard::{RecordedTurn, Scorecard, ScorecardMetrics, TurnInput};
+
+    let raw = std::fs::read_to_string(&args.input)
+        .with_context(|| format!("failed to read scorecard input {}", args.input.display()))?;
+    let recorded: Vec<RecordedTurn> = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse scorecard input {}", args.input.display()))?;
+
+    let inputs: Vec<TurnInput<'_>> = recorded
+        .iter()
+        .map(|r| TurnInput {
+            turn_id: r.turn_id.clone(),
+            model: r.model.clone(),
+            usage: &r.usage,
+        })
+        .collect();
+    let card = Scorecard::from_turns(&inputs);
+
+    let regressions = match &args.baseline {
+        Some(path) => {
+            let baseline_raw = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read baseline {}", path.display()))?;
+            let baseline: ScorecardMetrics = serde_json::from_str(&baseline_raw)
+                .with_context(|| format!("failed to parse baseline {}", path.display()))?;
+            card.metrics.regressions_against(&baseline, args.threshold)
+        }
+        None => Vec::new(),
+    };
+
+    if args.json {
+        let out = serde_json::json!({
+            "per_turn": card.per_turn,
+            "metrics": card.metrics,
+            "regressions": regressions,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        print!("{}", card.to_summary());
+        for r in &regressions {
+            println!(
+                "REGRESSION {}: baseline {:.4} -> current {:.4} (+{:.1}%)",
+                r.metric, r.baseline, r.current, r.pct_increase
+            );
+        }
+    }
+
+    if regressions.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "{} metric(s) regressed past the {:.1}% threshold",
+            regressions.len(),
+            args.threshold
+        )
     }
 }
 
@@ -1707,6 +1914,23 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
             print_inspection(&inspection);
             Ok(())
         }
+        FleetCommand::Resume {
+            run_id,
+            stale_after_seconds,
+        } => {
+            let manager = manager.with_stale_after(Duration::from_secs(stale_after_seconds.max(1)));
+            let report = manager.resume_run(&FleetRunId::from(run_id))?;
+            println!(
+                "fleet resume: {} reclaimed_stale={} restarted={} failed={} escalated={}",
+                report.run_id.0,
+                report.reclaimed_stale,
+                report.restarted,
+                report.failed,
+                report.escalated
+            );
+            print_status(&report.status);
+            Ok(())
+        }
         FleetCommand::Stop { all } => {
             if !all {
                 bail!("pass --all to stop all fleet work");
@@ -1798,6 +2022,36 @@ fn mcp_template_json() -> Result<String> {
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: std::collections::HashMap::new(),
+            env_headers: std::collections::HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
+        },
+    );
+    cfg.servers.insert(
+        "moraine-mcp".to_string(),
+        McpServerConfig {
+            command: Some("moraine".to_string()),
+            args: vec!["mcp".to_string()],
+            env: std::collections::HashMap::new(),
+            cwd: None,
+            url: None,
+            transport: None,
+            connect_timeout: None,
+            execute_timeout: None,
+            read_timeout: None,
+            disabled: true,
+            enabled: true,
+            required: false,
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            headers: std::collections::HashMap::new(),
+            env_headers: std::collections::HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         },
     );
     serde_json::to_string_pretty(&cfg)
@@ -2426,6 +2680,25 @@ fn run_setup_clean(checkpoints_dir: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
+fn run_session_diagnostics(args: SessionDiagnosticsArgs) -> Result<()> {
+    let contents = std::fs::read_to_string(&args.path).with_context(|| {
+        format!(
+            "read session diagnostic JSONL from {}",
+            crate::utils::display_path(&args.path)
+        )
+    })?;
+    let summary = crate::session_diagnostics::analyze_session_failure_jsonl(&contents);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "{}",
+            crate::session_diagnostics::format_redacted_failure_summary(&summary)
+        );
+    }
+    Ok(())
+}
+
 /// Run system diagnostics
 async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Option<&Path>) {
     use crate::palette;
@@ -2551,6 +2824,12 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
             crate::utils::display_path(&legacy_home)
         );
     }
+    let legacy_state_report = doctor_legacy_state_report(&code_home, &legacy_home);
+    print_doctor_legacy_state_report(
+        &legacy_state_report,
+        (aqua_r, aqua_g, aqua_b),
+        (sky_r, sky_g, sky_b),
+    );
 
     // Check API keys
     println!();
@@ -3260,7 +3539,7 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
     }
     if crate::settings::detected_legacy_windows_console_host() {
         println!(
-            "  {} legacy Windows console host → low_motion + fancy_animations=false + synchronized_output=off (auto)",
+            "  {} legacy Windows console host → low_motion + fancy_animations=false + bracketed_paste=false + synchronized_output=off (auto)",
             "•".truecolor(sky_r, sky_g, sky_b)
         );
         any_quirk = true;
@@ -3299,6 +3578,180 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
             .truecolor(aqua_r, aqua_g, aqua_b)
             .bold()
     );
+}
+
+const DOCTOR_LEGACY_STATE_ITEMS: &[&str] = &[
+    "sessions",
+    "tasks",
+    "skills",
+    "slop_ledger",
+    "trophies",
+    "catalog",
+    "review-receipts",
+    "config.toml",
+    "settings.toml",
+    "mcp.json",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorLegacyStateStatus {
+    PrimaryOnly,
+    LegacyOnly,
+    Both,
+    Absent,
+}
+
+impl DoctorLegacyStateStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PrimaryOnly => "primary_only",
+            Self::LegacyOnly => "legacy_only",
+            Self::Both => "both",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DoctorLegacyStateEntry {
+    name: &'static str,
+    primary_path: PathBuf,
+    legacy_path: PathBuf,
+    primary_present: bool,
+    legacy_present: bool,
+    status: DoctorLegacyStateStatus,
+}
+
+fn doctor_legacy_state_status(
+    primary_present: bool,
+    legacy_present: bool,
+) -> DoctorLegacyStateStatus {
+    match (primary_present, legacy_present) {
+        (true, false) => DoctorLegacyStateStatus::PrimaryOnly,
+        (false, true) => DoctorLegacyStateStatus::LegacyOnly,
+        (true, true) => DoctorLegacyStateStatus::Both,
+        (false, false) => DoctorLegacyStateStatus::Absent,
+    }
+}
+
+fn doctor_legacy_state_report(
+    primary_root: &Path,
+    legacy_root: &Path,
+) -> Vec<DoctorLegacyStateEntry> {
+    DOCTOR_LEGACY_STATE_ITEMS
+        .iter()
+        .copied()
+        .map(|name| {
+            let primary_path = primary_root.join(name);
+            let legacy_path = legacy_root.join(name);
+            let primary_present = primary_path.exists();
+            let legacy_present = legacy_path.exists();
+            let status = doctor_legacy_state_status(primary_present, legacy_present);
+            DoctorLegacyStateEntry {
+                name,
+                primary_path,
+                legacy_path,
+                primary_present,
+                legacy_present,
+                status,
+            }
+        })
+        .collect()
+}
+
+fn legacy_state_needs_attention(entry: &DoctorLegacyStateEntry) -> bool {
+    matches!(
+        entry.status,
+        DoctorLegacyStateStatus::LegacyOnly | DoctorLegacyStateStatus::Both
+    )
+}
+
+fn print_doctor_legacy_state_report(
+    report: &[DoctorLegacyStateEntry],
+    ok_rgb: (u8, u8, u8),
+    warn_rgb: (u8, u8, u8),
+) {
+    use colored::Colorize;
+
+    let attention: Vec<_> = report
+        .iter()
+        .filter(|entry| legacy_state_needs_attention(entry))
+        .collect();
+    if attention.is_empty() {
+        println!(
+            "  {} legacy state: no known .deepseek entries need migration",
+            "✓".truecolor(ok_rgb.0, ok_rgb.1, ok_rgb.2)
+        );
+        return;
+    }
+
+    println!(
+        "  {} legacy state needs review:",
+        "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2)
+    );
+    for entry in attention {
+        match entry.status {
+            DoctorLegacyStateStatus::LegacyOnly => {
+                println!(
+                    "    {} {} exists but {} is missing",
+                    "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2),
+                    crate::utils::display_path(&entry.legacy_path),
+                    crate::utils::display_path(&entry.primary_path),
+                );
+            }
+            DoctorLegacyStateStatus::Both => {
+                println!(
+                    "    {} {} exists alongside primary {}; legacy data may still need review",
+                    "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2),
+                    crate::utils::display_path(&entry.legacy_path),
+                    crate::utils::display_path(&entry.primary_path),
+                );
+            }
+            DoctorLegacyStateStatus::PrimaryOnly | DoctorLegacyStateStatus::Absent => {}
+        }
+    }
+    println!(
+        "    Run `codewhale setup --migrate` or start CodeWhale once to trigger safe migration where available."
+    );
+}
+
+fn doctor_legacy_state_json(
+    primary_root: &Path,
+    legacy_root: &Path,
+    report: &[DoctorLegacyStateEntry],
+) -> serde_json::Value {
+    use serde_json::json;
+
+    let legacy_only = report
+        .iter()
+        .filter(|entry| entry.status == DoctorLegacyStateStatus::LegacyOnly)
+        .count();
+    let both = report
+        .iter()
+        .filter(|entry| entry.status == DoctorLegacyStateStatus::Both)
+        .count();
+    let entries: Vec<_> = report
+        .iter()
+        .map(|entry| {
+            json!({
+                "name": entry.name,
+                "primary_path": entry.primary_path.display().to_string(),
+                "legacy_path": entry.legacy_path.display().to_string(),
+                "primary_present": entry.primary_present,
+                "legacy_present": entry.legacy_present,
+                "status": entry.status.as_str(),
+            })
+        })
+        .collect();
+
+    json!({
+        "primary_root": primary_root.display().to_string(),
+        "legacy_root": legacy_root.display().to_string(),
+        "needs_attention": legacy_only > 0 || both > 0,
+        "legacy_only_count": legacy_only,
+        "dual_present_count": both,
+        "entries": entries,
+    })
 }
 
 /// Machine-readable counterpart to `run_doctor`. Skips the live API call so it
@@ -3440,12 +3893,18 @@ fn run_doctor_json(
     let api_target = doctor_api_target(config);
     let strict_tool_mode = doctor_strict_tool_mode_status(config);
     let tls_status = doctor_tls_status(config);
+    let code_home =
+        codewhale_config::codewhale_home().unwrap_or_else(|_| PathBuf::from("~/.codewhale"));
+    let legacy_home =
+        codewhale_config::legacy_deepseek_home().unwrap_or_else(|_| PathBuf::from("~/.deepseek"));
+    let legacy_state_report = doctor_legacy_state_report(&code_home, &legacy_home);
 
     let report = json!({
         "version": env!("CARGO_PKG_VERSION"),
         "config_path": config_path.display().to_string(),
         "config_present": config_path.exists(),
         "workspace": workspace.display().to_string(),
+        "legacy_state": doctor_legacy_state_json(&code_home, &legacy_home, &legacy_state_report),
         "api_key": {
             "source": api_key_state,
         },
@@ -5013,6 +5472,18 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
                 } else {
                     "disabled"
                 };
+                let auth_status = crate::mcp::oauth::auth_status_for_server(&name, &server).await;
+                let auth = if auth_status == crate::mcp::oauth::McpAuthStatus::Unsupported {
+                    String::new()
+                } else {
+                    format!(
+                        " auth={}",
+                        auth_status
+                            .to_string()
+                            .to_ascii_lowercase()
+                            .replace(' ', "-")
+                    )
+                };
                 let args = if server.args.is_empty() {
                     "".to_string()
                 } else {
@@ -5026,14 +5497,20 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
                     "unknown".to_string()
                 };
                 let required = if server.required { " required" } else { "" };
-                println!("  - {name} [{status}{required}] {cmd_str}");
+                println!("  - {name} [{status}{required}{auth}] {cmd_str}");
             }
             Ok(())
         }
         McpCommand::Connect { server } => {
             let mut pool = McpPool::from_config_path_with_workspace(&config_path, workspace)?;
             if let Some(name) = server {
-                pool.get_or_connect(&name).await?;
+                if let Err(err) = pool.get_or_connect(&name).await {
+                    if crate::mcp::oauth::error_looks_auth_required(&err) {
+                        let hint = crate::mcp::oauth::auth_required_login_hint(&name);
+                        return Err(err).context(hint);
+                    }
+                    return Err(err);
+                }
                 println!("Connected to MCP server: {name}");
             } else {
                 let errors = pool.connect_all().await;
@@ -5042,6 +5519,9 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
                 } else {
                     for (name, err) in errors {
                         eprintln!("Failed to connect {name}: {err:#}");
+                        if crate::mcp::oauth::error_looks_auth_required(&err) {
+                            eprintln!("  {}", crate::mcp::oauth::auth_required_login_hint(&name));
+                        }
                     }
                 }
             }
@@ -5050,7 +5530,16 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
         McpCommand::Tools { server } => {
             let mut pool = McpPool::from_config_path_with_workspace(&config_path, workspace)?;
             if let Some(name) = server {
-                let conn = pool.get_or_connect(&name).await?;
+                let conn = match pool.get_or_connect(&name).await {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        if crate::mcp::oauth::error_looks_auth_required(&err) {
+                            let hint = crate::mcp::oauth::auth_required_login_hint(&name);
+                            return Err(err).context(hint);
+                        }
+                        return Err(err);
+                    }
+                };
                 if conn.tools().is_empty() {
                     println!("No tools found for MCP server: {name}");
                 } else {
@@ -5066,7 +5555,13 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
                     }
                 }
             } else {
-                let _ = pool.connect_all().await;
+                let errors = pool.connect_all().await;
+                for (name, err) in errors {
+                    eprintln!("Failed to connect {name}: {err:#}");
+                    if crate::mcp::oauth::error_looks_auth_required(&err) {
+                        eprintln!("  {}", crate::mcp::oauth::auth_required_login_hint(&name));
+                    }
+                }
                 let tools = pool.all_tools();
                 if tools.is_empty() {
                     println!("No MCP tools discovered.");
@@ -5090,6 +5585,10 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
             command,
             url,
             transport,
+            bearer_token_env_var,
+            oauth_client_id,
+            oauth_resource,
+            scopes,
             args,
         } => {
             if command.is_none() && url.is_none() {
@@ -5100,29 +5599,84 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
             {
                 bail!("Unsupported MCP transport '{transport}'. Supported values: sse");
             }
+            let added_server = McpServerConfig {
+                command,
+                args,
+                env: std::collections::HashMap::new(),
+                cwd: None,
+                url,
+                transport,
+                connect_timeout: None,
+                execute_timeout: None,
+                read_timeout: None,
+                disabled: false,
+                enabled: true,
+                required: false,
+                enabled_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                headers: std::collections::HashMap::new(),
+                env_headers: std::collections::HashMap::new(),
+                bearer_token_env_var,
+                scopes,
+                oauth: oauth_client_id.map(|client_id| McpServerOAuthConfig {
+                    client_id: Some(client_id),
+                }),
+                oauth_resource,
+            };
+            let can_suggest_oauth = added_server.url.is_some()
+                && added_server.bearer_token_env_var.is_none()
+                && added_server
+                    .headers
+                    .keys()
+                    .all(|key| !key.trim().eq_ignore_ascii_case("authorization"))
+                && added_server
+                    .env_headers
+                    .keys()
+                    .all(|key| !key.trim().eq_ignore_ascii_case("authorization"));
             let mut cfg = load_mcp_config(&config_path)?;
-            cfg.servers.insert(
-                name.clone(),
-                McpServerConfig {
-                    command,
-                    args,
-                    env: std::collections::HashMap::new(),
-                    cwd: None,
-                    url,
-                    transport,
-                    connect_timeout: None,
-                    execute_timeout: None,
-                    read_timeout: None,
-                    disabled: false,
-                    enabled: true,
-                    required: false,
-                    enabled_tools: Vec::new(),
-                    disabled_tools: Vec::new(),
-                    headers: std::collections::HashMap::new(),
-                },
-            );
+            cfg.servers.insert(name.clone(), added_server.clone());
             save_mcp_config(&config_path, &cfg)?;
             println!("Added MCP server '{name}' in {}", config_path.display());
+            if can_suggest_oauth
+                && crate::mcp::oauth::oauth_login_support(&added_server)
+                    .await
+                    .is_ok_and(|support| support.is_some())
+            {
+                println!(
+                    "OAuth is available for '{name}'. Run `codewhale mcp login {name}` to authenticate."
+                );
+            }
+            Ok(())
+        }
+        McpCommand::Login { name, scopes } => {
+            let cfg = crate::mcp::load_config_with_workspace(&config_path, workspace)?;
+            let server = cfg
+                .servers
+                .get(&name)
+                .ok_or_else(|| anyhow!("MCP server '{name}' not found"))?;
+            let explicit_scopes = (!scopes.is_empty()).then_some(scopes);
+            crate::mcp::oauth::perform_oauth_login_for_server(
+                &name,
+                server,
+                explicit_scopes,
+                config.mcp_oauth_callback_port,
+                config.mcp_oauth_callback_url.as_deref(),
+            )
+            .await?;
+            println!("Stored OAuth credentials for MCP server '{name}'.");
+            Ok(())
+        }
+        McpCommand::Logout { name } => {
+            let cfg = crate::mcp::load_config_with_workspace(&config_path, workspace)?;
+            let server = cfg
+                .servers
+                .get(&name)
+                .ok_or_else(|| anyhow!("MCP server '{name}' not found"))?;
+            if crate::mcp::oauth::delete_oauth_tokens_for_server(&name, server)? {
+                println!("Deleted stored OAuth credentials for MCP server '{name}'.");
+            } else {
+                println!("No stored OAuth credentials found for MCP server '{name}'.");
+            }
             Ok(())
         }
         McpCommand::Remove { name } => {
@@ -5207,6 +5761,11 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
                     enabled_tools: Vec::new(),
                     disabled_tools: Vec::new(),
                     headers: std::collections::HashMap::new(),
+                    env_headers: std::collections::HashMap::new(),
+                    bearer_token_env_var: None,
+                    scopes: Vec::new(),
+                    oauth: None,
+                    oauth_resource: None,
                 },
             );
             save_mcp_config(&config_path, &cfg)?;
@@ -5246,6 +5805,21 @@ enum McpServerDoctorStatus {
     Error(String),
 }
 
+fn is_relative_stdio_path_arg(value: &str) -> bool {
+    if value.is_empty() || value.starts_with('-') || value.contains("://") || value.starts_with('~')
+    {
+        return false;
+    }
+    let looks_like_path = value.contains('/') || value.contains('\\');
+    if !looks_like_path {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    let windows_absolute = value.starts_with("\\\\")
+        || (bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/'));
+    !Path::new(value).is_absolute() && !windows_absolute
+}
+
 /// Check an MCP server config entry for common issues.
 fn doctor_check_mcp_server(server: &McpServerConfig) -> McpServerDoctorStatus {
     // No command or URL — incomplete entry.
@@ -5271,6 +5845,23 @@ fn doctor_check_mcp_server(server: &McpServerConfig) -> McpServerDoctorStatus {
 
     if is_absolute && !cmd_path.exists() {
         return McpServerDoctorStatus::Error(format!("command not found: {cmd}"));
+    }
+
+    if server.cwd.is_none() {
+        if is_relative_stdio_path_arg(cmd) {
+            return McpServerDoctorStatus::Warning(format!(
+                "stdio server uses relative command \"{cmd}\" without cwd; set cwd so headless exec and UI status checks resolve the same path"
+            ));
+        }
+        if let Some(arg) = server
+            .args
+            .iter()
+            .find(|arg| is_relative_stdio_path_arg(arg))
+        {
+            return McpServerDoctorStatus::Warning(format!(
+                "stdio server uses relative path argument \"{arg}\" without cwd; set cwd so headless exec and UI status checks resolve the same path"
+            ));
+        }
     }
 
     // Detect self-hosted DeepSeek server entries.
@@ -5686,13 +6277,22 @@ fn merge_project_config(config: &mut Config, workspace: &Path) {
     //   target host with project-controlled values.
     // * `mcp_config_path` — point the loader at an MCP config that
     //   spawns arbitrary stdio servers under the user's identity.
+    // * `mcp_oauth_callback_*` — choose local OAuth redirect listener
+    //   behavior for user-owned MCP credentials.
     //
     // The overlay path is non-interactive; users can't visually
     // confirm a rogue project config is hijacking these. We surface
     // a stderr warning on first encounter so a user who *did* expect
     // the override has a chance to notice the deny instead of silent
     // discard.
-    const DENY_AT_PROJECT_SCOPE: &[&str] = &["api_key", "base_url", "provider", "mcp_config_path"];
+    const DENY_AT_PROJECT_SCOPE: &[&str] = &[
+        "api_key",
+        "base_url",
+        "provider",
+        "mcp_config_path",
+        "mcp_oauth_callback_port",
+        "mcp_oauth_callback_url",
+    ];
     for key in DENY_AT_PROJECT_SCOPE {
         if table.contains_key(*key) {
             eprintln!(
@@ -5893,6 +6493,10 @@ fn normalize_windows_config_path_str(path: &str) -> String {
     normalized.to_ascii_lowercase()
 }
 
+fn interactive_tui_allow_shell(yolo: bool, config: &Config) -> bool {
+    yolo || config.interactive_allow_shell()
+}
+
 async fn run_interactive(
     cli: &Cli,
     config: &Config,
@@ -5944,8 +6548,8 @@ async fn run_interactive(
     let use_alt_screen = should_use_alt_screen(cli, config);
     let use_mouse_capture = should_use_mouse_capture(cli, config, use_alt_screen);
     let use_bracketed_paste = crate::settings::Settings::load()
-        .map(|s| s.bracketed_paste)
-        .unwrap_or(true);
+        .map(|s| s.effective_bracketed_paste())
+        .unwrap_or_else(|_| !crate::settings::detected_legacy_windows_console_host());
 
     // Auto-install bundled system skills (e.g. skill-creator) on first launch.
     // Errors are non-fatal: log a warning and continue.
@@ -5997,7 +6601,7 @@ async fn run_interactive(
             workspace,
             config_path: cli.config.clone(),
             config_profile: cli.profile.clone(),
-            allow_shell: yolo || config.allow_shell(),
+            allow_shell: interactive_tui_allow_shell(yolo, config),
             use_alt_screen,
             use_mouse_capture,
             use_bracketed_paste,
@@ -6047,6 +6651,16 @@ fn config_for_cli_route(config: &Config, route: &CliAutoRoute) -> Config {
         execution_config.default_text_model = Some(route.model.clone());
     }
     execution_config
+}
+
+fn resolve_cli_route_limits(
+    config: &Config,
+    provider: crate::config::ApiProvider,
+    model: &str,
+) -> Option<codewhale_config::route::RouteLimits> {
+    crate::route_runtime::resolve_runtime_route(config, provider, Some(model))
+        .ok()
+        .and_then(|route| crate::route_budget::known_route_limits(route.candidate.limits))
 }
 
 async fn resolve_cli_auto_route(
@@ -6207,11 +6821,34 @@ struct ExecStreamMeta {
     model: String,
     input_tokens: u32,
     output_tokens: u32,
+    input_analysis: ExecStreamInputAnalysis,
+    visible_final_answer_chars: usize,
     session_id: String,
     resume_command: String,
     workspace: String,
     message_count: usize,
     status: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize, PartialEq, Eq)]
+struct ExecStreamInputAnalysis {
+    estimated_request_tokens: usize,
+    estimated_message_content_tokens: usize,
+    estimated_system_tokens: usize,
+    estimated_framing_tokens: usize,
+    user_message_count: usize,
+    assistant_message_count: usize,
+    tool_message_count: usize,
+    tool_use_count: usize,
+    tool_result_count: usize,
+    text_chars: usize,
+    thinking_chars: usize,
+    tool_use_input_chars: usize,
+    tool_result_chars: usize,
+    text_estimated_tokens: usize,
+    thinking_estimated_tokens: usize,
+    tool_use_input_estimated_tokens: usize,
+    tool_result_estimated_tokens: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -6244,6 +6881,115 @@ enum ExecStreamEvent {
 fn emit_exec_stream_event(event: &ExecStreamEvent) -> Result<()> {
     println!("{}", serde_json::to_string(event)?);
     Ok(())
+}
+
+fn exec_stream_input_analysis(
+    messages: &[Message],
+    system: Option<&SystemPrompt>,
+) -> ExecStreamInputAnalysis {
+    let mut analysis = ExecStreamInputAnalysis {
+        estimated_request_tokens: crate::compaction::estimate_input_tokens_conservative(
+            messages, system,
+        ),
+        estimated_message_content_tokens: crate::compaction::estimate_tokens(messages),
+        estimated_system_tokens: exec_stream_estimate_system_tokens(system),
+        estimated_framing_tokens: messages.len().saturating_mul(12).saturating_add(48),
+        ..ExecStreamInputAnalysis::default()
+    };
+
+    for message in messages {
+        match message.role.as_str() {
+            "user" => analysis.user_message_count += 1,
+            "assistant" => analysis.assistant_message_count += 1,
+            "tool" => analysis.tool_message_count += 1,
+            _ => {}
+        }
+
+        for block in &message.content {
+            match block {
+                ContentBlock::Text { text, .. } => {
+                    exec_stream_add_text_estimate(
+                        text,
+                        &mut analysis.text_chars,
+                        &mut analysis.text_estimated_tokens,
+                    );
+                }
+                ContentBlock::Thinking { thinking, .. } => {
+                    exec_stream_add_text_estimate(
+                        thinking,
+                        &mut analysis.thinking_chars,
+                        &mut analysis.thinking_estimated_tokens,
+                    );
+                }
+                ContentBlock::ToolUse { input, .. } | ContentBlock::ServerToolUse { input, .. } => {
+                    analysis.tool_use_count += 1;
+                    exec_stream_add_json_estimate(
+                        input,
+                        &mut analysis.tool_use_input_chars,
+                        &mut analysis.tool_use_input_estimated_tokens,
+                    );
+                }
+                ContentBlock::ToolResult {
+                    content,
+                    content_blocks,
+                    ..
+                } => {
+                    analysis.tool_result_count += 1;
+                    exec_stream_add_text_estimate(
+                        content,
+                        &mut analysis.tool_result_chars,
+                        &mut analysis.tool_result_estimated_tokens,
+                    );
+                    if let Some(blocks) = content_blocks {
+                        exec_stream_add_json_estimate(
+                            blocks,
+                            &mut analysis.tool_result_chars,
+                            &mut analysis.tool_result_estimated_tokens,
+                        );
+                    }
+                }
+                ContentBlock::ToolSearchToolResult { content, .. }
+                | ContentBlock::CodeExecutionToolResult { content, .. } => {
+                    analysis.tool_result_count += 1;
+                    exec_stream_add_json_estimate(
+                        content,
+                        &mut analysis.tool_result_chars,
+                        &mut analysis.tool_result_estimated_tokens,
+                    );
+                }
+                ContentBlock::ImageUrl { .. } => {}
+            }
+        }
+    }
+
+    analysis
+}
+
+fn exec_stream_add_text_estimate(text: &str, chars: &mut usize, tokens: &mut usize) {
+    *chars = chars.saturating_add(text.chars().count());
+    *tokens = tokens.saturating_add(crate::compaction::estimate_text_tokens_conservative(text));
+}
+
+fn exec_stream_add_json_estimate<T: serde::Serialize>(
+    value: &T,
+    chars: &mut usize,
+    tokens: &mut usize,
+) {
+    let text = serde_json::to_string(value).unwrap_or_default();
+    exec_stream_add_text_estimate(&text, chars, tokens);
+}
+
+fn exec_stream_estimate_system_tokens(system: Option<&SystemPrompt>) -> usize {
+    match system {
+        Some(SystemPrompt::Text(text)) => {
+            crate::compaction::estimate_text_tokens_conservative(text)
+        }
+        Some(SystemPrompt::Blocks(blocks)) => blocks
+            .iter()
+            .map(|block| crate::compaction::estimate_text_tokens_conservative(&block.text))
+            .sum(),
+        None => 0,
+    }
 }
 
 fn exec_saved_session_line(session_id: &str) -> String {
@@ -6335,9 +7081,6 @@ async fn run_exec_agent(
     use crate::core::engine::{EngineConfig, spawn_engine};
     use crate::core::events::Event;
     use crate::core::ops::Op;
-    use crate::models::{
-        auto_compact_default_for_model, compaction_threshold_for_model_at_percent,
-    };
     use crate::tools::plan::new_shared_plan_state;
     use crate::tools::todo::new_shared_todo_list;
     use crate::tui::app::AppMode;
@@ -6347,6 +7090,8 @@ async fn run_exec_agent(
     let auto_model = route.auto_model;
     let effective_provider = route.provider;
     let effective_model = route.model;
+    let active_route_limits =
+        resolve_cli_route_limits(&execution_config, effective_provider, &effective_model);
     let max_subagents = if max_subagents == config.max_subagents_for_provider(config.api_provider())
     {
         execution_config
@@ -6363,13 +7108,19 @@ async fn run_exec_agent(
     let auto_compact_enabled = if crate::settings::Settings::auto_compact_explicitly_configured() {
         settings.auto_compact
     } else {
-        auto_compact_default_for_model(&effective_model)
+        crate::route_budget::auto_compact_default_for_route(
+            effective_provider,
+            &effective_model,
+            active_route_limits,
+        )
     };
     let compaction = CompactionConfig {
         enabled: auto_compact_enabled,
         model: effective_model.clone(),
-        token_threshold: compaction_threshold_for_model_at_percent(
+        token_threshold: crate::route_budget::compaction_threshold_for_route_at_percent(
+            effective_provider,
             &effective_model,
+            active_route_limits,
             settings.auto_compact_threshold_percent,
         ),
         ..Default::default()
@@ -6385,6 +7136,7 @@ async fn run_exec_agent(
         .map(crate::config::LspConfigToml::into_runtime);
     let engine_config = EngineConfig {
         model: effective_model.clone(),
+        active_route_limits,
         workspace: workspace.clone(),
         allow_shell: auto_approve || execution_config.allow_shell(),
         trust_mode,
@@ -6445,6 +7197,7 @@ async fn run_exec_agent(
         ),
         prefer_bwrap: execution_config.prefer_bwrap.unwrap_or(false),
         memory_enabled: execution_config.memory_enabled(),
+        moraine_fallback: execution_config.moraine_fallback(),
         memory_path: execution_config.memory_path(),
         speech_output_dir: execution_config.speech_output_dir(),
         vision_config: execution_config.vision_model_config(),
@@ -6507,6 +7260,7 @@ async fn run_exec_agent(
                 system_prompt_override: false,
                 model: saved.metadata.model,
                 workspace: saved.metadata.workspace,
+                mode,
             })
             .await?;
         loaded_session_id = Some(saved_id.clone());
@@ -6536,7 +7290,7 @@ async fn run_exec_agent(
             translation_enabled: false,
             show_thinking: settings.show_thinking,
             approval_mode: if auto_approve {
-                crate::tui::approval::ApprovalMode::Auto
+                crate::tui::approval::ApprovalMode::Bypass
             } else {
                 execution_config
                     .approval_policy
@@ -6783,6 +7537,11 @@ async fn run_exec_agent(
                             model: latest_model.clone(),
                             input_tokens: usage.input_tokens,
                             output_tokens: usage.output_tokens,
+                            input_analysis: exec_stream_input_analysis(
+                                &latest_messages,
+                                latest_system_prompt.as_ref(),
+                            ),
+                            visible_final_answer_chars: summary.output.chars().count(),
                             resume_command: saved_session_id
                                 .as_deref()
                                 .map(exec_stream_resume_hint)
@@ -6892,6 +7651,122 @@ mod serve_bind_host_tests {
             err.to_string()
                 .contains("--http and --mobile are mutually exclusive")
         );
+    }
+}
+
+#[cfg(test)]
+mod doctor_legacy_state_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn roots(tmp: &TempDir) -> (PathBuf, PathBuf) {
+        (tmp.path().join(".codewhale"), tmp.path().join(".deepseek"))
+    }
+
+    fn entry<'a>(report: &'a [DoctorLegacyStateEntry], name: &str) -> &'a DoctorLegacyStateEntry {
+        report
+            .iter()
+            .find(|entry| entry.name == name)
+            .expect("legacy state entry should exist")
+    }
+
+    #[test]
+    fn doctor_legacy_state_report_marks_unmigrated_legacy_entries() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+        fs::create_dir_all(legacy_root.join("sessions")).expect("legacy sessions");
+        fs::create_dir_all(legacy_root.join("tasks")).expect("legacy tasks");
+        fs::create_dir_all(&primary_root).expect("primary root");
+        fs::write(legacy_root.join("config.toml"), "api_key = 'old'").expect("legacy config");
+
+        let report = doctor_legacy_state_report(&primary_root, &legacy_root);
+
+        assert_eq!(
+            entry(&report, "sessions").status,
+            DoctorLegacyStateStatus::LegacyOnly
+        );
+        assert_eq!(
+            entry(&report, "config.toml").status,
+            DoctorLegacyStateStatus::LegacyOnly
+        );
+        assert_eq!(
+            entry(&report, "skills").status,
+            DoctorLegacyStateStatus::Absent
+        );
+
+        let json = doctor_legacy_state_json(&primary_root, &legacy_root, &report);
+        assert_eq!(json["needs_attention"], true);
+        assert_eq!(json["legacy_only_count"], 3);
+        assert_eq!(json["dual_present_count"], 0);
+    }
+
+    #[test]
+    fn doctor_legacy_state_report_marks_dual_present_entries() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+        fs::create_dir_all(primary_root.join("sessions")).expect("primary sessions");
+        fs::create_dir_all(legacy_root.join("sessions")).expect("legacy sessions");
+        fs::write(primary_root.join("mcp.json"), "{}").expect("primary mcp");
+        fs::write(legacy_root.join("mcp.json"), "{}").expect("legacy mcp");
+
+        let report = doctor_legacy_state_report(&primary_root, &legacy_root);
+
+        assert_eq!(
+            entry(&report, "sessions").status,
+            DoctorLegacyStateStatus::Both
+        );
+        assert_eq!(
+            entry(&report, "mcp.json").status,
+            DoctorLegacyStateStatus::Both
+        );
+
+        let json = doctor_legacy_state_json(&primary_root, &legacy_root, &report);
+        assert_eq!(json["needs_attention"], true);
+        assert_eq!(json["legacy_only_count"], 0);
+        assert_eq!(json["dual_present_count"], 2);
+    }
+
+    #[test]
+    fn doctor_legacy_state_report_is_clear_when_only_primary_exists() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+        fs::create_dir_all(primary_root.join("sessions")).expect("primary sessions");
+        fs::write(primary_root.join("settings.toml"), "default_mode = 'ask'")
+            .expect("primary settings");
+
+        let report = doctor_legacy_state_report(&primary_root, &legacy_root);
+
+        assert_eq!(
+            entry(&report, "sessions").status,
+            DoctorLegacyStateStatus::PrimaryOnly
+        );
+        assert!(!report.iter().any(legacy_state_needs_attention));
+
+        let json = doctor_legacy_state_json(&primary_root, &legacy_root, &report);
+        assert_eq!(json["needs_attention"], false);
+        assert_eq!(json["legacy_only_count"], 0);
+        assert_eq!(json["dual_present_count"], 0);
+    }
+
+    #[test]
+    fn doctor_legacy_state_report_is_clear_when_neither_root_exists() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+
+        let report = doctor_legacy_state_report(&primary_root, &legacy_root);
+
+        assert!(
+            report
+                .iter()
+                .all(|entry| entry.status == DoctorLegacyStateStatus::Absent)
+        );
+        assert!(!report.iter().any(legacy_state_needs_attention));
+
+        let json = doctor_legacy_state_json(&primary_root, &legacy_root, &report);
+        assert_eq!(json["needs_attention"], false);
+        assert_eq!(json["legacy_only_count"], 0);
+        assert_eq!(json["dual_present_count"], 0);
     }
 }
 
@@ -7510,6 +8385,63 @@ mod terminal_mode_tests {
     }
 
     #[test]
+    fn exec_shell_only_tool_surface_env_sets_shell_allowlist() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _surface =
+            crate::test_support::EnvVarGuard::set(CODEWHALE_TOOL_SURFACE_ENV, " shell-only ");
+
+        let allowed_tools = resolve_exec_allowed_tools(None, exec_tool_surface_from_env())
+            .expect("shell-only surface should set an allowlist");
+
+        assert_eq!(
+            allowed_tools,
+            vec![
+                "exec_shell".to_string(),
+                "exec_shell_wait".to_string(),
+                "exec_shell_interact".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_explicit_allowed_tools_override_shell_only_env() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _surface =
+            crate::test_support::EnvVarGuard::set(CODEWHALE_TOOL_SURFACE_ENV, "shell-only");
+        let explicit = vec![" Read_File ".to_string(), "GREP_FILES".to_string()];
+
+        let allowed_tools =
+            resolve_exec_allowed_tools(Some(&explicit), exec_tool_surface_from_env())
+                .expect("explicit allowlist should be preserved");
+
+        assert_eq!(
+            allowed_tools,
+            vec!["read_file".to_string(), "grep_files".to_string()]
+        );
+    }
+
+    #[test]
+    fn exec_full_tool_surface_env_leaves_allowlist_unset() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _surface = crate::test_support::EnvVarGuard::set(CODEWHALE_TOOL_SURFACE_ENV, "full");
+
+        assert_eq!(
+            resolve_exec_allowed_tools(None, exec_tool_surface_from_env()),
+            None
+        );
+    }
+
+    #[test]
+    fn exec_unknown_tool_surface_env_warns_without_allowlist() {
+        assert!(should_warn_unknown_exec_tool_surface("shell_onyl"));
+        assert!(!should_warn_unknown_exec_tool_surface("shell-only"));
+        assert!(!should_warn_unknown_exec_tool_surface("native-tools"));
+        assert!(!should_warn_unknown_exec_tool_surface("full"));
+        assert!(!should_warn_unknown_exec_tool_surface(" "));
+        assert_eq!(parse_exec_tool_surface("shell_onyl"), None);
+    }
+
+    #[test]
     fn exec_rejects_zero_max_turns() {
         let err = Cli::try_parse_from(["codewhale", "exec", "--max-turns", "0", "hello"])
             .expect_err("max-turns must be >= 1");
@@ -7576,6 +8508,8 @@ mod terminal_mode_tests {
                 model: "deepseek-v4-flash".to_string(),
                 input_tokens: 123,
                 output_tokens: 45,
+                input_analysis: ExecStreamInputAnalysis::default(),
+                visible_final_answer_chars: 17,
                 session_id: exec_stream_session_ref(raw_session_id),
                 resume_command: exec_stream_resume_hint(raw_session_id),
                 workspace: "/tmp/work".to_string(),
@@ -7602,6 +8536,7 @@ mod terminal_mode_tests {
         );
         assert_eq!(parsed["meta"]["workspace"], "/tmp/work");
         assert_eq!(parsed["meta"]["message_count"], 4);
+        assert_eq!(parsed["meta"]["visible_final_answer_chars"], 17);
 
         let capture = ExecStreamEvent::SessionCapture {
             content: exec_stream_session_ref(raw_session_id),
@@ -7612,6 +8547,71 @@ mod terminal_mode_tests {
             serde_json::from_str(&capture_json).expect("valid json");
         assert_eq!(parsed_capture["type"], "session_capture");
         assert_ne!(parsed_capture["content"], raw_session_id);
+    }
+
+    #[test]
+    fn exec_stream_input_analysis_reports_prompt_composition() {
+        let system = SystemPrompt::Text("system rules".to_string());
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "run tests".to_string(),
+                    cache_control: None,
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "checking context".to_string(),
+                        signature: None,
+                    },
+                    ContentBlock::Text {
+                        text: "working".to_string(),
+                        cache_control: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call-1".to_string(),
+                        name: "exec_shell".to_string(),
+                        input: serde_json::json!({"command": "cargo test"}),
+                        caller: None,
+                    },
+                ],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: "stdout line\nstderr line".to_string(),
+                    is_error: Some(false),
+                    content_blocks: Some(vec![serde_json::json!({
+                        "type": "text",
+                        "text": "structured output"
+                    })]),
+                }],
+            },
+        ];
+
+        let analysis = exec_stream_input_analysis(&messages, Some(&system));
+
+        assert_eq!(analysis.user_message_count, 2);
+        assert_eq!(analysis.assistant_message_count, 1);
+        assert_eq!(analysis.tool_message_count, 0);
+        assert_eq!(analysis.tool_use_count, 1);
+        assert_eq!(analysis.tool_result_count, 1);
+        assert_eq!(analysis.thinking_chars, "checking context".chars().count());
+        assert!(analysis.text_chars >= "run testsworking".chars().count());
+        assert!(analysis.tool_use_input_chars > 0);
+        assert!(analysis.tool_result_chars >= "stdout line\nstderr line".chars().count());
+        assert!(analysis.estimated_system_tokens > 0);
+        assert!(analysis.estimated_message_content_tokens > 0);
+        assert!(
+            analysis.estimated_request_tokens
+                >= analysis.estimated_system_tokens
+                    + analysis.estimated_message_content_tokens
+                    + analysis.estimated_framing_tokens
+        );
     }
 
     #[test]
@@ -7909,6 +8909,34 @@ mod terminal_mode_tests {
 }
 
 #[cfg(test)]
+mod interactive_startup_tests {
+    use super::*;
+
+    #[test]
+    fn interactive_tui_defaults_agent_shell_to_approval_gated_on() {
+        let default_config = Config::default();
+        assert!(
+            interactive_tui_allow_shell(false, &default_config),
+            "interactive Agent mode should expose shell tools by default so approvals can gate commands"
+        );
+
+        let disabled = Config {
+            allow_shell: Some(false),
+            ..Config::default()
+        };
+        assert!(
+            !interactive_tui_allow_shell(false, &disabled),
+            "explicit allow_shell=false still hides shell tools"
+        );
+
+        assert!(
+            interactive_tui_allow_shell(true, &disabled),
+            "YOLO forces shell access for its no-guardrails contract"
+        );
+    }
+}
+
+#[cfg(test)]
 mod project_config_tests {
     use super::*;
     use std::fs;
@@ -8029,19 +9057,24 @@ model = "deepseek-ai/deepseek-v4-pro"
     #[test]
     fn project_overlay_denies_dangerous_credentials_and_redirects() {
         // #417: `api_key` / `base_url` / `provider` / `mcp_config_path`
-        // are all on the deny-list. A malicious project must not be
-        // able to redirect prompts or hijack MCP servers via these.
+        // and MCP OAuth callback settings are all on the deny-list. A
+        // malicious project must not be able to redirect prompts, hijack MCP
+        // servers, or influence OAuth callback behavior via these.
         let tmp = workspace_with_project_config(
             r#"
 api_key = "ATTACKER_KEY"
 base_url = "https://evil.example.com"
 provider = "nvidia-nim"
 mcp_config_path = "/tmp/attacker-mcp.json"
+mcp_oauth_callback_port = 9999
+mcp_oauth_callback_url = "http://evil.example.com/callback"
 "#,
         );
         let mut config = Config {
             api_key: Some("USER_KEY".to_string()),
             base_url: Some("https://api.deepseek.com".to_string()),
+            mcp_oauth_callback_port: Some(1455),
+            mcp_oauth_callback_url: Some("http://127.0.0.1:1455/callback".to_string()),
             ..Config::default()
         };
         merge_project_config(&mut config, tmp.path());
@@ -8062,6 +9095,16 @@ mcp_config_path = "/tmp/attacker-mcp.json"
         assert_eq!(
             config.mcp_config_path, None,
             "project-scope mcp_config_path must be denied"
+        );
+        assert_eq!(
+            config.mcp_oauth_callback_port,
+            Some(1455),
+            "project-scope mcp_oauth_callback_port must be denied"
+        );
+        assert_eq!(
+            config.mcp_oauth_callback_url.as_deref(),
+            Some("http://127.0.0.1:1455/callback"),
+            "project-scope mcp_oauth_callback_url must be denied"
         );
     }
 
@@ -8502,6 +9545,11 @@ mod doctor_mcp_tests {
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: std::collections::HashMap::new(),
+            env_headers: std::collections::HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         }
     }
 
@@ -8533,6 +9581,28 @@ mod doctor_mcp_tests {
     }
 
     #[test]
+    fn test_relative_stdio_path_arg_without_cwd_warns() {
+        let server = make_server(Some("python"), &["server/mcp_server.py"], None);
+        match doctor_check_mcp_server(&server) {
+            McpServerDoctorStatus::Warning(detail) => {
+                assert!(detail.contains("relative path argument"));
+                assert!(detail.contains("cwd"));
+            }
+            other => panic!("Expected Warning for relative path argument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_relative_stdio_path_arg_with_cwd_is_ok() {
+        let mut server = make_server(Some("python"), &["server/mcp_server.py"], None);
+        server.cwd = Some(PathBuf::from("/tmp/codewhale-project"));
+        match doctor_check_mcp_server(&server) {
+            McpServerDoctorStatus::Ok(detail) => assert!(detail.contains("stdio")),
+            other => panic!("Expected Ok when cwd anchors relative path, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_self_hosted_absolute_is_ok() {
         let server = make_server(Some("/usr/local/bin/codewhale"), &["serve", "--mcp"], None);
         match doctor_check_mcp_server(&server) {
@@ -8547,6 +9617,18 @@ mod doctor_mcp_tests {
             McpServerDoctorStatus::Warning(detail) => {
                 panic!("Absolute path should not warn: {detail}")
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod mcp_auth_guidance_tests {
+        #[test]
+        fn mcp_auth_hint_is_actionable_for_connect_failures() {
+            let hint = crate::mcp::oauth::auth_required_login_hint("nordic-mcp");
+            assert_eq!(
+                hint,
+                "MCP server 'nordic-mcp' requires OAuth authentication. Run `codewhale mcp login nordic-mcp` to authenticate."
+            );
         }
     }
 

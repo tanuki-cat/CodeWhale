@@ -20,6 +20,16 @@ impl EngineHandle {
         Ok(())
     }
 
+    /// Try to send an operation without blocking.
+    ///
+    /// Returns `Err` if the channel is full or closed.  Use this for
+    /// non-critical, refresh-type ops (e.g. `Op::ListSubAgents`) that can
+    /// safely be dropped and re-requested on the next drain cycle.
+    pub fn try_send(&self, op: Op) -> Result<()> {
+        self.tx_op.try_send(op)?;
+        Ok(())
+    }
+
     /// Cancel the current request (user-initiated path — keeps the
     /// public `cancel()` signature stable). Equivalent to
     /// `cancel_with_reason(CancelReason::User)`.
@@ -138,5 +148,16 @@ impl EngineHandle {
         self.send(Op::GetSessionSnapshot { tx }).await?;
         rx.await
             .map_err(|_| anyhow::anyhow!("Engine dropped session snapshot oneshot"))
+    }
+
+    /// Request active provider request concurrency state.
+    pub async fn get_provider_runtime_status(
+        &self,
+    ) -> Result<crate::core::ops::ProviderRuntimeStatus> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        self.send(Op::GetProviderRuntimeStatus { tx }).await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Engine dropped provider runtime status oneshot"))
     }
 }

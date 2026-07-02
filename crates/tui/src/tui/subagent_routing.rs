@@ -371,28 +371,53 @@ fn task_status_label(status: TaskStatus) -> &'static str {
     }
 }
 
+fn hunt_verdict_glyph(verdict: Option<&str>) -> &'static str {
+    match verdict {
+        Some("hunting") => "·",
+        Some("hunted") => "✓",
+        Some("wounded") => "!",
+        Some("escaped") => "×",
+        Some(_) => "?",
+        None => "-",
+    }
+}
+
 pub(super) fn format_task_list(tasks: &[TaskSummary]) -> String {
     if tasks.is_empty() {
         return "No tasks found.".to_string();
     }
 
-    let mut lines = vec![
-        format!("Tasks ({})", tasks.len()),
-        "ID             Status        Time  Title".to_string(),
-        "------------------------------------------------------------".to_string(),
-    ];
+    let show_verdict = tasks.iter().any(|task| task.hunt_verdict.is_some());
+    let mut lines = vec![format!("Tasks ({})", tasks.len())];
+    if show_verdict {
+        lines.push("ID             Status     Verdict     Time  Title".to_string());
+    } else {
+        lines.push("ID             Status        Time  Title".to_string());
+    }
+    lines.push("------------------------------------------------------------".to_string());
     for task in tasks {
         let duration = task
             .duration_ms
             .map(|ms| format!("{:.2}s", ms as f64 / 1000.0))
             .unwrap_or_else(|| "-".to_string());
-        lines.push(format!(
-            "{:<13}  {:<9}  {:>8}  {}",
-            task.id,
-            task_status_label(task.status),
-            duration,
-            task.prompt_summary
-        ));
+        if show_verdict {
+            lines.push(format!(
+                "{:<13}  {:<9}  {:<7}  {:>8}  {}",
+                task.id,
+                task_status_label(task.status),
+                hunt_verdict_glyph(task.hunt_verdict.as_deref()),
+                duration,
+                task.prompt_summary
+            ));
+        } else {
+            lines.push(format!(
+                "{:<13}  {:<9}  {:>8}  {}",
+                task.id,
+                task_status_label(task.status),
+                duration,
+                task.prompt_summary
+            ));
+        }
     }
     lines.push("Use /task show <id> for timeline details.".to_string());
     lines.join("\n")
@@ -553,6 +578,7 @@ mod tests {
             started_at: None,
             ended_at: None,
             duration_ms,
+            hunt_verdict: None,
             error: None,
             thread_id: None,
             turn_id: None,
@@ -569,6 +595,23 @@ mod tests {
         assert!(output.contains("ID             Status        Time  Title"));
         assert!(output.contains("task_12345678  running           -  Fix task list output"));
         assert!(output.contains("task_abcdef12  completed     1.23s  Fix task list output"));
+    }
+
+    #[test]
+    fn task_list_renders_hunt_verdict_glyphs_when_present() {
+        let mut hunted = task_summary("task_hunted", TaskStatus::Completed, Some(1200));
+        hunted.hunt_verdict = Some("hunted".to_string());
+        let mut wounded = task_summary("task_wounded", TaskStatus::Completed, Some(2300));
+        wounded.hunt_verdict = Some("wounded".to_string());
+        let mut escaped = task_summary("task_escaped", TaskStatus::Failed, Some(3400));
+        escaped.hunt_verdict = Some("escaped".to_string());
+
+        let output = format_task_list(&[hunted, wounded, escaped]);
+
+        assert!(output.contains("ID             Status     Verdict"));
+        assert!(output.contains("task_hunted    completed  ✓"));
+        assert!(output.contains("task_wounded   completed  !"));
+        assert!(output.contains("task_escaped   failed     ×"));
     }
 
     #[test]

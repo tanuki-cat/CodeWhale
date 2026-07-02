@@ -10,6 +10,7 @@ use crate::core::ops::UserInputProvenance;
 use crate::prompt_zones::PinnedPrefix;
 
 const MAX_APPROVAL_INTENT_SUMMARY_CHARS: usize = 2_000;
+const TOOL_ERROR_DEGRADATION_THRESHOLD: u32 = 2;
 
 fn approval_intent_summary(text: &str) -> Option<String> {
     let trimmed = text.trim();
@@ -40,6 +41,152 @@ pub(super) fn registered_tool_approval_required(
         return true;
     }
     !auto_approve
+}
+
+pub(super) fn tool_error_degradation_runtime_hint(
+    consecutive_tool_error_steps: u32,
+    step_error_tool_names: &[String],
+    step_error_categories: &[ErrorCategory],
+    step_error_tool_inputs: &[serde_json::Value],
+) -> Option<String> {
+    if consecutive_tool_error_steps < TOOL_ERROR_DEGRADATION_THRESHOLD {
+        return None;
+    }
+    if !step_error_categories
+        .iter()
+        .any(|category| tool_error_category_allows_degradation(*category))
+    {
+        return None;
+    }
+
+    let mut tool_names = step_error_tool_names
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    tool_names.sort_unstable();
+    tool_names.dedup();
+    let tools = if tool_names.is_empty() {
+        "tools".to_string()
+    } else {
+        tool_names.join(", ")
+    };
+
+    let mut hint = format!(
+        "Tool calls have failed for {consecutive_tool_error_steps} consecutive steps ({tools}). \
+do not repeat the same call unchanged; switch to an alternate tool or source, narrow the request, \
+or ask for the required input before trying again."
+    );
+    if let Some(direct_url_hint) =
+        direct_url_pattern_fallback_hint(step_error_tool_names, step_error_tool_inputs)
+    {
+        hint.push(' ');
+        hint.push_str(&direct_url_hint);
+    }
+    Some(hint)
+}
+
+fn tool_error_category_allows_degradation(category: ErrorCategory) -> bool {
+    matches!(
+        category,
+        ErrorCategory::Network
+            | ErrorCategory::RateLimit
+            | ErrorCategory::Timeout
+            | ErrorCategory::Tool
+    )
+}
+
+fn direct_url_pattern_fallback_hint(
+    step_error_tool_names: &[String],
+    step_error_tool_inputs: &[serde_json::Value],
+) -> Option<String> {
+    let mut domains = std::collections::BTreeSet::new();
+    for (tool_name, input) in step_error_tool_names
+        .iter()
+        .zip(step_error_tool_inputs.iter())
+    {
+        if matches!(tool_name.as_str(), "web_search" | "web.run") {
+            collect_search_domains(input, &mut domains);
+        }
+    }
+
+    let domain = domains.into_iter().next()?;
+    Some(format!(
+        "For blocked search, try fetch_url directly on likely URL patterns such as \
+https://{domain}/announcements and https://{domain}/news."
+    ))
+}
+
+fn collect_search_domains(
+    input: &serde_json::Value,
+    domains: &mut std::collections::BTreeSet<String>,
+) {
+    if let Some(values) = input.get("domains").and_then(serde_json::Value::as_array) {
+        for value in values {
+            if let Some(domain) = value.as_str().and_then(normalize_domain_candidate) {
+                domains.insert(domain);
+            }
+        }
+    }
+    for key in ["query", "q"] {
+        if let Some(query) = input.get(key).and_then(serde_json::Value::as_str) {
+            collect_query_domains(query, domains);
+        }
+    }
+    if let Some(searches) = input
+        .get("search_query")
+        .and_then(serde_json::Value::as_array)
+    {
+        for search in searches {
+            collect_search_domains(search, domains);
+        }
+    }
+}
+
+fn collect_query_domains(query: &str, domains: &mut std::collections::BTreeSet<String>) {
+    for token in query.split_whitespace() {
+        let token = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+            )
+        });
+        if let Some(site) = token.strip_prefix("site:") {
+            if let Some(domain) = normalize_domain_candidate(site) {
+                domains.insert(domain);
+            }
+        } else if let Some(domain) = normalize_domain_candidate(token) {
+            domains.insert(domain);
+        }
+    }
+}
+
+fn normalize_domain_candidate(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '<' | '>' | '.' | ',' | ';' | ':'));
+    if value.is_empty() {
+        return None;
+    }
+    let without_scheme = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .unwrap_or(value);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    let looks_like_domain = host.contains('.')
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+        && host.rsplit('.').next().is_some_and(|suffix| {
+            suffix.len() >= 2 && suffix.chars().any(|c| c.is_ascii_alphabetic())
+        });
+    if looks_like_domain { Some(host) } else { None }
 }
 
 fn registered_tool_requires_non_bypassable_approval(tool_name: &str) -> bool {
@@ -110,6 +257,7 @@ impl Engine {
         tools: Option<Vec<Tool>>,
         mode: AppMode,
         force_update_plan_first: bool,
+        dynamic_active_tools: Vec<&'static str>,
     ) -> (TurnOutcomeStatus, Option<String>) {
         // Signal to the terminal / taskbar that a turn is in progress
         // (OSC 9 ; 4 indeterminate progress + title spinner).
@@ -139,6 +287,11 @@ impl Engine {
             }
         }
         let mut active_tool_names = initial_active_tools(&tool_catalog);
+        active_tool_names.extend(
+            dynamic_active_tools
+                .into_iter()
+                .map(std::string::ToString::to_string),
+        );
         let mut goal_continuations_this_turn = 0u32;
 
         // Outer stream-retry counter: when the chunked-transfer connection
@@ -276,9 +429,12 @@ impl Engine {
                 }
             }
 
-            if let Some(input_budget) =
-                context_input_budget_for_provider(self.api_provider, &self.session.model)
-            {
+            if let Some(input_budget) = context_input_budget_for_route(
+                self.api_provider,
+                &self.session.model,
+                self.active_route_limits,
+                0,
+            ) {
                 let estimated_input = self.estimated_input_tokens();
                 if estimated_input > input_budget {
                     if context_recovery_attempts >= MAX_CONTEXT_RECOVERY_ATTEMPTS {
@@ -335,6 +491,7 @@ impl Engine {
             let effective_reasoning_effort = resolve_auto_effort(
                 self.session.reasoning_effort.as_deref(),
                 &self.session.messages,
+                self.api_provider,
             );
 
             // Check prefix-cache stability before building the request.
@@ -438,7 +595,10 @@ impl Engine {
             let request = MessageRequest {
                 model: self.session.model.clone(),
                 messages: self.messages_with_turn_metadata(),
-                max_tokens: effective_max_output_tokens(&self.session.model),
+                max_tokens: effective_max_output_tokens_for_route(
+                    &self.session.model,
+                    self.active_route_limits,
+                ),
                 system: self.session.system_prompt.clone(),
                 tools: active_tools.clone(),
                 tool_choice: if active_tools.is_some() {
@@ -781,6 +941,7 @@ impl Engine {
                                 input,
                                 caller,
                                 input_buffer: String::new(),
+                                input_parse_error: None,
                             });
                         }
                         ContentBlockStart::ServerToolUse { id, name, input } => {
@@ -795,6 +956,7 @@ impl Engine {
                                 input,
                                 caller: None,
                                 input_buffer: String::new(),
+                                input_parse_error: None,
                             });
                         }
                     },
@@ -906,6 +1068,11 @@ impl Engine {
                                         "Tool '{}' failed to parse final input buffer: '{}'",
                                         tool_state.name, tool_state.input_buffer
                                     ));
+                                    let error =
+                                        malformed_tool_arguments_error(&tool_state.input_buffer);
+                                    tool_state.input_parse_error = Some(error);
+                                    tool_state.input =
+                                        malformed_tool_arguments_input(&tool_state.input_buffer);
                                     let _ = self
                                         .tx_event
                                         .send(Event::status(format!(
@@ -1063,6 +1230,7 @@ impl Engine {
                         input: call.args,
                         caller: None,
                         input_buffer: String::new(),
+                        input_parse_error: None,
                     });
                 }
             }
@@ -1428,6 +1596,12 @@ impl Engine {
                     )));
                 }
 
+                if blocked_error.is_none()
+                    && let Some(error) = tool.input_parse_error.clone()
+                {
+                    blocked_error = Some(ToolError::invalid_input(error));
+                }
+
                 // #3027: deny wins over allow — check the deny-list first so a
                 // tool present in both lists is still blocked.
                 if blocked_error.is_none()
@@ -1529,7 +1703,7 @@ impl Engine {
                 if McpPool::is_mcp_tool(&tool_name) {
                     read_only = mcp_tool_is_read_only(&tool_name);
                     supports_parallel = mcp_tool_is_parallel_safe(&tool_name);
-                    approval_required = !read_only;
+                    approval_required = !read_only && !self.session.auto_approve;
                     approval_description = mcp_tool_approval_description(&tool_name);
                 } else if let Some(registry) = tool_registry
                     && let Some(spec) = registry.get(&tool_name)
@@ -1544,13 +1718,13 @@ impl Engine {
                     read_only = spec.is_read_only_for(&tool_input);
                     detached_start = spec.starts_detached_for(&tool_input);
                 } else if tool_name == CODE_EXECUTION_TOOL_NAME {
-                    approval_required = true;
+                    approval_required = !self.session.auto_approve;
                     approval_description =
                         "Run model-provided Python code in local execution sandbox".to_string();
                     supports_parallel = false;
                     read_only = false;
                 } else if tool_name == JS_EXECUTION_TOOL_NAME {
-                    approval_required = true;
+                    approval_required = !self.session.auto_approve;
                     approval_description =
                         "Run model-provided JavaScript code in local Node.js execution sandbox"
                             .to_string();
@@ -1563,11 +1737,20 @@ impl Engine {
                     read_only = true;
                 }
 
+                if blocked_error.is_none()
+                    && mode == AppMode::Plan
+                    && plan_mode_blocks_write_capable_tool(&tool_name, read_only)
+                {
+                    blocked_error = Some(ToolError::permission_denied(format!(
+                        "'{tool_name}' is not available in Plan mode - switch to Agent or YOLO mode to modify files or run write-capable tools."
+                    )));
+                }
+
                 // #3026: a hook `ask` decision forces the approval prompt even
                 // for tools the registry would auto-run. Must stay after the
                 // registry-based computation above, which assigns rather than
                 // ORs `approval_required`.
-                if hook_requires_approval {
+                if hook_requires_approval && !self.session.auto_approve {
                     approval_required = true;
                 }
 
@@ -1591,9 +1774,15 @@ impl Engine {
                     if let Some(decision) = ask_rule_decision {
                         match decision {
                             ToolAskRuleDecision::Prompt(reason) => {
-                                approval_required = true;
-                                approval_description = reason;
-                                approval_force_prompt = true;
+                                // #3790: the mode is the sole authority — a typed
+                                // ask-rule prompts in Agent/Plan but never in YOLO
+                                // (auto_approve). A typed deny rule still blocks
+                                // hard, in every mode.
+                                if !self.session.auto_approve {
+                                    approval_required = true;
+                                    approval_description = reason;
+                                    approval_force_prompt = true;
+                                }
                             }
                             ToolAskRuleDecision::Block(reason) => {
                                 approval_required = false;
@@ -1623,9 +1812,16 @@ impl Engine {
                     match decision {
                         AutoReviewPlanDecision::NoChange => {}
                         AutoReviewPlanDecision::ForcePrompt(reason) => {
-                            approval_required = true;
-                            approval_description = reason;
-                            approval_force_prompt = true;
+                            // #3790: the Tab-selected mode is the sole authority.
+                            // YOLO (auto_approve) suppresses every review-driven
+                            // prompt — there is no longer any "force prompt past
+                            // YOLO" path. A Block decision (a typed deny rule)
+                            // still hard-blocks below, in every mode.
+                            if !self.session.auto_approve {
+                                approval_required = true;
+                                approval_description = reason;
+                                approval_force_prompt = true;
+                            }
                         }
                         AutoReviewPlanDecision::Block(reason) => {
                             approval_required = false;
@@ -2029,10 +2225,11 @@ impl Engine {
                             continue;
                         }
 
-                        // Handle approval flow: returns (result_override, context_override)
-                        let (result_override, context_override): (
+                        // Handle approval flow: returns (result_override, context_override, approval_stamp)
+                        let (result_override, context_override, approval_stamp): (
                             Option<Result<ToolResult, ToolError>>,
                             Option<crate::tools::ToolContext>,
+                            Option<ToolApprovalStamp>,
                         ) = if plan.approval_required {
                             emit_tool_audit(json!({
                                 "event": "tool.approval_required",
@@ -2077,7 +2274,7 @@ impl Engine {
                                         "decision": "approved",
                                         "caller": caller_type_for_tool_use(tool_caller.as_ref()),
                                     }));
-                                    (None, None)
+                                    (None, None, Some(ToolApprovalStamp::ApprovedByUser))
                                 }
                                 Ok(ApprovalResult::Denied) => {
                                     emit_tool_audit(json!({
@@ -2091,6 +2288,7 @@ impl Engine {
                                         Some(Err(ToolError::permission_denied(format!(
                                             "Tool '{tool_name}' denied by user"
                                         )))),
+                                        None,
                                         None,
                                     )
                                 }
@@ -2106,12 +2304,16 @@ impl Engine {
                                     let elevated_context = tool_registry.map(|r| {
                                         r.context().clone().with_elevated_sandbox_policy(policy)
                                     });
-                                    (None, elevated_context)
+                                    (
+                                        None,
+                                        elevated_context,
+                                        Some(ToolApprovalStamp::ApprovedWithPolicy),
+                                    )
                                 }
-                                Err(err) => (Some(Err(err)), None),
+                                Err(err) => (Some(Err(err)), None, None),
                             }
                         } else {
-                            (None, None)
+                            (None, None, None)
                         };
 
                         // Per-tool snapshot for surgical undo (#384): capture workspace
@@ -2150,6 +2352,12 @@ impl Engine {
                             )
                             .await
                         };
+
+                        if let Some(approval_stamp) = approval_stamp
+                            && let Ok(tool_result) = result.as_mut()
+                        {
+                            stamp_tool_result_approval(tool_result, approval_stamp);
+                        }
 
                         // #500: spill outsized tool outputs to disk before the
                         // result fans out to the model context and the UI cell.
@@ -2202,6 +2410,8 @@ impl Engine {
             // (e.g.) a Tool failure that should escalate from a permission
             // denial that should not.
             let mut step_error_categories: Vec<ErrorCategory> = Vec::new();
+            let mut step_error_tool_names: Vec<String> = Vec::new();
+            let mut step_error_tool_inputs: Vec<serde_json::Value> = Vec::new();
             let mut stop_after_plan_tool = false;
 
             for outcome in outcomes.into_iter().flatten() {
@@ -2278,6 +2488,8 @@ impl Engine {
                         }));
                         step_error_count += 1;
                         step_error_categories.push(envelope.category);
+                        step_error_tool_names.push(outcome.name.clone());
+                        step_error_tool_inputs.push(tool_input.clone());
                         let error = format_tool_error(&e, &outcome.name);
                         self.session.working_set.observe_tool_call(
                             &tool_name_for_ws,
@@ -2318,6 +2530,18 @@ impl Engine {
 
             if step_error_count > 0 {
                 consecutive_tool_error_steps = consecutive_tool_error_steps.saturating_add(1);
+                if let Some(hint) = tool_error_degradation_runtime_hint(
+                    consecutive_tool_error_steps,
+                    &step_error_tool_names,
+                    &step_error_categories,
+                    &step_error_tool_inputs,
+                ) {
+                    self.add_session_message(self.runtime_text_message_with_turn_metadata(
+                        hint,
+                        UserInputProvenance::Runtime,
+                    ))
+                    .await;
+                }
             } else {
                 consecutive_tool_error_steps = 0;
             }
@@ -2558,6 +2782,11 @@ fn should_pre_tool_snapshot(
         && matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
 }
 
+fn plan_mode_blocks_write_capable_tool(tool_name: &str, read_only: bool) -> bool {
+    matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
+        || (McpPool::is_mcp_tool(tool_name) && !read_only)
+}
+
 /// Synthesize the tool result recorded for a tool call that never executed
 /// because the turn was cancelled mid-batch (#3216 / #2211).
 ///
@@ -2632,6 +2861,27 @@ mod pre_tool_snapshot_gate_tests {
                 "{tool} does not modify the workspace and must not be snapshotted"
             );
         }
+    }
+
+    #[test]
+    fn plan_mode_blocks_file_and_mcp_write_tools() {
+        for tool in ["write_file", "edit_file", "apply_patch"] {
+            assert!(plan_mode_blocks_write_capable_tool(tool, false));
+        }
+
+        assert!(plan_mode_blocks_write_capable_tool(
+            "mcp_filesystem_write",
+            false
+        ));
+        assert!(!plan_mode_blocks_write_capable_tool(
+            "mcp_filesystem_read",
+            true
+        ));
+        assert!(!plan_mode_blocks_write_capable_tool("read_file", true));
+        assert!(!plan_mode_blocks_write_capable_tool(
+            "request_user_input",
+            false
+        ));
     }
 }
 
@@ -2741,7 +2991,15 @@ pub(super) fn command_denies_tool(disallowed_tools: Option<&[String]>, tool_name
     let Some(disallowed_tools) = disallowed_tools else {
         return false;
     };
-    disallowed_tools.contains(&tool_name.to_ascii_lowercase())
+    let tool_name = tool_name.to_ascii_lowercase();
+    disallowed_tools.iter().any(|rule| {
+        let rule = rule.to_ascii_lowercase();
+        if let Some(prefix) = rule.strip_suffix('*') {
+            tool_name.starts_with(prefix)
+        } else {
+            tool_name == rule
+        }
+    })
 }
 
 fn resolve_tool_definition<'a>(
@@ -2797,7 +3055,11 @@ fn should_emit_thinking_only_status(
 /// When the configured effort is `"auto"`, inspects the last user message
 /// and calls [`crate::auto_reasoning::select`] to pick the actual tier.
 /// Non-`"auto"` values pass through unchanged.
-fn resolve_auto_effort(reasoning_effort: Option<&str>, messages: &[Message]) -> Option<String> {
+fn resolve_auto_effort(
+    reasoning_effort: Option<&str>,
+    messages: &[Message],
+    provider: crate::config::ApiProvider,
+) -> Option<String> {
     match reasoning_effort {
         Some("auto") => {
             // Find the last user message in the conversation.
@@ -2829,7 +3091,10 @@ fn resolve_auto_effort(reasoning_effort: Option<&str>, messages: &[Message]) -> 
             // their own turn pass and can pass is_subagent=true when they
             // call this function directly.
             let tier = crate::auto_reasoning::select(false, &last_msg);
-            let resolved = tier.as_setting().to_string();
+            let resolved =
+                crate::model_routing::normalize_auto_route_effort_for_provider(provider, tier)
+                    .as_setting()
+                    .to_string();
             tracing::debug!(
                 reasoning_effort = %resolved,
                 is_subagent = false,
@@ -3065,7 +3330,11 @@ mod tests {
         }];
 
         assert_eq!(
-            resolve_auto_effort(Some("auto"), &messages),
+            resolve_auto_effort(
+                Some("auto"),
+                &messages,
+                crate::config::ApiProvider::Deepseek
+            ),
             Some("high".to_string()),
             "auto thinking should classify the user request, not stored metadata"
         );
@@ -3105,6 +3374,19 @@ mod tests {
     fn disallowed_tools_gate_blocks_case_insensitively() {
         let disallowed = vec!["exec_shell".to_string()];
         assert!(command_denies_tool(Some(&disallowed), "Exec_Shell"));
+    }
+
+    #[test]
+    fn disallowed_tools_gate_blocks_prefix_wildcard() {
+        let disallowed = vec!["mcp_acme_*".to_string()];
+        assert!(command_denies_tool(
+            Some(&disallowed),
+            "mcp_acme_get_profile"
+        ));
+        assert!(!command_denies_tool(
+            Some(&disallowed),
+            "mcp_other_make_thing"
+        ));
     }
 
     #[test]

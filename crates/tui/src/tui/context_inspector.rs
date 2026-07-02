@@ -1,10 +1,10 @@
 //! Compact session context inspector.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Write;
 
 use crate::compaction::estimate_input_tokens_conservative;
-use crate::config::provider_capability;
 use crate::localization::{Locale, MessageId, tr};
 use crate::models::SystemPrompt;
 use crate::session_manager::SessionContextReference;
@@ -71,7 +71,7 @@ enum PromptLayerKind {
 }
 
 impl PromptLayerKind {
-    fn label(self, locale: Locale) -> &'static str {
+    fn label(self, locale: Locale) -> Cow<'static, str> {
         match self {
             Self::Static => tr(locale, MessageId::CtxInspCacheFriendly),
             Self::Dynamic => tr(locale, MessageId::CtxInspChangesByTurn),
@@ -140,7 +140,7 @@ pub fn build_context_inspector_text(app: &App, locale: Locale) -> String {
         tr(locale, MessageId::CtxInspWorkspaceStatus),
         app.workspace_context
             .as_deref()
-            .unwrap_or(tr(locale, MessageId::CtxInspNotSampledYet))
+            .unwrap_or(&*tr(locale, MessageId::CtxInspNotSampledYet))
     );
 
     let _ = writeln!(out);
@@ -154,8 +154,11 @@ pub fn build_context_inspector_text(app: &App, locale: Locale) -> String {
 }
 
 fn context_usage(app: &App) -> (usize, u32, f64) {
-    let max =
-        provider_capability(app.api_provider, app.effective_model_for_budget()).context_window;
+    let max = crate::route_budget::route_context_window_tokens(
+        app.api_provider,
+        app.effective_model_for_budget(),
+        app.active_route_limits,
+    );
     let estimated =
         estimate_input_tokens_conservative(&app.api_messages, app.system_prompt.as_ref());
     let total_chars = estimate_message_chars(&app.api_messages);
@@ -242,7 +245,7 @@ fn push_system_prompt_structure(out: &mut String, app: &App, locale: Locale) {
                 let _ = writeln!(
                     out,
                     "    {first_line_lbl}: {}",
-                    block.text.lines().next().unwrap_or(empty_lbl)
+                    block.text.lines().next().unwrap_or(&*empty_lbl)
                 );
             } else {
                 let _ = writeln!(out, "  {volatile_lbl}: {none_lbl}");
@@ -399,7 +402,7 @@ fn push_tools(out: &mut String, app: &App, locale: Locale) {
     let mut rendered = 0usize;
     for detail in app.active_tool_details.values() {
         let location = tr(locale, MessageId::CtxInspActive);
-        push_tool_row(out, locale, location, detail);
+        push_tool_row(out, locale, &location, detail);
         rendered += 1;
         if rendered >= MAX_TOOL_ROWS {
             return;
@@ -417,7 +420,7 @@ fn push_tools(out: &mut String, app: &App, locale: Locale) {
     if rendered == 0 {
         let _ = writeln!(out, "- {}", tr(locale, MessageId::CtxInspNoToolActivity));
     } else {
-        let _ = writeln!(out, "- {}", tr(locale, MessageId::CtxInspAltVHint));
+        let _ = writeln!(out, "- {}", tr(locale, MessageId::CtxInspVHint));
     }
 }
 

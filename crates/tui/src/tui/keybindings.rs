@@ -21,6 +21,8 @@
 //! pairs (`↑/↓`) or families (`1-8`) that don't map cleanly to a single
 //! chord.
 
+use std::borrow::Cow;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeybindingSection {
     Navigation,
@@ -33,7 +35,7 @@ pub enum KeybindingSection {
 }
 
 impl KeybindingSection {
-    pub fn label(self, locale: crate::localization::Locale) -> &'static str {
+    pub fn label(self, locale: crate::localization::Locale) -> Cow<'static, str> {
         use crate::localization::{MessageId, tr};
         let id = match self {
             Self::Navigation => MessageId::HelpSectionNavigation,
@@ -216,11 +218,6 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
-        chord: "Alt+V",
-        description_id: crate::localization::MessageId::KbToolDetailsPager,
-        section: KeybindingSection::Submission,
-    },
-    KeybindingEntry {
         chord: "Ctrl+O",
         description_id: crate::localization::MessageId::KbThinkingPager,
         section: KeybindingSection::Submission,
@@ -242,7 +239,7 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Modes,
     },
     KeybindingEntry {
-        chord: "1-8 / Alt+1-8",
+        chord: "Alt+1-8",
         description_id: crate::localization::MessageId::KbJumpPlanAgentYolo,
         section: KeybindingSection::Modes,
     },
@@ -366,6 +363,26 @@ mod tests {
         assert_eq!(
             ctrl_x_tasks.description_id,
             crate::localization::MessageId::KbCancelBackgroundShellJobs
+        );
+    }
+
+    #[test]
+    fn tool_details_help_documents_bare_v_without_alt_v() {
+        let selected_details = KEYBINDINGS
+            .iter()
+            .filter(|entry| {
+                entry.description_id == crate::localization::MessageId::KbSelectedDetails
+            })
+            .map(|entry| entry.chord)
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected_details, vec!["v"]);
+        let legacy_modified_details_chord = ["Alt", "V"].join("+");
+        assert!(
+            KEYBINDINGS
+                .iter()
+                .all(|entry| entry.chord != legacy_modified_details_chord),
+            "help should advertise the bare v details shortcut"
         );
     }
 

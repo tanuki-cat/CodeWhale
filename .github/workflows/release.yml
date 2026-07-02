@@ -15,6 +15,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
   RUSTFLAGS: -Dwarnings
 
 jobs:
@@ -25,8 +26,14 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: '1.88'
+          toolchain: stable
           components: clippy, rustfmt
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Enable sccache
+        shell: bash
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "${GITHUB_ENV}"
+          echo "RUSTC_WRAPPER=sccache" >> "${GITHUB_ENV}"
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -52,6 +59,7 @@ jobs:
             -A clippy::uninlined_format_args \
             -A clippy::too_many_arguments \
             -A clippy::unnecessary_map_or \
+            -A clippy::collapsible_if \
             -A clippy::assertions_on_constants
       - name: Workspace tests
         run: cargo test --workspace --all-features --locked
@@ -101,69 +109,75 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "source_ref=${source_ref}" >> "$GITHUB_OUTPUT"
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+      - name: Require release source on main
+        run: ./scripts/release/ensure-release-on-main.sh "${{ steps.release.outputs.sha }}"
 
   build:
     needs: [parity, resolve]
     # `parity` is gated to tag-push events. On manual `workflow_dispatch`,
-    # parity is skipped, so let `build` proceed when parity either succeeded
-    # or was skipped — but never when it actually failed or the run was
-    # cancelled. Operators using dispatch are expected to have already run
-    # the same gates locally / via ci.yml on `main`.
-    if: ${{ !cancelled() && (needs.parity.result == 'success' || needs.parity.result == 'skipped') }}
+    # parity is skipped, so let `build` proceed when resolve succeeded and
+    # parity either succeeded or was skipped — but never when parity actually
+    # failed or the run was cancelled. Operators using dispatch are expected
+    # to have already run the same gates locally / via ci.yml on `main`.
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.parity.result == 'success' || needs.parity.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # --- codewhale (cli dispatcher, canonical) ---
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            binary: codewhale
-            artifact_name: codewhale-linux-x64
+            platform: linux-x64
+            cli_binary: codewhale
+            shim_binary: codew
+            tui_binary: codewhale-tui
+            cli_artifact: codewhale-linux-x64
+            shim_artifact: codew-linux-x64
+            tui_artifact: codewhale-tui-linux-x64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            binary: codewhale
-            artifact_name: codewhale-linux-arm64
+            platform: linux-arm64
+            cli_binary: codewhale
+            shim_binary: codew
+            tui_binary: codewhale-tui
+            cli_artifact: codewhale-linux-arm64
+            shim_artifact: codew-linux-arm64
+            tui_artifact: codewhale-tui-linux-arm64
           - os: ubuntu-latest
             target: riscv64gc-unknown-linux-gnu
-            binary: codewhale
-            artifact_name: codewhale-linux-riscv64
+            platform: linux-riscv64
+            cli_binary: codewhale
+            shim_binary: codew
+            tui_binary: codewhale-tui
+            cli_artifact: codewhale-linux-riscv64
+            shim_artifact: codew-linux-riscv64
+            tui_artifact: codewhale-tui-linux-riscv64
           - os: macos-latest
             target: x86_64-apple-darwin
-            binary: codewhale
-            artifact_name: codewhale-macos-x64
+            platform: macos-x64
+            cli_binary: codewhale
+            shim_binary: codew
+            tui_binary: codewhale-tui
+            cli_artifact: codewhale-macos-x64
+            shim_artifact: codew-macos-x64
+            tui_artifact: codewhale-tui-macos-x64
           - os: macos-latest
             target: aarch64-apple-darwin
-            binary: codewhale
-            artifact_name: codewhale-macos-arm64
+            platform: macos-arm64
+            cli_binary: codewhale
+            shim_binary: codew
+            tui_binary: codewhale-tui
+            cli_artifact: codewhale-macos-arm64
+            shim_artifact: codew-macos-arm64
+            tui_artifact: codewhale-tui-macos-arm64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary: codewhale.exe
-            artifact_name: codewhale-windows-x64.exe
-          # --- codewhale-tui (TUI runtime, canonical) ---
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            binary: codewhale-tui
-            artifact_name: codewhale-tui-linux-x64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            binary: codewhale-tui
-            artifact_name: codewhale-tui-linux-arm64
-          - os: ubuntu-latest
-            target: riscv64gc-unknown-linux-gnu
-            binary: codewhale-tui
-            artifact_name: codewhale-tui-linux-riscv64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            binary: codewhale-tui
-            artifact_name: codewhale-tui-macos-x64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            binary: codewhale-tui
-            artifact_name: codewhale-tui-macos-arm64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary: codewhale-tui.exe
-            artifact_name: codewhale-tui-windows-x64.exe
+            platform: windows-x64
+            cli_binary: codewhale.exe
+            shim_binary: codew.exe
+            tui_binary: codewhale-tui.exe
+            cli_artifact: codewhale-windows-x64.exe
+            shim_artifact: codew-windows-x64.exe
+            tui_artifact: codewhale-tui-windows-x64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -171,10 +185,16 @@ jobs:
           ref: ${{ needs.resolve.outputs.source_ref }}
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: '1.88'
+          toolchain: stable
           targets: ${{ matrix.target }}
       - name: Install Rust target
-        run: rustup target add --toolchain 1.88 ${{ matrix.target }}
+        run: rustup target add --toolchain stable ${{ matrix.target }}
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Enable sccache
+        shell: bash
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "${GITHUB_ENV}"
+          echo "RUSTC_WRAPPER=sccache" >> "${GITHUB_ENV}"
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -193,8 +213,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          rustup target add --toolchain 1.88 x86_64-unknown-linux-musl
-          cargo build --release --locked --target x86_64-unknown-linux-musl
+          rustup target add --toolchain stable x86_64-unknown-linux-musl
+          cargo build --release --locked --target x86_64-unknown-linux-musl -p codewhale-cli -p codewhale-tui
       - name: Install RISC-V cross-compilation toolchain
         if: matrix.target == 'riscv64gc-unknown-linux-gnu'
         run: |
@@ -242,21 +262,37 @@ jobs:
           PKG_CONFIG_ALLOW_CROSS: 1
           PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu: /usr/lib/aarch64-linux-gnu/pkgconfig
           PKG_CONFIG_LIBDIR_riscv64gc_unknown_linux_gnu: /usr/lib/riscv64-linux-gnu/pkgconfig
-        run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Rename binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p codewhale-cli -p codewhale-tui
+      - name: Stage binaries
         shell: bash
         run: |
-          BIN_PATH="target/${{ matrix.target }}/release/${{ matrix.binary }}"
-          if [ ! -f "${BIN_PATH}" ]; then
-            echo "Binary not at ${BIN_PATH}; searching target/ for ${{ matrix.binary }}:"
-            find target -name "${{ matrix.binary }}" -type f
-            exit 1
-          fi
-          cp "${BIN_PATH}" "${{ matrix.artifact_name }}"
+          stage_binary() {
+            local binary="$1"
+            local artifact="$2"
+            local bin_path="target/${{ matrix.target }}/release/${binary}"
+            if [ ! -f "${bin_path}" ]; then
+              echo "Binary not at ${bin_path}; searching target/ for ${binary}:"
+              find target -name "${binary}" -type f
+              exit 1
+            fi
+            cp "${bin_path}" "${artifact}"
+          }
+
+          stage_binary "${{ matrix.cli_binary }}" "${{ matrix.cli_artifact }}"
+          stage_binary "${{ matrix.shim_binary }}" "${{ matrix.shim_artifact }}"
+          stage_binary "${{ matrix.tui_binary }}" "${{ matrix.tui_artifact }}"
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}
+          name: ${{ matrix.cli_artifact }}
+          path: ${{ matrix.cli_artifact }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.shim_artifact }}
+          path: ${{ matrix.shim_artifact }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.tui_artifact }}
+          path: ${{ matrix.tui_artifact }}
 
   bundle:
     needs: [build, resolve]
@@ -269,7 +305,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
-          pattern: 'codewhale*'
+          pattern: '*'
       - name: Create platform archives
         shell: bash
         run: |
@@ -281,22 +317,26 @@ jobs:
           bundle() {
             local platform="$1"   # linux-x64, linux-arm64, macos-x64, macos-arm64, windows-x64
             local cli_src="$2"    # artifact name for codewhale binary
-            local tui_src="$3"    # artifact name for codewhale-tui binary
-            local ext="$4"        # tar.gz or zip
-            local variant="$5"    # '' (standard) or 'portable' (Windows only, no install script)
-            shift 5
+            local shim_src="$3"   # artifact name for codew shim
+            local tui_src="$4"    # artifact name for codewhale-tui binary
+            local ext="$5"        # tar.gz or zip
+            local variant="$6"    # '' (standard) or 'portable' (Windows only, no install script)
+            shift 6
 
             local dir="bundles/codewhale-${platform}${variant:+-}${variant}"
             mkdir -p "$dir"
 
             # Copy binaries, stripping platform suffixes
             local cli_dst="codewhale"
+            local shim_dst="codew"
             local tui_dst="codewhale-tui"
             if [[ "$platform" == windows-* ]]; then
               cli_dst="codewhale.exe"
+              shim_dst="codew.exe"
               tui_dst="codewhale-tui.exe"
             fi
             cp "artifacts/${cli_src}/${cli_src}" "$dir/${cli_dst}"
+            cp "artifacts/${shim_src}/${shim_src}" "$dir/${shim_dst}"
             cp "artifacts/${tui_src}/${tui_src}" "$dir/${tui_dst}"
 
             # Add install script (standard variant only)
@@ -324,29 +364,29 @@ jobs:
 
           # Platform: linux-x64
           bundle linux-x64 \
-            codewhale-linux-x64 codewhale-tui-linux-x64 tar.gz ""
+            codewhale-linux-x64 codew-linux-x64 codewhale-tui-linux-x64 tar.gz ""
 
           # Platform: linux-arm64
           bundle linux-arm64 \
-            codewhale-linux-arm64 codewhale-tui-linux-arm64 tar.gz ""
+            codewhale-linux-arm64 codew-linux-arm64 codewhale-tui-linux-arm64 tar.gz ""
 
           # Platform: linux-riscv64
           bundle linux-riscv64 \
-            codewhale-linux-riscv64 codewhale-tui-linux-riscv64 tar.gz ""
+            codewhale-linux-riscv64 codew-linux-riscv64 codewhale-tui-linux-riscv64 tar.gz ""
 
           # Platform: macos-x64
           bundle macos-x64 \
-            codewhale-macos-x64 codewhale-tui-macos-x64 tar.gz ""
+            codewhale-macos-x64 codew-macos-x64 codewhale-tui-macos-x64 tar.gz ""
 
           # Platform: macos-arm64
           bundle macos-arm64 \
-            codewhale-macos-arm64 codewhale-tui-macos-arm64 tar.gz ""
+            codewhale-macos-arm64 codew-macos-arm64 codewhale-tui-macos-arm64 tar.gz ""
 
           # Platform: windows-x64 (standard + portable)
           bundle windows-x64 \
-            codewhale-windows-x64.exe codewhale-tui-windows-x64.exe zip ""
+            codewhale-windows-x64.exe codew-windows-x64.exe codewhale-tui-windows-x64.exe zip ""
           bundle windows-x64 \
-            codewhale-windows-x64.exe codewhale-tui-windows-x64.exe zip "portable"
+            codewhale-windows-x64.exe codew-windows-x64.exe codewhale-tui-windows-x64.exe zip "portable"
 
           echo ""
           echo "=== Archive checksums ==="
@@ -370,7 +410,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
-          pattern: 'codewhale*-windows-x64.exe'
+          pattern: '*windows-x64.exe'
       - name: Install NSIS
         shell: pwsh
         run: choco install nsis -y --no-progress
@@ -380,6 +420,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $version = "${{ needs.resolve.outputs.tag }}".TrimStart("v")
           Copy-Item "artifacts\codewhale-windows-x64.exe\codewhale-windows-x64.exe" "scripts\installer\codewhale.exe"
+          Copy-Item "artifacts\codew-windows-x64.exe\codew-windows-x64.exe" "scripts\installer\codew.exe"
           Copy-Item "artifacts\codewhale-tui-windows-x64.exe\codewhale-tui-windows-x64.exe" "scripts\installer\codewhale-tui.exe"
           $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           if (!(Test-Path $makensis)) {

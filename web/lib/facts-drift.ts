@@ -77,6 +77,7 @@ function deriveProvidersFromConfig(cfg: string): ProviderFact[] {
   // so the binary rejects it — keep it out of the docs. Issue #1104.
   const labelMap: Record<string, ProviderFact> = {
     Deepseek: { id: "deepseek", label: "DeepSeek", env: "DEEPSEEK_API_KEY" },
+    DeepseekAnthropic: { id: "deepseek-anthropic", label: "DeepSeek Anthropic", env: "DEEPSEEK_API_KEY / ANTHROPIC_API_KEY" },
     NvidiaNim: { id: "nvidia-nim", label: "NVIDIA NIM", env: "NVIDIA_API_KEY / NVIDIA_NIM_API_KEY" },
     Openai: { id: "openai", label: "OpenAI-compatible", env: "OPENAI_API_KEY" },
     Atlascloud: { id: "atlascloud", label: "AtlasCloud", env: "ATLASCLOUD_API_KEY" },
@@ -102,23 +103,28 @@ function deriveProvidersFromConfig(cfg: string): ProviderFact[] {
     Zai: { id: "zai", label: "Z.ai", env: "ZAI_API_KEY / Z_AI_API_KEY" },
     Stepfun: { id: "stepfun", label: "StepFun", env: "STEPFUN_API_KEY / STEP_API_KEY" },
     Minimax: { id: "minimax", label: "MiniMax", env: "MINIMAX_API_KEY" },
+    Openmodel: { id: "openmodel", label: "OpenModel", env: "OPENMODEL_API_KEY" },
+    Sakana: { id: "sakana", label: "Sakana AI", env: "FUGU_API_KEY / SAKANA_API_KEY" },
   };
   // Log loudly on unmapped variants so a new provider can never be silently
-  // dropped from the drift-derived facts again. DeepseekCN is the one
-  // deliberate exclusion (see comment above / issue #1104).
-  const EXCLUDED = new Set(["DeepseekCN"]);
+  // dropped from the drift-derived facts again. DeepseekCN (#1104) and the
+  // dynamic Custom meta-provider (#1519, user-defined endpoints) are the
+  // deliberate exclusions.
+  const EXCLUDED = new Set(["DeepseekCN", "Custom"]);
   const unmapped = variants.filter((v) => !EXCLUDED.has(v) && !labelMap[v]);
   if (unmapped.length > 0) {
     console.warn(
       `[facts-drift] ApiProvider variants missing from labelMap: ${unmapped.join(", ")}. ` +
-        "Add them to labelMap here AND in web/scripts/derive-facts.mjs (or to EXCLUDED if intentionally hidden).",
+        "Add them to labelMap here AND PROVIDER_LABEL_MAP in web/scripts/facts-lib.mjs (or to EXCLUDED if intentionally hidden).",
     );
   }
   return variants.map((v) => labelMap[v]).filter(Boolean);
 }
 
 function deriveDefaultModel(cfg: string): string | null {
-  const m = cfg.match(/DEFAULT_TEXT_MODEL[^"]*"([^"]+)"/);
+  // Match the const *definition* (`= "..."`); the definition moved to
+  // config/models.rs in the #3311 split, so callers pass config.rs + models.rs.
+  const m = cfg.match(/DEFAULT_TEXT_MODEL\s*(?::\s*&str\s*)?=\s*"([^"]+)"/);
   return m ? m[1] : null;
 }
 
@@ -160,9 +166,10 @@ function deriveLicense(licText: string): string | null {
 }
 
 export async function deriveFactsFromRemote(ghToken?: string): Promise<RepoFacts | null> {
-  const [cargo, configRs, sandboxFiles, npmPkg, licText, toolFiles, latestRelease] = await Promise.all([
+  const [cargo, configRs, configModels, sandboxFiles, npmPkg, licText, toolFiles, latestRelease] = await Promise.all([
     fetchText("Cargo.toml", ghToken),
     fetchText("crates/tui/src/config.rs", ghToken),
+    fetchText("crates/tui/src/config/models.rs", ghToken),
     fetchListing("crates/tui/src/sandbox", ghToken),
     fetchText("npm/codewhale/package.json", ghToken),
     fetchText("LICENSE", ghToken),
@@ -179,7 +186,7 @@ export async function deriveFactsFromRemote(ghToken?: string): Promise<RepoFacts
     crates: deriveCrates(cargo),
     sandboxBackends: sandboxFiles ? deriveSandboxBackends(sandboxFiles) : BUILD_FACTS.sandboxBackends,
     providers: deriveProvidersFromConfig(configRs),
-    defaultModel: deriveDefaultModel(configRs),
+    defaultModel: deriveDefaultModel(`${configRs}\n${configModels ?? ""}`),
     nodeEngines: (() => {
       try { return npmPkg ? JSON.parse(npmPkg).engines?.node ?? null : null; } catch { return null; }
     })(),

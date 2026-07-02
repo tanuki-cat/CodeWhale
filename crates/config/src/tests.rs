@@ -27,6 +27,37 @@ fn network_policy_toml_deserializes_proxy_hosts() {
 }
 
 #[test]
+fn verifier_config_defaults_to_hunt_verdict_policy() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+        [verifier]
+        enabled = true
+        "#,
+    )
+    .expect("verifier config toml");
+
+    let verifier = config.verifier.expect("verifier table");
+    assert!(verifier.enabled);
+    assert_eq!(verifier.verdict_policy, VerifierVerdictPolicy::Hunt);
+}
+
+#[test]
+fn verifier_config_rejects_unknown_verdict_policy() {
+    let err = toml::from_str::<ConfigToml>(
+        r#"
+        [verifier]
+        verdict_policy = "strict"
+        "#,
+    )
+    .expect_err("only the shipped hunt policy should parse");
+
+    assert!(
+        err.message().contains("unknown variant"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn permissions_toml_deserializes_typed_ask_rules() {
     let permissions: PermissionsToml = toml::from_str(
         r#"
@@ -51,7 +82,8 @@ fn permissions_toml_deserializes_typed_ask_rules() {
 }
 
 #[test]
-fn permissions_toml_rejects_typed_allow_deny_shape() {
+fn permissions_toml_rejects_unknown_decision_field() {
+    // `decision` is NOT a valid field — `deny_unknown_fields` still active.
     let err = toml::from_str::<PermissionsToml>(
         r#"
         [[rules]]
@@ -60,9 +92,184 @@ fn permissions_toml_rejects_typed_allow_deny_shape() {
         command = "cargo test"
         "#,
     )
-    .expect_err("permissions.toml should be ask-only in this slice");
+    .expect_err("permissions.toml should reject unknown 'decision' field");
 
     assert!(err.message().contains("unknown field"));
+}
+
+#[test]
+fn permissions_toml_deserializes_action_deny_and_allow() {
+    let permissions: PermissionsToml = toml::from_str(
+        r#"
+        [[rules]]
+        tool = "exec_shell"
+        command = "sed"
+        action = "deny"
+
+        [[rules]]
+        tool = "exec_shell"
+        command = "git status"
+        action = "allow"
+
+        [[rules]]
+        tool = "exec_shell"
+        command = "cargo test"
+        "#,
+    )
+    .expect("permissions toml with actions");
+
+    assert_eq!(permissions.rules.len(), 3);
+    assert_eq!(
+        permissions.rules[0].action,
+        codewhale_execpolicy::PermissionAction::Deny
+    );
+    assert_eq!(
+        permissions.rules[1].action,
+        codewhale_execpolicy::PermissionAction::Allow
+    );
+    assert_eq!(
+        permissions.rules[2].action,
+        codewhale_execpolicy::PermissionAction::Ask
+    ); // default
+}
+
+#[test]
+fn permissions_ruleset_populates_denied_and_trusted_prefixes() {
+    let permissions: PermissionsToml = toml::from_str(
+        r#"
+        [[rules]]
+        tool = "exec_shell"
+        command = "sed"
+        action = "deny"
+
+        [[rules]]
+        tool = "exec_shell"
+        command = "awk"
+        action = "deny"
+
+        [[rules]]
+        tool = "exec_shell"
+        command = "git status"
+        action = "allow"
+
+        [[rules]]
+        tool = "exec_shell"
+        command = "cargo test"
+        action = "ask"
+        "#,
+    )
+    .unwrap();
+
+    let ruleset = permissions.ruleset();
+
+    // All four rules kept as ask_rules for path-based / tool-only matching
+    assert_eq!(ruleset.ask_rules.len(), 4);
+    // deny rules promoted to denied_prefixes
+    assert!(ruleset.denied_prefixes.contains(&"sed".to_string()));
+    assert!(ruleset.denied_prefixes.contains(&"awk".to_string()));
+    // allow rule promoted to trusted_prefixes
+    assert!(ruleset.trusted_prefixes.contains(&"git status".to_string()));
+    // ask rule NOT in trusted/denied prefixes
+    assert!(!ruleset.trusted_prefixes.contains(&"cargo test".to_string()));
+    assert!(!ruleset.denied_prefixes.contains(&"cargo test".to_string()));
+}
+
+#[test]
+fn permissions_ruleset_deny_without_command_stays_in_ask_rules() {
+    // Tool-only deny (no command) can't be promoted to denied_prefixes.
+    let permissions: PermissionsToml = toml::from_str(
+        r#"
+        [[rules]]
+        tool = "exec_shell"
+        action = "deny"
+        "#,
+    )
+    .unwrap();
+
+    let ruleset = permissions.ruleset();
+    assert_eq!(ruleset.ask_rules.len(), 1);
+    assert_eq!(
+        ruleset.ask_rules[0].action,
+        codewhale_execpolicy::PermissionAction::Deny
+    );
+    // No command → nothing to promote to denied_prefixes
+    assert!(ruleset.denied_prefixes.is_empty());
+}
+
+#[test]
+fn permissions_ruleset_empty_rules_produces_empty_ruleset() {
+    let permissions = PermissionsToml::default();
+    let ruleset = permissions.ruleset();
+    assert!(ruleset.trusted_prefixes.is_empty());
+    assert!(ruleset.denied_prefixes.is_empty());
+    assert!(ruleset.ask_rules.is_empty());
+}
+
+#[test]
+fn permissions_ruleset_mixed_actions_all_coexist() {
+    let permissions: PermissionsToml = toml::from_str(
+        r#"
+        [[rules]]
+        tool = "exec_shell"
+        command = "rm -rf"
+        action = "deny"
+
+        [[rules]]
+        tool = "exec_shell"
+        command = "git status"
+        action = "allow"
+
+        [[rules]]
+        tool = "exec_shell"
+        command = "npm test"
+        action = "ask"
+
+        [[rules]]
+        tool = "read_file"
+        path = "Cargo.toml"
+        action = "allow"
+
+        [[rules]]
+        tool = "write_file"
+        path = "src/secrets.rs"
+        action = "deny"
+        "#,
+    )
+    .unwrap();
+
+    let ruleset = permissions.ruleset();
+
+    // All 5 rules in ask_rules
+    assert_eq!(ruleset.ask_rules.len(), 5);
+
+    // Command-based deny → denied_prefixes
+    assert!(ruleset.denied_prefixes.contains(&"rm -rf".to_string()));
+    assert_eq!(ruleset.denied_prefixes.len(), 1); // only rm -rf has a command
+
+    // Command-based allow → trusted_prefixes
+    assert!(ruleset.trusted_prefixes.contains(&"git status".to_string()));
+    assert_eq!(ruleset.trusted_prefixes.len(), 1); // only git status has a command
+
+    // Path-based rules stay in ask_rules but not in prefixes
+    let path_deny = ruleset
+        .ask_rules
+        .iter()
+        .find(|r| r.path.as_deref() == Some("src/secrets.rs"))
+        .unwrap();
+    assert_eq!(
+        path_deny.action,
+        codewhale_execpolicy::PermissionAction::Deny
+    );
+
+    let path_allow = ruleset
+        .ask_rules
+        .iter()
+        .find(|r| r.path.as_deref() == Some("Cargo.toml"))
+        .unwrap();
+    assert_eq!(
+        path_allow.action,
+        codewhale_execpolicy::PermissionAction::Allow
+    );
 }
 
 #[test]
@@ -128,30 +335,48 @@ fn provider_auth_source_rejects_empty_command() {
 }
 
 #[test]
-fn hotbar_defaults_when_config_is_absent() {
+fn hotbar_hidden_when_config_is_absent() {
+    // #3807: an absent `hotbar` key resolves to no bindings, so the Hotbar is
+    // hidden until the user opts in. The default slots are still available
+    // explicitly via `default_hotbar_bindings_toml()` (what `/hotbar on` writes).
     let config = ConfigToml::default();
 
     let resolved = config.resolve_hotbar_bindings(&DEFAULT_HOTBAR_ACTIONS);
 
     assert_eq!(resolved.warnings, Vec::new());
-    assert_eq!(resolved.bindings, default_hotbar_bindings());
-    assert_eq!(
-        resolved
-            .bindings
-            .iter()
-            .map(|binding| (binding.slot, binding.action.as_str()))
-            .collect::<Vec<_>>(),
-        vec![
-            (1, "voice.toggle"),
-            (2, "session.compact"),
-            (3, "mode.plan"),
-            (4, "mode.agent"),
-            (5, "mode.yolo"),
-            (6, "palette.open"),
-            (7, "sidebar.toggle"),
-            (8, "trust.toggle"),
-        ]
+    assert!(
+        resolved.bindings.is_empty(),
+        "fresh config must resolve to no hotbar bindings: {:?}",
+        resolved.bindings
     );
+
+    // The explicit default set still expands to the eight recommended slots.
+    let explicit = ConfigToml {
+        hotbar: Some(default_hotbar_bindings_toml()),
+        ..ConfigToml::default()
+    };
+    assert_eq!(
+        explicit
+            .resolve_hotbar_bindings(&DEFAULT_HOTBAR_ACTIONS)
+            .bindings,
+        default_hotbar_bindings(),
+        "an explicit default-bindings config still shows all eight slots"
+    );
+}
+
+#[test]
+fn hotbar_empty_array_disables_default_slots() {
+    let config: ConfigToml = toml::from_str("hotbar = []\n").expect("parse empty hotbar array");
+
+    let resolved = config.resolve_hotbar_bindings(&DEFAULT_HOTBAR_ACTIONS);
+
+    assert_eq!(resolved.warnings, Vec::new());
+    assert_eq!(resolved.bindings, Vec::new());
+
+    let serialized = toml::to_string_pretty(&config).expect("serialize config");
+    let round_tripped: ConfigToml =
+        toml::from_str(&serialized).expect("deserialize serialized config");
+    assert_eq!(round_tripped.hotbar, Some(Vec::new()));
 }
 
 #[test]
@@ -536,6 +761,8 @@ fn config_store_secures_persisted_permissions_file() {
 struct EnvGuard {
     deepseek_api_key: Option<OsString>,
     deepseek_base_url: Option<OsString>,
+    deepseek_anthropic_base_url: Option<OsString>,
+    deepseek_claude_base_url: Option<OsString>,
     deepseek_http_headers: Option<OsString>,
     deepseek_model: Option<OsString>,
     deepseek_default_text_model: Option<OsString>,
@@ -549,6 +776,9 @@ struct EnvGuard {
     openrouter_api_key: Option<OsString>,
     openrouter_base_url: Option<OsString>,
     openrouter_model: Option<OsString>,
+    openmodel_api_key: Option<OsString>,
+    openmodel_base_url: Option<OsString>,
+    openmodel_model: Option<OsString>,
     xiaomi_mimo_token_plan_api_key: Option<OsString>,
     mimo_token_plan_api_key: Option<OsString>,
     xiaomi_mimo_api_key: Option<OsString>,
@@ -596,8 +826,19 @@ struct EnvGuard {
     kimi_model_name: Option<OsString>,
     zai_api_key: Option<OsString>,
     z_ai_api_key: Option<OsString>,
+    zhipu_api_key: Option<OsString>,
+    glm_api_key: Option<OsString>,
     zai_base_url: Option<OsString>,
+    z_ai_base_url: Option<OsString>,
+    zhipu_base_url: Option<OsString>,
+    zhipuai_base_url: Option<OsString>,
+    bigmodel_base_url: Option<OsString>,
     zai_model: Option<OsString>,
+    z_ai_model: Option<OsString>,
+    zhipu_model: Option<OsString>,
+    zhipuai_model: Option<OsString>,
+    bigmodel_model: Option<OsString>,
+    glm_model: Option<OsString>,
     stepfun_api_key: Option<OsString>,
     step_api_key: Option<OsString>,
     stepfun_base_url: Option<OsString>,
@@ -605,6 +846,10 @@ struct EnvGuard {
     minimax_api_key: Option<OsString>,
     minimax_base_url: Option<OsString>,
     minimax_model: Option<OsString>,
+    sakana_api_key: Option<OsString>,
+    fugu_api_key: Option<OsString>,
+    sakana_base_url: Option<OsString>,
+    sakana_model: Option<OsString>,
     sglang_api_key: Option<OsString>,
     sglang_base_url: Option<OsString>,
     vllm_api_key: Option<OsString>,
@@ -627,6 +872,8 @@ impl EnvGuard {
         let guard = Self {
             deepseek_api_key: env::var_os("DEEPSEEK_API_KEY"),
             deepseek_base_url: env::var_os("DEEPSEEK_BASE_URL"),
+            deepseek_anthropic_base_url: env::var_os("DEEPSEEK_ANTHROPIC_BASE_URL"),
+            deepseek_claude_base_url: env::var_os("DEEPSEEK_CLAUDE_BASE_URL"),
             deepseek_http_headers: env::var_os("DEEPSEEK_HTTP_HEADERS"),
             deepseek_model: env::var_os("DEEPSEEK_MODEL"),
             deepseek_default_text_model: env::var_os("DEEPSEEK_DEFAULT_TEXT_MODEL"),
@@ -643,6 +890,9 @@ impl EnvGuard {
             openrouter_api_key: env::var_os("OPENROUTER_API_KEY"),
             openrouter_base_url: env::var_os("OPENROUTER_BASE_URL"),
             openrouter_model: env::var_os("OPENROUTER_MODEL"),
+            openmodel_api_key: env::var_os("OPENMODEL_API_KEY"),
+            openmodel_base_url: env::var_os("OPENMODEL_BASE_URL"),
+            openmodel_model: env::var_os("OPENMODEL_MODEL"),
             xiaomi_mimo_token_plan_api_key: env::var_os("XIAOMI_MIMO_TOKEN_PLAN_API_KEY"),
             mimo_token_plan_api_key: env::var_os("MIMO_TOKEN_PLAN_API_KEY"),
             xiaomi_mimo_api_key: env::var_os("XIAOMI_MIMO_API_KEY"),
@@ -690,8 +940,19 @@ impl EnvGuard {
             kimi_model_name: env::var_os("KIMI_MODEL_NAME"),
             zai_api_key: env::var_os("ZAI_API_KEY"),
             z_ai_api_key: env::var_os("Z_AI_API_KEY"),
+            zhipu_api_key: env::var_os("ZHIPU_API_KEY"),
+            glm_api_key: env::var_os("GLM_API_KEY"),
             zai_base_url: env::var_os("ZAI_BASE_URL"),
+            z_ai_base_url: env::var_os("Z_AI_BASE_URL"),
+            zhipu_base_url: env::var_os("ZHIPU_BASE_URL"),
+            zhipuai_base_url: env::var_os("ZHIPUAI_BASE_URL"),
+            bigmodel_base_url: env::var_os("BIGMODEL_BASE_URL"),
             zai_model: env::var_os("ZAI_MODEL"),
+            z_ai_model: env::var_os("Z_AI_MODEL"),
+            zhipu_model: env::var_os("ZHIPU_MODEL"),
+            zhipuai_model: env::var_os("ZHIPUAI_MODEL"),
+            bigmodel_model: env::var_os("BIGMODEL_MODEL"),
+            glm_model: env::var_os("GLM_MODEL"),
             stepfun_api_key: env::var_os("STEPFUN_API_KEY"),
             step_api_key: env::var_os("STEP_API_KEY"),
             stepfun_base_url: env::var_os("STEPFUN_BASE_URL"),
@@ -699,6 +960,10 @@ impl EnvGuard {
             minimax_api_key: env::var_os("MINIMAX_API_KEY"),
             minimax_base_url: env::var_os("MINIMAX_BASE_URL"),
             minimax_model: env::var_os("MINIMAX_MODEL"),
+            sakana_api_key: env::var_os("SAKANA_API_KEY"),
+            fugu_api_key: env::var_os("FUGU_API_KEY"),
+            sakana_base_url: env::var_os("SAKANA_BASE_URL"),
+            sakana_model: env::var_os("SAKANA_MODEL"),
             sglang_api_key: env::var_os("SGLANG_API_KEY"),
             sglang_base_url: env::var_os("SGLANG_BASE_URL"),
             vllm_api_key: env::var_os("VLLM_API_KEY"),
@@ -716,6 +981,8 @@ impl EnvGuard {
         unsafe {
             env::remove_var("DEEPSEEK_API_KEY");
             env::remove_var("DEEPSEEK_BASE_URL");
+            env::remove_var("DEEPSEEK_ANTHROPIC_BASE_URL");
+            env::remove_var("DEEPSEEK_CLAUDE_BASE_URL");
             env::remove_var("DEEPSEEK_HTTP_HEADERS");
             env::remove_var("DEEPSEEK_MODEL");
             env::remove_var("DEEPSEEK_DEFAULT_TEXT_MODEL");
@@ -732,6 +999,9 @@ impl EnvGuard {
             env::remove_var("OPENROUTER_API_KEY");
             env::remove_var("OPENROUTER_BASE_URL");
             env::remove_var("OPENROUTER_MODEL");
+            env::remove_var("OPENMODEL_API_KEY");
+            env::remove_var("OPENMODEL_BASE_URL");
+            env::remove_var("OPENMODEL_MODEL");
             env::remove_var("XIAOMI_MIMO_TOKEN_PLAN_API_KEY");
             env::remove_var("MIMO_TOKEN_PLAN_API_KEY");
             env::remove_var("XIAOMI_MIMO_API_KEY");
@@ -779,8 +1049,19 @@ impl EnvGuard {
             env::remove_var("KIMI_MODEL_NAME");
             env::remove_var("ZAI_API_KEY");
             env::remove_var("Z_AI_API_KEY");
+            env::remove_var("ZHIPU_API_KEY");
+            env::remove_var("GLM_API_KEY");
             env::remove_var("ZAI_BASE_URL");
+            env::remove_var("Z_AI_BASE_URL");
+            env::remove_var("ZHIPU_BASE_URL");
+            env::remove_var("ZHIPUAI_BASE_URL");
+            env::remove_var("BIGMODEL_BASE_URL");
             env::remove_var("ZAI_MODEL");
+            env::remove_var("Z_AI_MODEL");
+            env::remove_var("ZHIPU_MODEL");
+            env::remove_var("ZHIPUAI_MODEL");
+            env::remove_var("BIGMODEL_MODEL");
+            env::remove_var("GLM_MODEL");
             env::remove_var("STEPFUN_API_KEY");
             env::remove_var("STEP_API_KEY");
             env::remove_var("STEPFUN_BASE_URL");
@@ -788,6 +1069,10 @@ impl EnvGuard {
             env::remove_var("MINIMAX_API_KEY");
             env::remove_var("MINIMAX_BASE_URL");
             env::remove_var("MINIMAX_MODEL");
+            env::remove_var("SAKANA_API_KEY");
+            env::remove_var("FUGU_API_KEY");
+            env::remove_var("SAKANA_BASE_URL");
+            env::remove_var("SAKANA_MODEL");
             env::remove_var("SGLANG_API_KEY");
             env::remove_var("SGLANG_BASE_URL");
             env::remove_var("VLLM_API_KEY");
@@ -819,6 +1104,14 @@ impl Drop for EnvGuard {
         unsafe {
             Self::restore_var("DEEPSEEK_API_KEY", self.deepseek_api_key.take());
             Self::restore_var("DEEPSEEK_BASE_URL", self.deepseek_base_url.take());
+            Self::restore_var(
+                "DEEPSEEK_ANTHROPIC_BASE_URL",
+                self.deepseek_anthropic_base_url.take(),
+            );
+            Self::restore_var(
+                "DEEPSEEK_CLAUDE_BASE_URL",
+                self.deepseek_claude_base_url.take(),
+            );
             Self::restore_var("DEEPSEEK_HTTP_HEADERS", self.deepseek_http_headers.take());
             Self::restore_var("DEEPSEEK_MODEL", self.deepseek_model.take());
             Self::restore_var(
@@ -838,6 +1131,9 @@ impl Drop for EnvGuard {
             Self::restore_var("OPENROUTER_API_KEY", self.openrouter_api_key.take());
             Self::restore_var("OPENROUTER_BASE_URL", self.openrouter_base_url.take());
             Self::restore_var("OPENROUTER_MODEL", self.openrouter_model.take());
+            Self::restore_var("OPENMODEL_API_KEY", self.openmodel_api_key.take());
+            Self::restore_var("OPENMODEL_BASE_URL", self.openmodel_base_url.take());
+            Self::restore_var("OPENMODEL_MODEL", self.openmodel_model.take());
             Self::restore_var(
                 "XIAOMI_MIMO_TOKEN_PLAN_API_KEY",
                 self.xiaomi_mimo_token_plan_api_key.take(),
@@ -894,8 +1190,19 @@ impl Drop for EnvGuard {
             Self::restore_var("KIMI_MODEL_NAME", self.kimi_model_name.take());
             Self::restore_var("ZAI_API_KEY", self.zai_api_key.take());
             Self::restore_var("Z_AI_API_KEY", self.z_ai_api_key.take());
+            Self::restore_var("ZHIPU_API_KEY", self.zhipu_api_key.take());
+            Self::restore_var("GLM_API_KEY", self.glm_api_key.take());
             Self::restore_var("ZAI_BASE_URL", self.zai_base_url.take());
+            Self::restore_var("Z_AI_BASE_URL", self.z_ai_base_url.take());
+            Self::restore_var("ZHIPU_BASE_URL", self.zhipu_base_url.take());
+            Self::restore_var("ZHIPUAI_BASE_URL", self.zhipuai_base_url.take());
+            Self::restore_var("BIGMODEL_BASE_URL", self.bigmodel_base_url.take());
             Self::restore_var("ZAI_MODEL", self.zai_model.take());
+            Self::restore_var("Z_AI_MODEL", self.z_ai_model.take());
+            Self::restore_var("ZHIPU_MODEL", self.zhipu_model.take());
+            Self::restore_var("ZHIPUAI_MODEL", self.zhipuai_model.take());
+            Self::restore_var("BIGMODEL_MODEL", self.bigmodel_model.take());
+            Self::restore_var("GLM_MODEL", self.glm_model.take());
             Self::restore_var("STEPFUN_API_KEY", self.stepfun_api_key.take());
             Self::restore_var("STEP_API_KEY", self.step_api_key.take());
             Self::restore_var("STEPFUN_BASE_URL", self.stepfun_base_url.take());
@@ -903,6 +1210,10 @@ impl Drop for EnvGuard {
             Self::restore_var("MINIMAX_API_KEY", self.minimax_api_key.take());
             Self::restore_var("MINIMAX_BASE_URL", self.minimax_base_url.take());
             Self::restore_var("MINIMAX_MODEL", self.minimax_model.take());
+            Self::restore_var("SAKANA_API_KEY", self.sakana_api_key.take());
+            Self::restore_var("FUGU_API_KEY", self.fugu_api_key.take());
+            Self::restore_var("SAKANA_BASE_URL", self.sakana_base_url.take());
+            Self::restore_var("SAKANA_MODEL", self.sakana_model.take());
             Self::restore_var("SGLANG_API_KEY", self.sglang_api_key.take());
             Self::restore_var("SGLANG_BASE_URL", self.sglang_base_url.take());
             Self::restore_var("VLLM_API_KEY", self.vllm_api_key.take());
@@ -1631,6 +1942,7 @@ fn provider_key_value_api_covers_all_provider_metadata_entries() -> Result<()> {
         let api_key_path = format!("providers.{table}.api_key");
         let base_url_path = format!("providers.{table}.base_url");
         let model_path = format!("providers.{table}.model");
+        let context_window_path = format!("providers.{table}.context_window");
         let headers_path = format!("providers.{table}.http_headers");
         let mode_path = format!("providers.{table}.mode");
         let auth_mode_path = format!("providers.{table}.auth_mode");
@@ -1640,6 +1952,7 @@ fn provider_key_value_api_covers_all_provider_metadata_entries() -> Result<()> {
         config.set_value(&api_key_path, &api_key)?;
         config.set_value(&base_url_path, "https://gateway.example/v1")?;
         config.set_value(&model_path, "provider-test-model")?;
+        config.set_value(&context_window_path, "1000000")?;
         config.set_value(&headers_path, "X-Test=ok")?;
         config.set_value(&mode_path, "concise")?;
         config.set_value(&auth_mode_path, "api_key")?;
@@ -1657,6 +1970,10 @@ fn provider_key_value_api_covers_all_provider_metadata_entries() -> Result<()> {
         assert_eq!(
             config.get_value(&model_path).as_deref(),
             Some("provider-test-model")
+        );
+        assert_eq!(
+            config.get_value(&context_window_path).as_deref(),
+            Some("1000000")
         );
         assert_eq!(
             config.get_value(&headers_path).as_deref(),
@@ -1683,11 +2000,16 @@ fn provider_key_value_api_covers_all_provider_metadata_entries() -> Result<()> {
             listed.get(&headers_path).map(String::as_str),
             Some("X-Test=ok")
         );
+        assert_eq!(
+            listed.get(&context_window_path).map(String::as_str),
+            Some("1000000")
+        );
         assert_eq!(listed.get(&insecure_path).map(String::as_str), Some("true"));
 
         config.unset_value(&api_key_path)?;
         config.unset_value(&base_url_path)?;
         config.unset_value(&model_path)?;
+        config.unset_value(&context_window_path)?;
         config.unset_value(&headers_path)?;
         config.unset_value(&mode_path)?;
         config.unset_value(&auth_mode_path)?;
@@ -1697,6 +2019,7 @@ fn provider_key_value_api_covers_all_provider_metadata_entries() -> Result<()> {
         assert_eq!(config.get_value(&api_key_path), None);
         assert_eq!(config.get_value(&base_url_path), None);
         assert_eq!(config.get_value(&model_path), None);
+        assert_eq!(config.get_value(&context_window_path), None);
         assert_eq!(config.get_value(&headers_path), None);
         assert_eq!(config.get_value(&mode_path), None);
         assert_eq!(config.get_value(&auth_mode_path), None);
@@ -1712,6 +2035,16 @@ fn provider_key_value_api_covers_all_provider_metadata_entries() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+fn provider_context_window_rejects_zero() {
+    let mut config = ConfigToml::default();
+    let err = config
+        .set_value("providers.openai.context_window", "0")
+        .expect_err("zero context window should be rejected");
+
+    assert!(err.to_string().contains("greater than 0"));
 }
 
 #[test]
@@ -1797,6 +2130,37 @@ fn project_merge_forwards_all_provider_model_overrides() {
             "provider {key} should merge repo-local model override"
         );
     }
+}
+
+#[test]
+fn project_merge_does_not_replace_user_hotbar_bindings() {
+    let mut base = ConfigToml {
+        hotbar: Some(vec![HotbarBindingToml {
+            slot: 1,
+            action: "mode.plan".to_string(),
+            label: Some("Plan".to_string()),
+        }]),
+        ..ConfigToml::default()
+    };
+    let project = ConfigToml {
+        hotbar: Some(vec![HotbarBindingToml {
+            slot: 1,
+            action: "mode.yolo".to_string(),
+            label: Some("Yolo".to_string()),
+        }]),
+        ..ConfigToml::default()
+    };
+
+    base.merge_project_overrides(project);
+
+    assert_eq!(
+        base.hotbar,
+        Some(vec![HotbarBindingToml {
+            slot: 1,
+            action: "mode.plan".to_string(),
+            label: Some("Plan".to_string()),
+        }])
+    );
 }
 
 #[test]
@@ -2103,8 +2467,14 @@ fn ensure_state_dir_relocates_legacy_subdir_on_first_write() {
     .expect("legacy file");
     assert!(!state_env.primary("slop_ledger").exists());
 
-    let dir = ensure_state_dir("slop_ledger").expect("ensure_state_dir");
+    let (dir, migration) =
+        ensure_state_dir_with_migration("slop_ledger").expect("ensure_state_dir");
     assert_eq!(dir, state_env.primary("slop_ledger"));
+    let migration = migration.expect("legacy migration should be reported");
+    assert_eq!(migration.kind, StateMigrationKind::Relocated);
+    assert_eq!(migration.subdir, "slop_ledger");
+    assert_eq!(migration.legacy_path, state_env.legacy("slop_ledger"));
+    assert_eq!(migration.primary_path, state_env.primary("slop_ledger"));
     // Legacy contents relocated into primary.
     assert_eq!(
         fs::read_to_string(state_env.primary("slop_ledger").join("slop_ledger.json"))
@@ -2117,8 +2487,44 @@ fn ensure_state_dir_relocates_legacy_subdir_on_first_write() {
         "legacy subdir should be removed after relocation"
     );
     // Idempotent: a second call is a no-op now that primary exists.
-    ensure_state_dir("slop_ledger").expect("idempotent ensure");
+    let (_, repeated_migration) =
+        ensure_state_dir_with_migration("slop_ledger").expect("idempotent ensure");
+    assert!(repeated_migration.is_none());
     let _ = fs::remove_dir_all(&state_env.home);
+}
+
+#[test]
+fn state_migration_notice_explains_preserved_data_and_canonical_root() {
+    let migration = StateMigration {
+        subdir: "sessions".to_string(),
+        legacy_path: PathBuf::from("/home/alice/.deepseek/sessions"),
+        primary_path: PathBuf::from("/home/alice/.codewhale/sessions"),
+        kind: StateMigrationKind::Relocated,
+    };
+
+    let notice = migration.user_notice();
+
+    assert!(notice.contains("CodeWhale migrated legacy state"));
+    assert!(notice.contains("/home/alice/.deepseek/sessions"));
+    assert!(notice.contains("/home/alice/.codewhale/sessions"));
+    assert!(notice.contains("Your data was preserved"));
+    assert!(notice.contains("Use .codewhale as the canonical state location"));
+    assert!(notice.contains("remove the legacy .deepseek tree"));
+}
+
+#[test]
+fn copied_state_migration_notice_says_legacy_copy_remains() {
+    let migration = StateMigration {
+        subdir: "catalog".to_string(),
+        legacy_path: PathBuf::from("/home/alice/.deepseek/catalog"),
+        primary_path: PathBuf::from("/home/alice/.codewhale/catalog"),
+        kind: StateMigrationKind::Copied,
+    };
+
+    let notice = migration.user_notice();
+
+    assert!(notice.contains("copied"));
+    assert!(notice.contains("legacy .deepseek copy was left in place"));
 }
 
 #[test]
@@ -2135,8 +2541,12 @@ fn ensure_state_dir_writes_to_primary_when_both_exist() {
     fs::create_dir_all(state_env.legacy("sessions")).expect("legacy dir");
     fs::write(state_env.legacy("sessions").join("old.json"), b"legacy").expect("legacy file");
 
-    let dir = ensure_state_dir("sessions").expect("ensure_state_dir");
+    let (dir, migration) = ensure_state_dir_with_migration("sessions").expect("ensure_state_dir");
     assert_eq!(dir, state_env.primary("sessions"));
+    assert!(
+        migration.is_none(),
+        "existing primary must not emit a migration event"
+    );
     // Primary untouched; legacy orphan left as-is (not migrated, not deleted).
     assert_eq!(
         fs::read_to_string(state_env.primary("sessions").join("a.json")).expect("primary"),
@@ -2747,6 +3157,14 @@ fn provider_kind_parses_openrouter_and_novita_aliases() {
         assert_eq!(parsed.provider, ProviderKind::Deepinfra);
     }
 
+    for alias in ["sakana", "sakana-ai", "sakana_ai", "fugu"] {
+        assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Sakana));
+
+        let parsed: ConfigToml =
+            toml::from_str(&format!("provider = \"{alias}\"")).expect("sakana alias");
+        assert_eq!(parsed.provider, ProviderKind::Sakana);
+    }
+
     for alias in ["qianfan", "baidu-qianfan", "baidu_qianfan", "baidu"] {
         assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Qianfan));
 
@@ -2788,6 +3206,104 @@ fn provider_kind_accepts_legacy_deepseek_cn_aliases() {
         let parsed: ConfigToml =
             toml::from_str(&format!("provider = \"{alias}\"")).expect("legacy provider alias");
         assert_eq!(parsed.provider, ProviderKind::Deepseek);
+    }
+}
+
+#[test]
+fn deepseek_anthropic_route_defaults_to_anthropic_endpoint() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    for alias in [
+        "deepseek-anthropic",
+        "deepseek_anthropic",
+        "deepseek-claude",
+        "deepseek_claude",
+    ] {
+        assert_eq!(
+            ProviderKind::parse(alias),
+            Some(ProviderKind::DeepseekAnthropic)
+        );
+
+        let parsed: ConfigToml =
+            toml::from_str(&format!("provider = \"{alias}\"")).expect("deepseek anthropic alias");
+        assert_eq!(parsed.provider, ProviderKind::DeepseekAnthropic);
+    }
+
+    let provider = provider::resolve_provider("deepseek-anthropic")
+        .expect("deepseek anthropic metadata resolves");
+    assert_eq!(provider.kind(), ProviderKind::DeepseekAnthropic);
+    assert_eq!(provider.provider_config_key(), "deepseek_anthropic");
+    assert_eq!(provider.default_model(), DEFAULT_DEEPSEEK_ANTHROPIC_MODEL);
+    assert_eq!(
+        provider.default_base_url(),
+        DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL
+    );
+    assert_eq!(provider.env_vars(), &["DEEPSEEK_API_KEY"]);
+    assert_eq!(provider.wire(), provider::WireFormat::AnthropicMessages);
+
+    let config = ConfigToml {
+        provider: ProviderKind::DeepseekAnthropic,
+        ..ConfigToml::default()
+    };
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+    assert_eq!(resolved.provider, ProviderKind::DeepseekAnthropic);
+    assert_eq!(resolved.base_url, DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL);
+    assert_eq!(resolved.model, DEFAULT_DEEPSEEK_ANTHROPIC_MODEL);
+
+    unsafe {
+        std::env::set_var(
+            "DEEPSEEK_ANTHROPIC_BASE_URL",
+            "https://gateway.example.test/anthropic",
+        );
+    }
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.base_url, "https://gateway.example.test/anthropic");
+    unsafe {
+        std::env::remove_var("DEEPSEEK_ANTHROPIC_BASE_URL");
+    }
+}
+
+#[test]
+fn openmodel_route_defaults_to_messages_endpoint() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    for alias in ["openmodel", "open-model", "open_model"] {
+        assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Openmodel));
+
+        let parsed: ConfigToml =
+            toml::from_str(&format!("provider = \"{alias}\"")).expect("openmodel alias");
+        assert_eq!(parsed.provider, ProviderKind::Openmodel);
+    }
+
+    let provider = provider::resolve_provider("openmodel").expect("openmodel metadata resolves");
+    assert_eq!(provider.kind(), ProviderKind::Openmodel);
+    assert_eq!(provider.provider_config_key(), "openmodel");
+    assert_eq!(provider.default_model(), DEFAULT_OPENMODEL_MODEL);
+    assert_eq!(provider.default_base_url(), DEFAULT_OPENMODEL_BASE_URL);
+    assert_eq!(provider.env_vars(), &["OPENMODEL_API_KEY"]);
+    assert_eq!(provider.wire(), provider::WireFormat::AnthropicMessages);
+
+    let config = ConfigToml {
+        provider: ProviderKind::Openmodel,
+        ..ConfigToml::default()
+    };
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+    assert_eq!(resolved.provider, ProviderKind::Openmodel);
+    assert_eq!(resolved.base_url, DEFAULT_OPENMODEL_BASE_URL);
+    assert_eq!(resolved.model, DEFAULT_OPENMODEL_MODEL);
+
+    unsafe {
+        std::env::set_var("OPENMODEL_BASE_URL", "https://gateway.example.test");
+        std::env::set_var("OPENMODEL_MODEL", "claude-sonnet-4-20250514");
+    }
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.base_url, "https://gateway.example.test");
+    assert_eq!(resolved.model, "claude-sonnet-4-20250514");
+    unsafe {
+        std::env::remove_var("OPENMODEL_BASE_URL");
+        std::env::remove_var("OPENMODEL_MODEL");
     }
 }
 
@@ -2872,13 +3388,21 @@ fn provider_metadata_defaults_match_runtime_helpers() {
             default_base_url_for_provider(kind)
         );
         assert!(!provider.display_name().trim().is_empty());
-        assert!(!provider.env_vars().is_empty());
+        // The dynamic custom provider (#1519) intentionally declares no
+        // built-in auth env var: the key env var name is supplied per entry via
+        // `[providers.<name>] api_key_env = "..."`. Every built-in provider
+        // still must declare at least one.
+        if kind != ProviderKind::Custom {
+            assert!(!provider.env_vars().is_empty());
+        }
         // OpenAI Codex (ChatGPT) speaks the Responses API and Anthropic
         // speaks the native Messages API; every other built-in provider
         // is OpenAI-compatible Chat Completions.
         let expected_wire = match kind {
             ProviderKind::OpenaiCodex => provider::WireFormat::Responses,
-            ProviderKind::Anthropic => provider::WireFormat::AnthropicMessages,
+            ProviderKind::Anthropic | ProviderKind::DeepseekAnthropic | ProviderKind::Openmodel => {
+                provider::WireFormat::AnthropicMessages
+            }
             _ => provider::WireFormat::ChatCompletions,
         };
         assert_eq!(provider.wire(), expected_wire);
@@ -3060,6 +3584,42 @@ fn zai_aliases_resolve_to_canonical_models() {
 }
 
 #[test]
+fn zhipu_aliases_fold_into_zai_provider() {
+    // Zhipu AI and Z.ai are the same vendor; `zhipu`/`zhipuai`/`bigmodel`
+    // resolve to the single Zai provider rather than a separate one.
+    assert_eq!(ProviderKind::parse("zhipu"), Some(ProviderKind::Zai));
+    assert_eq!(ProviderKind::parse("zhipuai"), Some(ProviderKind::Zai));
+    assert_eq!(ProviderKind::parse("bigmodel"), Some(ProviderKind::Zai));
+    assert_eq!(ProviderKind::parse("big-model"), Some(ProviderKind::Zai));
+
+    // A `[providers.zhipu]` table (BigModel China endpoint) merges into the Zai
+    // provider config through the serde alias.
+    let parsed: ConfigToml = toml::from_str(
+        r#"
+        [providers.zhipu]
+        api_key = "$ZHIPU_API_KEY"
+        base_url = "https://open.bigmodel.cn/api/paas/v4/"
+        model = "glm-5-2"
+        "#,
+    )
+    .expect("zhipu provider table parses");
+
+    let provider = parsed.providers.for_provider(ProviderKind::Zai);
+    assert_eq!(provider.api_key.as_deref(), Some("$ZHIPU_API_KEY"));
+    assert_eq!(
+        provider.base_url.as_deref(),
+        Some("https://open.bigmodel.cn/api/paas/v4/")
+    );
+    assert_eq!(provider.model.as_deref(), Some("glm-5-2"));
+
+    // GLM aliases canonicalize under the Zai umbrella.
+    assert_eq!(
+        normalize_model_for_provider(ProviderKind::Zai, "glm-5-2"),
+        DEFAULT_ZAI_MODEL
+    );
+}
+
+#[test]
 fn novita_provider_defaults_to_canonical_endpoint_and_model() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
@@ -3165,7 +3725,7 @@ fn moonshot_provider_defaults_to_kimi_k27_code() {
 }
 
 #[test]
-fn zai_stepfun_and_minimax_default_to_first_party_routes() {
+fn zai_stepfun_minimax_and_sakana_default_to_first_party_routes() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
 
@@ -3180,6 +3740,11 @@ fn zai_stepfun_and_minimax_default_to_first_party_routes() {
             ProviderKind::Minimax,
             DEFAULT_MINIMAX_BASE_URL,
             DEFAULT_MINIMAX_MODEL,
+        ),
+        (
+            ProviderKind::Sakana,
+            DEFAULT_SAKANA_BASE_URL,
+            DEFAULT_SAKANA_MODEL,
         ),
     ] {
         let config = ConfigToml {
@@ -3260,6 +3825,23 @@ fn minimax_env_model_override_canonicalizes_known_aliases() {
 
     assert_eq!(resolved.provider, ProviderKind::Minimax);
     assert_eq!(resolved.model, "MiniMax-M2.5-highspeed");
+}
+
+#[test]
+fn sakana_env_overrides_resolve_fugu_route() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    unsafe {
+        env::set_var("CODEWHALE_PROVIDER", "sakana");
+        env::set_var("SAKANA_BASE_URL", "https://sakana.example/v1");
+        env::set_var("SAKANA_MODEL", "fugu-ultra-20260615");
+    }
+
+    let resolved = ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
+
+    assert_eq!(resolved.provider, ProviderKind::Sakana);
+    assert_eq!(resolved.base_url, "https://sakana.example/v1");
+    assert_eq!(resolved.model, "fugu-ultra-20260615");
 }
 
 #[test]
@@ -4084,7 +4666,7 @@ fn openrouter_provider_normalizes_recent_large_model_aliases() {
         ("kimi", OPENROUTER_KIMI_K2_7_CODE_MODEL),
         ("kimi-k2.6", OPENROUTER_KIMI_K2_6_MODEL),
         ("minimax-m3", OPENROUTER_MINIMAX_M3_MODEL),
-        ("minimax-2.7", OPENROUTER_MINIMAX_2_7_MODEL),
+        ("minimax-2.7", OPENROUTER_MINIMAX_M2_7_MODEL),
         ("gemma-4-31b-it", OPENROUTER_GEMMA_4_31B_MODEL),
         ("glm-5.1", OPENROUTER_GLM_5_1_MODEL),
         ("glm-5.2", OPENROUTER_GLM_5_2_MODEL),
@@ -4579,6 +5161,7 @@ fn fleet_profile_explicit_config_parses_role_loadout_permissions() {
 [fleet.profiles.verifier]
 slot = "verifier"
 loadout = "review"
+model = "deepseek-v4-pro"
 
 [fleet.profiles.verifier.role]
 name = "verifier"
@@ -4616,11 +5199,20 @@ concurrency = 3
         Some("Check the patch and report evidence.")
     );
     assert_eq!(profile.loadout, FleetLoadout::Review);
+    assert_eq!(profile.model.as_deref(), Some("deepseek-v4-pro"));
     assert!(!profile.permissions.allow_shell);
     assert!(!profile.permissions.trust);
     assert!(profile.permissions.approval_required);
     assert_eq!(profile.delegation.max_spawn_depth, Some(0));
     assert_eq!(profile.delegation.max_concurrency, Some(3));
+}
+
+#[test]
+fn fleet_loadout_accepts_default_model_classes() {
+    assert_eq!(FleetLoadout::from_name("strong"), FleetLoadout::Strong);
+    assert_eq!(FleetLoadout::from_name("balanced"), FleetLoadout::Balanced);
+    assert_eq!(FleetLoadout::from_name("fast"), FleetLoadout::Fast);
+    assert_eq!(FleetLoadout::Strong.as_str(), "strong");
 }
 
 #[test]

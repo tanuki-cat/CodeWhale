@@ -574,7 +574,7 @@ pub(crate) fn active_tool_status_label(app: &App) -> Option<String> {
     if active_foreground_shell_running(app) {
         parts.push("Ctrl+B shell".to_string());
     }
-    parts.push(key_shortcuts::tool_details_shortcut_hint_label().to_string());
+    parts.push(key_shortcuts::tool_details_shortcut_action_hint("details"));
     Some(parts.join(" \u{00B7} "))
 }
 
@@ -1202,6 +1202,7 @@ pub(crate) fn footer_mode_style(app: &App) -> (&'static str, ratatui::style::Col
     let label = app.mode.as_setting();
     let color = match app.mode {
         crate::tui::app::AppMode::Agent => app.ui_theme.mode_agent,
+        crate::tui::app::AppMode::Auto => app.ui_theme.mode_agent,
         crate::tui::app::AppMode::Yolo => app.ui_theme.mode_yolo,
         crate::tui::app::AppMode::Plan => app.ui_theme.mode_plan,
     };

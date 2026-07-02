@@ -57,3 +57,31 @@ a familiar declaration format, not a second execution runtime.
 - `cargo test -p codewhale-whaleflow --locked starlark`
 
 Current example: `workflows/issue_audit.workflow.js`.
+
+## Agent-Written Fleet Workflows
+
+The primary product flow is not "ask the user to write a script." The main
+agent should decide when a task deserves workflow orchestration, draft the
+WhaleFlow source, show the plan for the current permission mode, and then let
+the runtime compile and monitor it.
+
+WhaleFlow owns the plan: phases, branches, loops, reducers, and intermediate
+results. Fleet owns the durable sub-agent configuration: slots, profiles,
+models, tool posture, launch concurrency, leases, heartbeats, logs, receipts,
+and resume/stop/restart controls. In other words, a workflow can choose and
+monitor Fleet slots, but it must not become a second executor with its own shell
+or filesystem authority.
+
+Fleet launch validation applies a conservative default shape before any
+WhaleFlow IR is lowered to workers:
+
+- up to 100 total worker agents per workflow run;
+- up to 5 recursive Fleet rings;
+- loops require `max_iterations`;
+- dynamic `expand` nodes require `max_children` and a template.
+
+Those limits bound the workflow population, not instantaneous launch
+concurrency. A valid 100-agent workflow can still drain through a smaller Fleet
+worker pool. Model selection stays per slot: a DeepSeek preset can suggest
+`deepseek-v4-pro` for the orchestrator and `deepseek-v4-flash` for nearby
+workers, but users and agents may override any slot when the task calls for it.

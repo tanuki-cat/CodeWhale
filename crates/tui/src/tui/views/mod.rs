@@ -1,7 +1,15 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::{buffer::Buffer, layout::Rect};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Clear, Paragraph, Widget},
+};
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::fmt;
+use unicode_width::UnicodeWidthStr;
 
 use crate::config::{ApiProvider, Config};
 use crate::features::{FEATURES, Stage};
@@ -15,6 +23,7 @@ use crate::tui::approval::{ElevationOption, ReviewDecision};
 use crate::tui::history::{HistoryCell, SubAgentCell, summarize_tool_output};
 use crate::tui::widgets::agent_card::AgentLifecycle;
 
+pub mod fleet_setup;
 pub mod mode_picker;
 pub mod status_picker;
 
@@ -34,11 +43,264 @@ pub enum ModalKind {
     ModelPicker,
     ProviderPicker,
     ModePicker,
+    FleetSetup,
+    HotbarSetup,
     FilePicker,
     StatusPicker,
     FeedbackPicker,
     ThemePicker,
     ContextMenu,
+}
+
+/// Clear and paint a modal popup with an opaque surface.
+///
+/// Older modals often called `Clear` only, which left reset-background blank
+/// cells that could read as translucent on terminals with a non-default app
+/// background. This helper makes the popup area explicit and keeps the small
+/// shadow from inheriting stale transcript glyphs.
+pub(crate) fn render_modal_surface(area: Rect, popup_area: Rect, buf: &mut Buffer) {
+    let shadow_x = popup_area.x.saturating_add(1);
+    let shadow_y = popup_area.y.saturating_add(1);
+    let shadow_right = area.x.saturating_add(area.width);
+    let shadow_bottom = area.y.saturating_add(area.height);
+    let shadow_width = popup_area.width.min(shadow_right.saturating_sub(shadow_x));
+    let shadow_height = popup_area
+        .height
+        .min(shadow_bottom.saturating_sub(shadow_y));
+
+    if shadow_width > 0 && shadow_height > 0 {
+        Block::default()
+            .style(Style::default().bg(palette::SURFACE_ELEVATED))
+            .render(
+                Rect {
+                    x: shadow_x,
+                    y: shadow_y,
+                    width: shadow_width,
+                    height: shadow_height,
+                },
+                buf,
+            );
+    }
+
+    Clear.render(popup_area, buf);
+    Block::default()
+        .style(Style::default().bg(palette::DEEPSEEK_INK))
+        .render(popup_area, buf);
+}
+
+fn render_modal_backdrop(area: Rect, buf: &mut Buffer) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            buf[(x, y)]
+                .set_symbol(" ")
+                .set_style(Style::default().bg(palette::DEEPSEEK_INK));
+        }
+    }
+}
+
+/// Compute a centered, responsive popup rect for a modal.
+///
+/// The size starts from `preferred_*`, but is clamped so it never exceeds the
+/// frame (leaving a small breathing-room margin when there is space) and never
+/// drops below `min_*` unless the frame itself is smaller. Centering the result
+/// inside `area` replaces the repeated, error-prone
+/// `N.min(area.width.saturating_sub(..))` arithmetic scattered across modals so
+/// every overlay sizes itself the same way at 80x24, 100x30, 120x32, 160x40,
+/// and beyond. See #3732.
+pub(crate) fn centered_modal_area(
+    area: Rect,
+    preferred_width: u16,
+    preferred_height: u16,
+    min_width: u16,
+    min_height: u16,
+) -> Rect {
+    // Keep a 2-cell margin on each axis when the frame can spare it so the
+    // backdrop stays visible around the card; otherwise fill the frame.
+    let avail_width = area.width.saturating_sub(2).max(1);
+    let avail_height = area.height.saturating_sub(2).max(1);
+    let width = preferred_width.clamp(min_width.min(avail_width), avail_width);
+    let height = preferred_height.clamp(min_height.min(avail_height), avail_height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+/// A single key/label hint shown in a modal's action footer.
+///
+/// Footers built from `ActionHint`s are laid out by [`action_footer_lines`],
+/// which wraps to additional rows instead of letting an action run off the
+/// right edge of the modal — the core overflow bug behind #3732. Use this for
+/// action/navigation hints; truncate only identifiers/paths/hashes elsewhere.
+pub(crate) struct ActionHint {
+    key: Cow<'static, str>,
+    label: Cow<'static, str>,
+}
+
+impl ActionHint {
+    pub(crate) fn new(
+        key: impl Into<Cow<'static, str>>,
+        label: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            label: label.into(),
+        }
+    }
+
+    /// Display columns this hint occupies: ` key ` (key padded by a space on
+    /// each side) followed by the label.
+    fn width(&self) -> usize {
+        UnicodeWidthStr::width(self.key.as_ref()) + 2 + UnicodeWidthStr::width(self.label.as_ref())
+    }
+
+    fn spans(&self) -> [Span<'static>; 2] {
+        [
+            Span::styled(
+                format!(" {} ", self.key),
+                Style::default()
+                    .fg(palette::DEEPSEEK_SKY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                self.label.clone().into_owned(),
+                Style::default().fg(palette::TEXT_MUTED),
+            ),
+        ]
+    }
+}
+
+/// Lay out action hints into one or more lines that each fit within `width`.
+///
+/// Hints are packed greedily; when the next hint would overflow the current row
+/// the layout starts a new row rather than truncating. No action is ever
+/// dropped or clipped (a single hint wider than `width` is emitted alone, which
+/// only happens at degenerate widths below the modal minimums). This is the
+/// shared replacement for the single-line `title_bottom` footers that silently
+/// pushed actions off-screen.
+pub(crate) fn action_footer_lines(hints: &[ActionHint], width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width);
+    if hints.is_empty() || width == 0 {
+        return Vec::new();
+    }
+    const GAP: usize = 1;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+    for hint in hints {
+        let hint_width = hint.width();
+        let needed = if current.is_empty() {
+            hint_width
+        } else {
+            current_width + GAP + hint_width
+        };
+        if !current.is_empty() && needed > width {
+            lines.push(Line::from(std::mem::take(&mut current)));
+            current_width = 0;
+        }
+        if !current.is_empty() {
+            current.push(Span::raw(" ".repeat(GAP)));
+            current_width += GAP;
+        }
+        current.extend(hint.spans());
+        current_width += hint_width;
+    }
+    if !current.is_empty() {
+        lines.push(Line::from(current));
+    }
+    lines
+}
+
+/// Reserve `lines` worth of rows at the bottom of `inner`, paint them, and
+/// return the content area that remains above. Shared by the action-hint and
+/// free-text modal footers.
+fn place_footer_lines(inner: Rect, buf: &mut Buffer, lines: Vec<Line<'static>>) -> Rect {
+    if lines.is_empty() || inner.height == 0 {
+        return inner;
+    }
+    let footer_height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .min(inner.height);
+    let footer_area = Rect {
+        x: inner.x,
+        y: inner.y + inner.height - footer_height,
+        width: inner.width,
+        height: footer_height,
+    };
+    Paragraph::new(lines).render(footer_area, buf);
+    Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height - footer_height,
+    }
+}
+
+/// Render a wrapping action footer anchored to the bottom of `inner` and
+/// return the content area that remains above it.
+///
+/// Modals call this after painting their block so the footer reserves exactly
+/// as many rows as it needs (bounded by the available height) and the body
+/// fills the rest. Centralizing it keeps every modal's action row visible and
+/// reachable at narrow widths.
+pub(crate) fn render_modal_footer(inner: Rect, buf: &mut Buffer, hints: &[ActionHint]) -> Rect {
+    let lines = action_footer_lines(hints, inner.width);
+    place_footer_lines(inner, buf, lines)
+}
+
+/// Word-wrap a free-form footer string into styled lines that each fit `width`.
+///
+/// For footers that are pre-composed prose/sentences (e.g. localized config
+/// hints) rather than discrete key/label hints. Wrapping on whitespace keeps
+/// every word visible instead of clipping the tail at the modal edge.
+pub(crate) fn wrapped_footer_lines(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
+    let width = usize::from(width);
+    if text.trim().is_empty() || width == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for word in text.split_whitespace() {
+        let word_width = UnicodeWidthStr::width(word);
+        let needed = if current.is_empty() {
+            word_width
+        } else {
+            current_width + 1 + word_width
+        };
+        if !current.is_empty() && needed > width {
+            lines.push(Line::from(Span::styled(
+                std::mem::take(&mut current),
+                style,
+            )));
+            current_width = 0;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+            current_width += 1;
+        }
+        current.push_str(word);
+        current_width += word_width;
+    }
+    if !current.is_empty() {
+        lines.push(Line::from(Span::styled(current, style)));
+    }
+    lines
+}
+
+/// Render a wrapping free-text footer anchored to the bottom of `inner` and
+/// return the content area above it. The prose counterpart to
+/// [`render_modal_footer`].
+pub(crate) fn render_modal_text_footer(
+    inner: Rect,
+    buf: &mut Buffer,
+    text: &str,
+    style: Style,
+) -> Rect {
+    let lines = wrapped_footer_lines(text, inner.width, style);
+    place_footer_lines(inner, buf, lines)
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +436,11 @@ pub enum ViewEvent {
     ProviderPickerKimiOAuthEnabled {
         provider: crate::config::ApiProvider,
     },
+    /// Emitted by the `/provider` picker (the `M` action) to jump straight to
+    /// the `/model` picker pre-filtered to the highlighted provider (#3083).
+    ProviderPickerOpenModels {
+        provider: crate::config::ApiProvider,
+    },
     /// Emitted by the `/mode` picker when the user chooses a mode.
     ModeSelected {
         mode: crate::tui::app::AppMode,
@@ -186,6 +453,15 @@ pub enum ViewEvent {
         items: Vec<crate::config::StatusItem>,
         final_save: bool,
     },
+    /// Emitted by the `/hotbar` setup wizard when the user saves the draft
+    /// bindings. The host updates live config state; disk persistence is
+    /// handled by the follow-up persistence slice.
+    HotbarSetupSaved {
+        bindings: Vec<codewhale_config::HotbarBindingToml>,
+    },
+    /// Emitted by the `/hotbar` setup wizard when the user chooses "Disable
+    /// Hotbar". The host persists `hotbar = []` and hides the panel.
+    HotbarDisableRequested,
     /// Emitted by the live-transcript overlay while in backtrack preview
     /// mode (#133) when the user steps the highlighted user message with
     /// Left or Right. The handler advances `app.backtrack`, refreshes the
@@ -239,6 +515,17 @@ pub trait ModalView: std::any::Any {
         ViewAction::None
     }
     fn render(&self, area: Rect, buf: &mut Buffer);
+    /// The region this modal actually paints within the full frame `area`.
+    ///
+    /// Defaults to the whole frame, which is the legacy full-screen overlay
+    /// behaviour every picker/menu still relies on. Inline modals (the
+    /// approval prompt) override this to return a bottom-anchored band so the
+    /// backdrop only dims their strip and the transcript above stays visible.
+    /// The returned rect MUST match the region the modal renders into, or the
+    /// dim and the painted content will disagree.
+    fn occupied_region(&self, area: Rect) -> Rect {
+        area
+    }
     fn update_subagents(&mut self, _agents: &[SubAgentResult]) -> bool {
         false
     }
@@ -294,7 +581,14 @@ impl ViewStack {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        // Dim each view's own occupied region rather than the whole frame, so
+        // an inline modal (the approval prompt) leaves the transcript above it
+        // visible instead of blacking out the screen. Full-screen modals keep
+        // the default `occupied_region` of the entire frame, so their backdrop
+        // is unchanged.
         for view in &self.views {
+            let region = view.occupied_region(area);
+            render_modal_backdrop(region, buf);
             view.render(area, buf);
         }
     }
@@ -379,7 +673,7 @@ enum ConfigScope {
 }
 
 impl ConfigScope {
-    fn label(self, locale: Locale) -> &'static str {
+    fn label(self, locale: Locale) -> Cow<'static, str> {
         tr(
             locale,
             match self {
@@ -419,7 +713,7 @@ enum ConfigSection {
 }
 
 impl ConfigSection {
-    fn label(self, locale: Locale) -> &'static str {
+    fn label(self, locale: Locale) -> Cow<'static, str> {
         tr(
             locale,
             match self {
@@ -508,7 +802,7 @@ impl ConfigView {
                 value: settings
                     .default_model
                     .as_deref()
-                    .unwrap_or(tr(app.ui_locale, MessageId::ConfigDefaultValue))
+                    .unwrap_or(&*tr(app.ui_locale, MessageId::ConfigDefaultValue))
                     .to_string(),
                 editable: true,
                 scope: ConfigScope::Saved,
@@ -806,7 +1100,7 @@ impl ConfigView {
         }
     }
 
-    fn tr(&self, id: MessageId) -> &'static str {
+    fn tr(&self, id: MessageId) -> Cow<'static, str> {
         tr(self.locale, id)
     }
 
@@ -823,18 +1117,22 @@ impl ConfigView {
 
         let section = row.section.label(self.locale).to_lowercase();
         let section_en = row.section.label(Locale::En).to_lowercase();
+        let label = config_label_for_key(&row.key).to_lowercase();
         let key = row.key.to_lowercase();
         let value = self.row_display_value(row).to_lowercase();
         let scope = row.scope.label(self.locale).to_lowercase();
         let scope_en = row.scope.label(Locale::En).to_lowercase();
+        let hint = config_hint_for_key(&row.key).to_lowercase();
 
         filter.split_whitespace().all(|term| {
             section.contains(term)
                 || section_en.contains(term)
+                || label.contains(term)
                 || key.contains(term)
                 || value.contains(term)
                 || scope.contains(term)
                 || scope_en.contains(term)
+                || hint.contains(term)
         })
     }
 
@@ -868,7 +1166,7 @@ impl ConfigView {
     fn key_column_width(&self) -> usize {
         self.rows
             .iter()
-            .map(|row| row.key.chars().count())
+            .map(|row| config_label_for_key(&row.key).chars().count())
             .max()
             .unwrap_or(CONFIG_MIN_KEY_COLUMN_WIDTH)
             .max(CONFIG_MIN_KEY_COLUMN_WIDTH)
@@ -1147,6 +1445,21 @@ impl ConfigView {
 
         row.value.clone()
     }
+
+    fn selected_row_hint(&self) -> Option<String> {
+        let row_idx = self.selected_row_index()?;
+        let row = self.rows.get(row_idx)?;
+        let label = config_label_for_key(&row.key);
+        let hint = config_hint_for_key(&row.key);
+        if !hint.is_empty() {
+            return Some(format!("{label}: {hint}"));
+        }
+        if row.editable {
+            Some(format!("{label}: Enter to edit ({})", row.key))
+        } else {
+            Some(format!("{label}: read-only status ({})", row.key))
+        }
+    }
 }
 
 fn config_base_url_row_key(provider: ApiProvider) -> &'static str {
@@ -1232,6 +1545,78 @@ fn experimental_feature_value(effective: bool, default_enabled: bool, configured
     }
 }
 
+fn config_label_for_key(key: &str) -> String {
+    let static_label = match key {
+        "provider" => "Active provider",
+        "base_url" => "DeepSeek API URL",
+        "provider_url" => "Provider API URL",
+        "model" => "Current model",
+        "default_model" => "Default model",
+        "reasoning_effort" => "Reasoning level",
+        "approval_mode" => "Current approval mode",
+        "default_mode" => "Startup mode",
+        "allow_shell" => "Shell access",
+        "stream_chunk_timeout_secs" => "Stream timeout",
+        "theme" => "Theme",
+        "locale" => "Language",
+        "background_color" => "Background",
+        "calm_mode" => "Calm mode",
+        "low_motion" => "Low motion",
+        "fancy_animations" => "Animations",
+        "show_thinking" => "Show thinking",
+        "show_tool_details" => "Tool detail level",
+        "status_indicator" => "Status indicator",
+        "synchronized_output" => "Output pacing",
+        "cost_currency" => "Cost currency",
+        "transcript_spacing" => "Transcript spacing",
+        "tool_collapse" => "Tool cards",
+        "composer_density" => "Composer density",
+        "composer_border" => "Composer border",
+        "composer_vim_mode" => "Composer Vim mode",
+        "bracketed_paste" => "Bracketed paste",
+        "paste_burst_detection" => "Paste detection",
+        "mention_menu_limit" => "Mention menu limit",
+        "mention_menu_behavior" => "Mention menu behavior",
+        "mention_walk_depth" => "File mention depth",
+        "workspace_follow_symlinks" => "Follow symlinks",
+        "sidebar_width" => "Sidebar width",
+        "sidebar_focus" => "Sidebar focus",
+        "context_panel" => "Context panel",
+        "auto_compact" => "Auto compact",
+        "auto_compact_threshold_percent" => "Compact threshold",
+        "max_history" => "Input history",
+        "prefer_external_pdftotext" => "PDF text extractor",
+        "mcp_config_path" => "MCP config path",
+        "fleet.exec.max_spawn_depth" => "Fleet recursion depth",
+        "goal_command" => "Goal command",
+        "whaleflow" => "WhaleFlow",
+        _ => {
+            if let Some(feature) = key.strip_prefix("features.") {
+                return format!("Feature: {}", humanize_config_key(feature));
+            } else {
+                return humanize_config_key(key);
+            }
+        }
+    };
+    static_label.to_string()
+}
+
+fn humanize_config_key(key: &str) -> String {
+    key.split(['.', '_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut word = first.to_uppercase().collect::<String>();
+            word.push_str(chars.as_str());
+            word
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn config_hint_for_key(key: &str) -> &'static str {
     match key {
         "model" => "deepseek-v4-pro | deepseek-v4-flash | deepseek-*",
@@ -1269,6 +1654,14 @@ fn config_hint_for_key(key: &str) -> &'static str {
         "fleet.exec.max_spawn_depth" => {
             "0 blocks child agents; 3 default (same axis as sub-agents); capped at 8"
         }
+        "features.subagents" => "read-only feature flag state; Fleet setup is the user-facing path",
+        "features.web_search" => "read-only feature flag state for web search tools",
+        "features.apply_patch" => "read-only feature flag state for patch editing tools",
+        "features.mcp" => "read-only feature flag state for MCP tools",
+        "features.exec_policy" => "read-only feature flag state for execution policy tools",
+        "features.vision_model" => "read-only feature flag state for vision/model image support",
+        "goal_command" => "preview-only; not a stable command surface yet",
+        "whaleflow" => "preview-only workflow/fleet overlay; not a stable command surface yet",
         _ => "",
     }
 }
@@ -1456,20 +1849,12 @@ impl ModalView for ConfigView {
         use ratatui::{
             style::Style,
             text::{Line, Span},
-            widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
+            widgets::{Block, Borders, Padding, Paragraph, Widget},
         };
 
-        let popup_width = 84.min(area.width.saturating_sub(4));
-        let popup_height = 22.min(area.height.saturating_sub(4));
+        let popup_area = centered_modal_area(area, 84, 22, 60, 12);
 
-        let popup_area = Rect {
-            x: (area.width - popup_width) / 2,
-            y: (area.height - popup_height) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
-
-        Clear.render(popup_area, buf);
+        render_modal_surface(area, popup_area, buf);
 
         let base_block = Block::default()
             .borders(Borders::ALL)
@@ -1480,8 +1865,19 @@ impl ModalView for ConfigView {
         let inner = base_block.inner(popup_area);
         let (lines, footer) = if let Some(edit) = self.editing.as_ref() {
             let mut lines: Vec<Line> = Vec::new();
+            let edit_label = config_label_for_key(&edit.key);
+            let edit_title = if edit_label == edit.key {
+                format!("{}{}", self.tr(MessageId::ConfigEditTitlePrefix), edit.key)
+            } else {
+                format!(
+                    "{}{} [{}]",
+                    self.tr(MessageId::ConfigEditTitlePrefix),
+                    edit_label,
+                    edit.key
+                )
+            };
             lines.push(Line::from(vec![Span::styled(
-                format!("{}{}", self.tr(MessageId::ConfigEditTitlePrefix), edit.key),
+                edit_title,
                 Style::default().fg(palette::DEEPSEEK_SKY).bold(),
             )]));
             lines.push(Line::from(""));
@@ -1517,8 +1913,12 @@ impl ModalView for ConfigView {
             let content_height = usize::from(inner.height);
             let header_lines = 5usize;
             let bottom_lines = 1usize;
+            // The action footer now lives inside the modal body (reserved by
+            // `render_modal_text_footer` below) rather than on the border, so it
+            // claims one inner row that the table must not draw over.
+            let footer_lines = 1usize;
             let visible_rows = content_height
-                .saturating_sub(header_lines + bottom_lines)
+                .saturating_sub(header_lines + bottom_lines + footer_lines)
                 .max(1);
             self.last_visible_rows.set(visible_rows);
 
@@ -1551,7 +1951,7 @@ impl ModalView for ConfigView {
                 Line::from(""),
                 Line::from(format!(
                     "  {:<key_width$} {:<value_width$} {:<scope_width$}",
-                    "Key",
+                    "Setting",
                     "Value",
                     "Scope",
                     key_width = key_column_width,
@@ -1593,11 +1993,12 @@ impl ModalView for ConfigView {
                         } else {
                             Style::default().fg(palette::TEXT_PRIMARY)
                         };
-                        let key = truncate_view_text(&row.key, key_column_width);
+                        let label = config_label_for_key(&row.key);
+                        let key = truncate_view_text(&label, key_column_width);
                         let value =
                             truncate_view_text(&self.row_display_value(row), value_column_width);
                         let scope =
-                            truncate_view_text(row.scope.label(self.locale), scope_column_width);
+                            truncate_view_text(&row.scope.label(self.locale), scope_column_width);
                         let mut line = Line::from(format!(
                             "  {key:<key_column_width$} {value:<value_column_width$} {scope:<scope_column_width$}"
                         ));
@@ -1624,6 +2025,7 @@ impl ModalView for ConfigView {
                 )));
             }
 
+            let selected_hint = self.selected_row_hint();
             let bottom_text = if let Some(status) = self.status.as_ref() {
                 status.clone()
             } else if !self.filter.is_empty() {
@@ -1632,18 +2034,23 @@ impl ModalView for ConfigView {
                     self.tr(MessageId::ConfigFilteredSettings)
                 )
             } else if scrollable && !items.is_empty() {
-                format!(
+                let showing = format!(
                     "{} {}-{} / {}",
                     self.tr(MessageId::ConfigShowing),
                     self.scroll.saturating_add(1),
                     end,
                     items.len()
-                )
+                );
+                if let Some(hint) = selected_hint {
+                    format!("{showing} | {hint}")
+                } else {
+                    showing
+                }
             } else {
-                String::new()
+                selected_hint.unwrap_or_default()
             };
             lines.push(Line::from(Span::styled(
-                bottom_text,
+                truncate_view_text(&bottom_text, usize::from(inner.width)),
                 Style::default().fg(palette::TEXT_MUTED),
             )));
 
@@ -1662,10 +2069,6 @@ impl ModalView for ConfigView {
                 self.tr(MessageId::ConfigModalTitle),
                 Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
             )]))
-            .title_bottom(Line::from(Span::styled(
-                footer,
-                Style::default().fg(palette::TEXT_MUTED),
-            )))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
             .style(Style::default().bg(palette::DEEPSEEK_INK))
@@ -1673,10 +2076,18 @@ impl ModalView for ConfigView {
 
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
+        // Footer wraps inside the body so its hints can never run off the modal
+        // edge (#3732); the table renders into the area above it.
+        let content = render_modal_text_footer(
+            inner,
+            buf,
+            &footer,
+            Style::default().fg(palette::TEXT_MUTED),
+        );
         Paragraph::new(lines)
             .style(Style::default().fg(palette::TEXT_PRIMARY))
             .scroll((0, 0))
-            .render(inner, buf);
+            .render(content, buf);
     }
 }
 
@@ -1828,6 +2239,13 @@ impl ModalView for SubAgentsView {
             KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('R') => {
                 ViewAction::Emit(ViewEvent::SubAgentsRefresh)
             }
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                ViewAction::Emit(ViewEvent::CommandPaletteSelected {
+                    action: CommandPaletteAction::ExecuteCommand {
+                        command: "/fleet".to_string(),
+                    },
+                })
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.scroll = self.scroll.saturating_sub(1);
                 ViewAction::None
@@ -1848,30 +2266,27 @@ impl ModalView for SubAgentsView {
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
         use ratatui::{
+            layout::Alignment,
             style::Style,
             text::{Line, Span},
-            widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
+            widgets::{Block, Borders, Padding, Paragraph, Widget},
         };
 
-        let popup_width = 78.min(area.width.saturating_sub(4));
-        let popup_height = 20.min(area.height.saturating_sub(4));
+        let popup_area = centered_modal_area(area, 78, 20, 56, 12);
 
-        let popup_area = Rect {
-            x: (area.width - popup_width) / 2,
-            y: (area.height - popup_height) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
-
-        Clear.render(popup_area, buf);
+        render_modal_surface(area, popup_area, buf);
 
         let mut lines: Vec<Line> = Vec::new();
-        let content_width = popup_width.saturating_sub(4) as usize;
+        let content_width = popup_area.width.saturating_sub(4) as usize;
 
         if self.agents.is_empty() {
             lines.push(Line::from(Span::styled(
-                "No agents running.",
+                "No Fleet workers running.",
                 Style::default().fg(palette::TEXT_MUTED),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Use /fleet to configure role profiles and launch posture.",
+                Style::default().fg(palette::TEXT_DIM),
             )));
         } else {
             let mut running = Vec::new();
@@ -1900,8 +2315,12 @@ impl ModalView for SubAgentsView {
             ];
 
             lines.push(Line::from(Span::styled(
-                "Sub-agents",
+                "Fleet workers",
                 Style::default().fg(palette::DEEPSEEK_SKY).bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Sub-agent roles are Fleet worker roles.",
+                Style::default().fg(palette::TEXT_DIM),
             )));
 
             let mut summary_parts = Vec::new();
@@ -1983,8 +2402,9 @@ impl ModalView for SubAgentsView {
             );
         }
 
+        // Reserve one body row for the wrapping footer below.
         let total_lines = lines.len();
-        let visible_lines = (popup_height as usize).saturating_sub(3);
+        let visible_lines = usize::from(popup_area.height).saturating_sub(5).max(1);
         let max_scroll = total_lines.saturating_sub(visible_lines);
         let scroll = self.scroll.min(max_scroll);
 
@@ -1994,26 +2414,39 @@ impl ModalView for SubAgentsView {
             String::new()
         };
 
-        let view = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(Line::from(vec![Span::styled(
-                        " Sub-agents ",
-                        Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
-                    )]))
-                    .title_bottom(Line::from(vec![
-                        Span::styled(" Esc to close ", Style::default().fg(palette::TEXT_MUTED)),
-                        Span::styled(" R to refresh ", Style::default().fg(palette::TEXT_MUTED)),
-                        Span::styled(scroll_indicator, Style::default().fg(palette::DEEPSEEK_SKY)),
-                    ]))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(palette::BORDER_COLOR))
-                    .style(Style::default().bg(palette::DEEPSEEK_INK))
-                    .padding(Padding::uniform(1)),
+        let block = Block::default()
+            .title(Line::from(vec![Span::styled(
+                " Fleet workers ",
+                Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+            )]))
+            .title_bottom(
+                Line::from(Span::styled(
+                    scroll_indicator,
+                    Style::default().fg(palette::DEEPSEEK_SKY),
+                ))
+                .alignment(Alignment::Right),
             )
-            .scroll((scroll as u16, 0));
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default().bg(palette::DEEPSEEK_INK))
+            .padding(Padding::uniform(1));
 
-        view.render(popup_area, buf);
+        let inner = block.inner(popup_area);
+        block.render(popup_area, buf);
+
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("Esc", "close"),
+                ActionHint::new("R", "refresh"),
+                ActionHint::new("F", "setup"),
+            ],
+        );
+
+        Paragraph::new(lines)
+            .scroll((scroll as u16, 0))
+            .render(content, buf);
     }
 }
 
@@ -2189,8 +2622,9 @@ fn truncate_view_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigListItem, ConfigView, HelpView, ModalKind, ModalView, ViewAction, ViewEvent,
-        ViewStack, subagent_view_agents, truncate_view_text,
+        ActionHint, ConfigListItem, ConfigView, HelpView, ModalKind, ModalView, ViewAction,
+        ViewEvent, ViewStack, action_footer_lines, centered_modal_area, render_modal_footer,
+        subagent_view_agents, truncate_view_text,
     };
     use crate::config::Config;
     use crate::localization::{Locale, MessageId, tr};
@@ -2201,16 +2635,166 @@ mod tests {
     };
     use crate::tui::app::{App, TuiOptions};
     use crate::tui::history::{HistoryCell, SubAgentCell};
+    use crate::tui::views::{CommandPaletteAction, SubAgentsView};
     use crate::tui::widgets::agent_card::{AgentLifecycle, FanoutCard};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
-    use ratatui::{buffer::Buffer, layout::Rect};
+    use ratatui::{
+        buffer::Buffer,
+        layout::Rect,
+        style::{Color, Style},
+    };
+    use std::borrow::Cow;
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::MutexGuard;
     use tempfile::TempDir;
+    use unicode_width::UnicodeWidthStr;
+
+    /// Terminal sizes the v0.8.66 modal blocker (#3732) requires every overlay
+    /// to remain readable and fully operable at.
+    const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
+
+    /// Render a modal through the `ViewStack` (so the shared opaque backdrop is
+    /// painted exactly as in production) over a sentinel-filled buffer, then
+    /// assert: every `required_label` is visible, no sentinel `X` survives
+    /// anywhere (fully opaque), the center cell carries the modal ink, and no
+    /// row overflows the frame width.
+    fn assert_modal_usable_and_opaque<V: ModalView + 'static>(
+        make: impl Fn() -> V,
+        required_labels: &[&str],
+    ) {
+        for (w, h) in BLOCKER_SIZES {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            for y in 0..h {
+                for x in 0..w {
+                    buf[(x, y)].set_symbol("X");
+                }
+            }
+            let mut stack = ViewStack::new();
+            stack.push(make());
+            stack.render(area, &mut buf);
+
+            let rows: Vec<String> = (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect();
+            let text = rows.join("\n");
+
+            for label in required_labels {
+                assert!(text.contains(label), "{w}x{h}: missing '{label}'");
+            }
+            assert!(
+                !text.contains('X'),
+                "{w}x{h}: background bleed-through into modal surface"
+            );
+            assert_eq!(
+                buf[(w / 2, h / 2)].bg,
+                palette::DEEPSEEK_INK,
+                "{w}x{h}: modal interior must be opaque"
+            );
+            for (y, row) in rows.iter().enumerate() {
+                assert!(
+                    UnicodeWidthStr::width(row.trim_end()) <= w as usize,
+                    "{w}x{h}: row {y} overflows width: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_modal_is_usable_and_opaque_at_blocker_sizes() {
+        let _lock = crate::test_support::lock_test_env();
+        // "Search" is the hardcoded English search-row label; asserting it (plus
+        // the opacity/overflow checks) proves the modal renders fully and its
+        // footer wraps inside bounds rather than clipping.
+        assert_modal_usable_and_opaque(|| create_config_view(Locale::En), &["Search"]);
+    }
+
+    #[test]
+    fn subagents_modal_is_usable_and_opaque_at_blocker_sizes() {
+        assert_modal_usable_and_opaque(
+            || SubAgentsView::new(Vec::new()),
+            &["close", "refresh", "setup"],
+        );
+    }
+
+    #[test]
+    fn centered_modal_area_clamps_and_centers() {
+        // Roomy frame: preferred size honoured, centered.
+        let area = Rect::new(0, 0, 160, 40);
+        let rect = centered_modal_area(area, 80, 20, 40, 10);
+        assert_eq!((rect.width, rect.height), (80, 20));
+        assert_eq!(rect.x, (160 - 80) / 2);
+        assert_eq!(rect.y, (40 - 20) / 2);
+
+        // Tiny frame: never exceeds the frame even below the requested minimum.
+        let tiny = Rect::new(0, 0, 30, 8);
+        let rect = centered_modal_area(tiny, 80, 20, 40, 10);
+        assert!(rect.width <= tiny.width, "width must fit frame");
+        assert!(rect.height <= tiny.height, "height must fit frame");
+        assert!(rect.x + rect.width <= tiny.width);
+        assert!(rect.y + rect.height <= tiny.height);
+    }
+
+    #[test]
+    fn action_footer_wraps_instead_of_overflowing() {
+        let hints = [
+            ActionHint::new("↑↓", "move"),
+            ActionHint::new("a-z", "jump"),
+            ActionHint::new("Enter", "apply"),
+            ActionHint::new("R", "edit key"),
+            ActionHint::new("M", "models"),
+            ActionHint::new("Esc", "cancel"),
+        ];
+
+        // Wide enough for a single row.
+        let wide = action_footer_lines(&hints, 120);
+        assert_eq!(wide.len(), 1);
+        assert!(wide[0].width() <= 120);
+
+        // Narrow forces wrapping but never truncates: every action survives and
+        // no produced line exceeds the available width.
+        let narrow = action_footer_lines(&hints, 28);
+        assert!(narrow.len() >= 2, "narrow footer should wrap to >1 row");
+        for line in &narrow {
+            assert!(
+                line.width() <= 28,
+                "wrapped footer row overflows: {} cols",
+                line.width()
+            );
+        }
+        let joined: String = narrow
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        for label in ["move", "jump", "apply", "edit key", "models", "cancel"] {
+            assert!(joined.contains(label), "footer dropped action: {label}");
+        }
+    }
+
+    #[test]
+    fn render_modal_footer_reserves_rows_and_returns_body() {
+        let inner = Rect::new(2, 2, 40, 10);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 44, 14));
+        let hints = [
+            ActionHint::new("Enter", "save"),
+            ActionHint::new("Esc", "cancel"),
+        ];
+        let body = render_modal_footer(inner, &mut buf, &hints);
+        // The footer (a single row at this width) is reserved off the bottom and
+        // the body fills the rows above it.
+        assert_eq!(body.y, inner.y);
+        assert_eq!(body.height, inner.height - 1);
+        assert_eq!(body.y + body.height, inner.y + inner.height - 1);
+    }
 
     struct ConfigSettingsEnvGuard {
         _tmp: TempDir,
@@ -2383,7 +2967,21 @@ mod tests {
         assert_eq!(agents[0].assignment.objective, "read the docs");
     }
 
-    fn visible_section_labels(view: &ConfigView) -> Vec<&'static str> {
+    #[test]
+    fn fleet_worker_status_view_can_jump_to_fleet_setup() {
+        let mut view = SubAgentsView::new(Vec::new());
+
+        let action = view.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+
+        match action {
+            ViewAction::Emit(ViewEvent::CommandPaletteSelected {
+                action: CommandPaletteAction::ExecuteCommand { command },
+            }) => assert_eq!(command, "/fleet"),
+            other => panic!("expected /fleet jump action, got {other:?}"),
+        }
+    }
+
+    fn visible_section_labels(view: &ConfigView) -> Vec<Cow<'static, str>> {
         view.visible_items()
             .into_iter()
             .filter_map(|item| match item {
@@ -2821,6 +3419,42 @@ base_url = "https://api.xiaomimimo.com/v1"
     }
 
     #[test]
+    fn config_view_filter_matches_friendly_labels_and_hints() {
+        let mut view = create_config_view(Locale::En);
+
+        type_filter(&mut view, "shell access");
+        assert_eq!(visible_row_keys(&view), vec!["allow_shell"]);
+
+        view.clear_filter();
+        type_filter(&mut view, "reasoning level");
+        assert_eq!(visible_row_keys(&view), vec!["reasoning_effort"]);
+
+        view.clear_filter();
+        type_filter(&mut view, "fleet setup user-facing");
+        assert_eq!(visible_row_keys(&view), vec!["features.subagents"]);
+    }
+
+    #[test]
+    fn config_view_renders_friendly_setting_labels() {
+        let view = create_config_view(Locale::En);
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buf = Buffer::empty(area);
+
+        view.render(area, &mut buf);
+
+        let dump = buffer_text(&buf, area);
+        assert!(
+            dump.contains("Active provider"),
+            "missing provider label:\n{dump}"
+        );
+        assert!(
+            dump.contains("Shell access"),
+            "missing shell label:\n{dump}"
+        );
+        assert!(dump.contains("Setting"), "missing table heading:\n{dump}");
+    }
+
+    #[test]
     fn localized_config_view_renders_at_narrow_width() {
         let mut app = create_test_app();
         app.ui_locale = Locale::PtBr;
@@ -2892,12 +3526,16 @@ base_url = "https://api.xiaomimimo.com/v1"
 
         let dump = buffer_text(&buf, area);
         assert!(
-            dump.contains("paste_burst_detection"),
-            "long config keys should stay readable:\n{dump}"
+            dump.contains("Paste detection"),
+            "friendly config labels should stay readable:\n{dump}"
         );
         let scope_columns = dump
             .lines()
-            .filter(|line| line.contains("composer_") || line.contains("bracketed_paste"))
+            .filter(|line| {
+                line.contains("Composer")
+                    || line.contains("Bracketed paste")
+                    || line.contains("Paste detection")
+            })
             .filter_map(|line| line.find('已'))
             .collect::<Vec<_>>();
         assert!(
@@ -3066,7 +3704,7 @@ base_url = "https://api.xiaomimimo.com/v1"
         assert!(view.editing.is_none());
         assert_eq!(
             view.status.as_deref(),
-            Some(tr(Locale::En, MessageId::ConfigEditCancelled))
+            Some(&*tr(Locale::En, MessageId::ConfigEditCancelled))
         );
     }
 
@@ -3080,6 +3718,69 @@ base_url = "https://api.xiaomimimo.com/v1"
         stack.push(HelpView::new_for_locale(crate::localization::Locale::En));
         assert!(!stack.handle_paste("hello"));
         assert_eq!(stack.top_kind(), Some(ModalKind::Help));
+    }
+
+    struct BareModal;
+
+    impl ModalView for BareModal {
+        fn kind(&self) -> ModalKind {
+            ModalKind::ContextMenu
+        }
+
+        fn handle_key(&mut self, _key: KeyEvent) -> ViewAction {
+            ViewAction::None
+        }
+
+        fn render(&self, area: Rect, buf: &mut Buffer) {
+            let x = area.x + area.width / 2;
+            let y = area.y + area.height / 2;
+            buf[(x, y)]
+                .set_symbol("M")
+                .set_style(Style::default().fg(Color::White).bg(Color::Red));
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn view_stack_paints_opaque_backdrop_before_modal() {
+        let area = Rect::new(0, 0, 24, 8);
+        let modal_x = area.x + area.width / 2;
+        let modal_y = area.y + area.height / 2;
+        let mut buf = Buffer::empty(area);
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                buf[(x, y)]
+                    .set_symbol("X")
+                    .set_style(Style::default().fg(Color::Red).bg(Color::Blue));
+            }
+        }
+
+        let mut stack = ViewStack::new();
+        stack.push(BareModal);
+        stack.render(area, &mut buf);
+
+        assert_eq!(buf[(modal_x, modal_y)].symbol(), "M");
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if x == modal_x && y == modal_y {
+                    continue;
+                }
+                let cell = &buf[(x, y)];
+                assert_eq!(
+                    cell.symbol(),
+                    " ",
+                    "stale glyph at ({x},{y}) must be cleared"
+                );
+                assert_eq!(
+                    cell.bg,
+                    palette::DEEPSEEK_INK,
+                    "backdrop at ({x},{y}) must be opaque"
+                );
+            }
+        }
     }
 
     fn buffer_text(buf: &Buffer, area: Rect) -> String {

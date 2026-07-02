@@ -4,7 +4,7 @@
 
 Rust 製の TUI と CLI、25 のプロバイダ。DeepSeek、OpenRouter、Hugging Face、DeepInfra、ローカルの vLLM/SGLang/Ollama を第一級のルートとして扱い、手元にあるのが Anthropic Claude や OpenAI のキーなら、それらの API もネイティブに扱えます。承認ゲート付きツール、OS サンドボックス、そして全ターンを巻き戻せる `/restore`。
 
-[English README](README.md) · [简体中文 README](README.zh-CN.md) · [Tiếng Việt README](README.vi.md) · [codewhale.net](https://codewhale.net/) · [Install guide](docs/INSTALL.md) · [Provider registry](docs/PROVIDERS.md) · [Changelog](CHANGELOG.md)
+[English README](README.md) · [简体中文 README](README.zh-CN.md) · [Tiếng Việt README](README.vi.md) · [한국어 README](README.ko-KR.md) · [codewhale.net](https://codewhale.net/) · [Install guide](docs/INSTALL.md) · [Provider registry](docs/PROVIDERS.md) · [Changelog](CHANGELOG.md)
 
 [![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
@@ -17,7 +17,7 @@ Rust 製の TUI と CLI、25 のプロバイダ。DeepSeek、OpenRouter、Huggin
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.63
+codewhale --version   # 0.8.66
 ```
 
 npm wrapper（Node 18+）は GitHub Releases から SHA-256 検証済みのバイナリをダウンロードし、`codewhale`、`codew`、`codewhale-tui` をインストールします。ソースからビルドしたい場合は cargo（Rust 1.88+）で:
@@ -44,8 +44,8 @@ nix run github:Hmbown/CodeWhale
 scoop install codewhale        # または GitHub Releases の NSIS インストーラ
 
 # GitHub に安定して到達できない場合の CNB ミラー
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.64 codewhale-cli --locked --force
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.64 codewhale-tui --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-cli --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-tui --locked --force
 
 # 旧 Homebrew 互換。formula の改名が完了するまで deepseek-tui 名のままです
 brew tap Hmbown/deepseek-tui

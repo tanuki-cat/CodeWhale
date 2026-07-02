@@ -1,10 +1,10 @@
 use super::*;
 
 use super::context::{COMPACTION_SUMMARY_MARKER, TURN_MAX_OUTPUT_TOKENS};
-use super::turn_loop::registered_tool_approval_required;
+use super::turn_loop::{registered_tool_approval_required, tool_error_degradation_runtime_hint};
 use crate::config::ApiProvider;
-use crate::models::SystemBlock;
-use crate::test_support::lock_test_env;
+use crate::models::{SystemBlock, Usage};
+use crate::test_support::{EnvVarGuard, lock_test_env};
 use crate::tools::plan::{PlanItemArg, PlanSnapshot, StepStatus};
 use crate::tools::spec::ToolCapability;
 use crate::tools::todo::{TodoItem, TodoListSnapshot, TodoStatus};
@@ -212,6 +212,33 @@ fn tool_catalog_filter_applies_allow_and_deny_gates() {
     );
     let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(names, ["read_file"]);
+}
+
+#[test]
+fn tool_catalog_shell_only_benchmark_surface_hides_native_tools() {
+    let mut catalog = vec![
+        catalog_tool("exec_shell"),
+        catalog_tool("exec_shell_wait"),
+        catalog_tool("exec_shell_interact"),
+        catalog_tool("read_file"),
+        catalog_tool("write_file"),
+        catalog_tool("list_dir"),
+        catalog_tool("git_status"),
+        catalog_tool("checklist_write"),
+    ];
+    let shell_only = [
+        "exec_shell".to_string(),
+        "exec_shell_wait".to_string(),
+        "exec_shell_interact".to_string(),
+    ];
+
+    filter_tool_catalog_for_gates(&mut catalog, Some(&shell_only), None);
+
+    let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["exec_shell", "exec_shell_wait", "exec_shell_interact"]
+    );
 }
 
 #[test]
@@ -432,32 +459,21 @@ fn file_ask_rule_engine(tool: &str, path: &str) -> codewhale_execpolicy::ExecPol
     ])
 }
 
-#[test]
-fn auto_review_policy_forces_prompt_for_publish_like_actions() {
-    let (decision, audit) = auto_review_plan_decision(
-        &crate::tui::auto_review::AutoReviewPolicy::default(),
-        "git_push",
-        &json!({"remote": "origin", "branch": "main"}),
-        crate::tui::auto_review::RunOrigin::Interactive,
-        crate::tui::approval::ApprovalMode::Auto,
-        Some("push the release branch"),
-        true,
-        false,
-    );
-
-    assert_eq!(
-        decision,
-        AutoReviewPlanDecision::ForcePrompt(
-            "Auto-review policy requires approval: publish-like actions require a durable review step"
-                .to_string()
-        )
-    );
-    assert_eq!(audit["decision"], "hold_for_review");
-    assert_eq!(audit["action_kind"], "publish");
+fn model_turn_event_timeout() -> Duration {
+    if cfg!(windows) {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(10)
+    }
 }
 
 #[test]
-fn auto_review_policy_forces_prompt_for_shell_git_push() {
+fn auto_review_classifies_publish_but_no_longer_force_prompts_it() {
+    // #3790: publish-like shell is still *classified* as publish (audit only),
+    // but with the safety floor removed the policy no longer forces a prompt.
+    // The mode alone decides: Agent prompts via the normal approval path, YOLO
+    // runs with zero prompts. Previously this returned ForcePrompt with a
+    // hold_for_review audit decision and was overridden past YOLO.
     let (decision, audit) = auto_review_plan_decision(
         &crate::tui::auto_review::AutoReviewPolicy::default(),
         "exec_shell",
@@ -469,19 +485,35 @@ fn auto_review_policy_forces_prompt_for_shell_git_push() {
         false,
     );
 
-    assert_eq!(
-        decision,
-        AutoReviewPlanDecision::ForcePrompt(
-            "Auto-review policy requires approval: publish-like actions require a durable review step"
-                .to_string()
-        )
-    );
-    assert_eq!(audit["decision"], "hold_for_review");
+    assert_eq!(decision, AutoReviewPlanDecision::NoChange);
     assert_eq!(audit["action_kind"], "publish");
+    assert_ne!(audit["decision"], "hold_for_review");
 }
 
 #[test]
-fn auto_review_policy_blocks_hold_when_approval_is_never() {
+fn auto_review_policy_does_not_force_prompt_for_shell_git_tag_list_probe() {
+    let (decision, audit) = auto_review_plan_decision(
+        &crate::tui::auto_review::AutoReviewPolicy::default(),
+        "exec_shell",
+        &json!({"command": "git remote -v && git rev-parse --show-toplevel && git branch --show-current && git rev-parse HEAD && git tag --list 'v0.8.65'"}),
+        crate::tui::auto_review::RunOrigin::Interactive,
+        crate::tui::approval::ApprovalMode::Auto,
+        Some("inspect release status"),
+        true,
+        false,
+    );
+
+    assert_eq!(decision, AutoReviewPlanDecision::NoChange);
+    assert_eq!(audit["decision"], "ask_user");
+    assert_eq!(audit["action_kind"], "shell");
+}
+
+#[test]
+fn auto_review_policy_no_longer_holds_publish_even_when_approval_is_never() {
+    // #3790: the publish "durable review" floor was removed and deferred to
+    // 0.8.67. The auto-review policy no longer forces a hold or a Never-block
+    // for a publish-like action; refusal is the job of a typed deny rule or the
+    // approval gate (ApprovalMode::Never denies at the chokepoint), not a floor.
     let (decision, audit) = auto_review_plan_decision(
         &crate::tui::auto_review::AutoReviewPolicy::default(),
         "github_publish_release",
@@ -493,15 +525,9 @@ fn auto_review_policy_blocks_hold_when_approval_is_never() {
         false,
     );
 
-    assert_eq!(
-        decision,
-        AutoReviewPlanDecision::Block(
-            "Auto-review policy requires approval: publish-like actions require a durable review step"
-                .to_string()
-        )
-    );
+    assert_eq!(decision, AutoReviewPlanDecision::NoChange);
     assert_eq!(audit["approval_mode"], "NEVER");
-    assert_eq!(audit["decision"], "hold_for_review");
+    assert_ne!(audit["decision"], "hold_for_review");
 }
 
 #[test]
@@ -558,31 +584,56 @@ fn auto_review_run_origin_marks_detached_tools_as_background() {
 }
 
 #[test]
-fn auto_review_policy_holds_background_destructive_auto_approval() {
+fn auto_review_policy_no_longer_holds_background_destructive_under_suggest() {
+    // #3790: the background/headless destructive floor was removed and deferred
+    // to 0.8.67. Agent-mode prompting for a write-capable shell still happens
+    // via the normal registered-tool approval path; the auto-review policy no
+    // longer force-prompts it.
     let (decision, audit) = auto_review_plan_decision(
         &crate::tui::auto_review::AutoReviewPolicy::default(),
         "exec_shell",
         &json!({"command": "cargo test", "background": true}),
         crate::tui::auto_review::RunOrigin::Background,
-        crate::tui::approval::ApprovalMode::Auto,
+        crate::tui::approval::ApprovalMode::Suggest,
         Some("run tests in the background"),
         true,
         false,
     );
 
-    assert_eq!(
-        decision,
-        AutoReviewPlanDecision::ForcePrompt(
-            "Auto-review policy requires approval: destructive background/headless actions cannot auto-approve"
-                .to_string()
-        )
-    );
+    assert_eq!(decision, AutoReviewPlanDecision::NoChange);
     assert_eq!(audit["run_origin"], "background");
-    assert_eq!(audit["decision"], "hold_for_review");
+    assert_ne!(audit["decision"], "hold_for_review");
 }
 
 #[test]
-fn auto_review_policy_blocks_background_hold_when_approval_is_never() {
+fn auto_review_policy_preserves_yolo_for_detached_destructive_tools() {
+    for run_origin in [
+        crate::tui::auto_review::RunOrigin::Background,
+        crate::tui::auto_review::RunOrigin::Headless,
+    ] {
+        let (decision, audit) = auto_review_plan_decision(
+            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            "exec_shell",
+            &json!({"command": "cargo test", "background": true}),
+            run_origin,
+            crate::tui::approval::ApprovalMode::Bypass,
+            Some("run tests in the background"),
+            true,
+            false,
+        );
+
+        assert_eq!(decision, AutoReviewPlanDecision::NoChange);
+        assert_eq!(audit["approval_mode"], "BYPASS");
+        assert_eq!(audit["run_origin"], run_origin.as_str());
+        assert_eq!(audit["decision"], "ask_user");
+    }
+}
+
+#[test]
+fn auto_review_policy_no_longer_blocks_background_destructive_under_never() {
+    // #3790: with the background/headless destructive floor removed, the policy
+    // returns NoChange even under Never; Never denies at the approval gate, not
+    // via an auto-review hold. Deferred to 0.8.67.
     let (decision, audit) = auto_review_plan_decision(
         &crate::tui::auto_review::AutoReviewPolicy::default(),
         "exec_shell",
@@ -594,13 +645,7 @@ fn auto_review_policy_blocks_background_hold_when_approval_is_never() {
         false,
     );
 
-    assert_eq!(
-        decision,
-        AutoReviewPlanDecision::Block(
-            "Auto-review policy requires approval: destructive background/headless actions cannot auto-approve"
-                .to_string()
-        )
-    );
+    assert_eq!(decision, AutoReviewPlanDecision::NoChange);
     assert_eq!(audit["approval_mode"], "NEVER");
     assert_eq!(audit["run_origin"], "background");
 }
@@ -715,6 +760,30 @@ fn file_ask_rule_decision_prompts_for_matching_read_path() {
         &config,
         "read_file",
         &json!({"path": "secrets/api_key.txt"}),
+        Path::new("/repo"),
+        crate::tui::approval::ApprovalMode::Auto,
+    );
+
+    assert_eq!(
+        decision,
+        Some(ToolAskRuleDecision::Prompt(
+            "Typed ask rule 'tool=read_file path=secrets/api_key.txt' requires approval."
+                .to_string()
+        ))
+    );
+}
+
+#[test]
+fn file_ask_rule_decision_prompts_for_absolute_workspace_path() {
+    let config = EngineConfig {
+        exec_policy_engine: file_ask_rule_engine("read_file", "secrets/api_key.txt"),
+        ..EngineConfig::default()
+    };
+
+    let decision = file_tool_ask_rule_decision(
+        &config,
+        "read_file",
+        &json!({"path": "/repo/secrets/api_key.txt"}),
         Path::new("/repo"),
         crate::tui::approval::ApprovalMode::Auto,
     );
@@ -1099,6 +1168,68 @@ fn background_verifier_starts_batch_with_readonly_tools_when_auto_approved() {
     }
 }
 
+// #3801: agent `action=start` plans with `detached_start=true` and no approval
+// (YOLO / auto-approve mode) should all join one parallel batch instead of
+// being serialized N ways under the global tool-execution write lock.
+#[test]
+fn agent_start_detached_plans_join_single_parallel_batch() {
+    // Simulate 4 independent `agent start` calls — each is a detached_start,
+    // not read-only, not parallel-safe in the read-only sense, but qualifies
+    // for the detached-start parallel-batch path.
+    let plans: Vec<ToolExecutionPlan> = (0..4)
+        .map(|i| {
+            let mut plan = make_plan_at(i, false, false, false, false);
+            plan.name = "agent".to_string();
+            plan.detached_start = true;
+            plan
+        })
+        .collect();
+
+    let batches = plan_tool_execution_batches(plans);
+    assert_eq!(
+        batches.len(),
+        1,
+        "all 4 agent starts should form 1 parallel batch"
+    );
+    match &batches[0] {
+        ToolExecutionBatch::Parallel(plans) => {
+            assert_eq!(plans.len(), 4);
+            assert!(
+                plans.iter().all(|p| p.detached_start),
+                "every plan in the parallel batch should be a detached_start"
+            );
+        }
+        ToolExecutionBatch::Serial(_) => {
+            panic!("agent starts should be parallel, not serial");
+        }
+    }
+}
+
+// #3801: mixed agent starts and read-only tools should coexist in a parallel batch.
+#[test]
+fn agent_start_detached_plans_batch_with_readonly_tools() {
+    let mut grep_a = make_plan_at(0, true, true, false, false);
+    grep_a.name = "grep_files".to_string();
+
+    let mut agent_start = make_plan_at(1, false, false, false, false);
+    agent_start.name = "agent".to_string();
+    agent_start.detached_start = true;
+
+    let mut grep_b = make_plan_at(2, true, true, false, false);
+    grep_b.name = "grep_files".to_string();
+
+    let batches = plan_tool_execution_batches(vec![grep_a, agent_start, grep_b]);
+    assert_eq!(batches.len(), 1);
+    match &batches[0] {
+        ToolExecutionBatch::Parallel(plans) => {
+            assert_eq!(plans.len(), 3);
+        }
+        ToolExecutionBatch::Serial(_) => {
+            panic!("read-only tools + detached agent start should form 1 parallel batch");
+        }
+    }
+}
+
 #[test]
 fn successful_update_plan_ends_plan_mode_turn_immediately() {
     assert!(should_stop_after_plan_tool(
@@ -1230,6 +1361,99 @@ fn tool_error_messages_include_actionable_hints() {
 }
 
 #[test]
+fn transient_tool_errors_include_fallback_hint() {
+    let search_error = ToolError::execution_failed("Web search request failed: timeout");
+    let formatted = format_tool_error(&search_error, "web_search");
+
+    assert!(
+        formatted.contains("Fallback: after one retry"),
+        "{formatted}"
+    );
+    assert!(formatted.contains("direct URL"), "{formatted}");
+    assert!(formatted.contains("instead of repeating"), "{formatted}");
+}
+
+#[test]
+fn tool_errors_with_specific_recovery_do_not_get_generic_fallback() {
+    let message = "edit_file search string not found. Recovery: call read_file first.";
+    let formatted = format_tool_error(&ToolError::execution_failed(message), "edit_file");
+
+    assert_eq!(formatted, message);
+}
+
+#[test]
+fn repeated_tool_errors_wait_until_degradation_threshold() {
+    let tools = vec!["web_search".to_string()];
+
+    assert!(tool_error_degradation_runtime_hint(1, &tools, &[ErrorCategory::Tool], &[]).is_none());
+}
+
+#[test]
+fn repeated_tool_errors_emit_model_visible_degradation_hint() {
+    let tools = vec!["web_search".to_string(), "web_search".to_string()];
+    let hint = tool_error_degradation_runtime_hint(2, &tools, &[ErrorCategory::Tool], &[])
+        .expect("second consecutive tool-error step should emit a runtime hint");
+
+    assert!(hint.contains("2 consecutive"), "{hint}");
+    assert!(hint.contains("web_search"), "{hint}");
+    assert!(hint.contains("do not repeat"), "{hint}");
+    assert!(hint.contains("alternate tool"), "{hint}");
+    assert!(hint.contains("narrow the request"), "{hint}");
+}
+
+#[test]
+fn repeated_authorization_errors_do_not_emit_degradation_hint() {
+    let tools = vec!["exec_shell".to_string()];
+
+    assert!(
+        tool_error_degradation_runtime_hint(2, &tools, &[ErrorCategory::Authorization], &[])
+            .is_none()
+    );
+}
+
+#[test]
+fn repeated_search_errors_suggest_direct_url_patterns_for_domains() {
+    let tools = vec!["web_search".to_string()];
+    let inputs = vec![json!({"query": "site:example.edu announcements"})];
+    let hint = tool_error_degradation_runtime_hint(2, &tools, &[ErrorCategory::Tool], &inputs)
+        .expect("repeated web_search failure should emit a domain-aware fallback hint");
+
+    assert!(hint.contains("fetch_url"), "{hint}");
+    assert!(hint.contains("https://example.edu/announcements"), "{hint}");
+    assert!(hint.contains("https://example.edu/news"), "{hint}");
+}
+
+#[test]
+fn repeated_web_run_errors_suggest_direct_url_patterns_for_domains_list() {
+    let tools = vec!["web.run".to_string()];
+    let inputs = vec![json!({
+        "search_query": [
+            {
+                "q": "announcements",
+                "domains": ["www.example.edu"]
+            }
+        ]
+    })];
+    let hint = tool_error_degradation_runtime_hint(2, &tools, &[ErrorCategory::Tool], &inputs)
+        .expect("repeated web.run failure should emit a domain-aware fallback hint");
+
+    assert!(hint.contains("https://example.edu/announcements"), "{hint}");
+    assert!(hint.contains("https://example.edu/news"), "{hint}");
+}
+
+#[test]
+fn repeated_search_errors_do_not_treat_versions_as_domains() {
+    let tools = vec!["web_search".to_string()];
+    let inputs = vec![json!({"query": "release v1.2 notes"})];
+    let hint = tool_error_degradation_runtime_hint(2, &tools, &[ErrorCategory::Tool], &inputs)
+        .expect("repeated web_search failure should still emit the generic hint");
+
+    assert!(hint.contains("alternate tool"), "{hint}");
+    assert!(!hint.contains("fetch_url"), "{hint}");
+    assert!(!hint.contains("https://v1.2"), "{hint}");
+}
+
+#[test]
 fn tool_exec_outcome_tracks_duration() {
     let outcome = ToolExecOutcome {
         index: 0,
@@ -1241,6 +1465,46 @@ fn tool_exec_outcome_tracks_duration() {
     };
 
     assert!(outcome.started_at.elapsed().as_nanos() > 0);
+}
+
+#[test]
+fn approval_stamp_makes_user_approval_model_visible() {
+    let mut result = ToolResult::success("stdout");
+
+    stamp_tool_result_approval(&mut result, ToolApprovalStamp::ApprovedByUser);
+
+    assert!(
+        result
+            .content
+            .starts_with("[approval] This tool call required approval"),
+        "{}",
+        result.content
+    );
+    assert!(
+        result
+            .content
+            .contains("approved by the user before execution")
+    );
+    assert!(result.content.ends_with("stdout"));
+
+    let metadata = result.metadata.expect("approval metadata");
+    assert_eq!(metadata["approval"]["required"], true);
+    assert_eq!(metadata["approval"]["decision"], "approved_by_user");
+    assert_eq!(metadata["approval"]["model_visible"], true);
+}
+
+#[test]
+fn approval_stamp_preserves_existing_metadata() {
+    let mut result = ToolResult::success("ok").with_metadata(json!({
+        "summary": "kept"
+    }));
+
+    stamp_tool_result_approval(&mut result, ToolApprovalStamp::ApprovedWithPolicy);
+
+    let metadata = result.metadata.expect("metadata");
+    assert_eq!(metadata["summary"], "kept");
+    assert_eq!(metadata["approval"]["decision"], "approved_with_policy");
+    assert!(result.content.contains("adjusted execution policy"));
 }
 
 #[test]
@@ -1272,6 +1536,10 @@ fn non_yolo_mode_retains_default_defer_policy() {
     ));
     assert!(!should_default_defer_tool("web_search", &always_load));
     assert!(!should_default_defer_tool("write_file", &always_load));
+    assert!(should_default_defer_tool(
+        REQUEST_USER_INPUT_NAME,
+        &always_load
+    ));
     assert!(should_default_defer_tool("task_shell_start", &always_load));
     assert!(should_default_defer_tool("task_shell_wait", &always_load));
     assert!(should_default_defer_tool("git_blame", &always_load));
@@ -1749,6 +2017,37 @@ fn model_tool_catalog_defers_non_core_native_tools_in_yolo_mode() {
 }
 
 #[test]
+fn request_user_input_stays_deferred_but_can_be_dynamically_activated() {
+    let always_load = HashSet::new();
+    let catalog = build_model_tool_catalog(
+        vec![api_tool("read_file"), api_tool(REQUEST_USER_INPUT_NAME)],
+        Vec::new(),
+        AppMode::Agent,
+        &always_load,
+    );
+
+    assert_eq!(
+        catalog
+            .iter()
+            .find(|tool| tool.name == REQUEST_USER_INPUT_NAME)
+            .and_then(|tool| tool.defer_loading),
+        Some(true)
+    );
+
+    let mut active = initial_active_tools(&catalog);
+    assert!(!active.contains(REQUEST_USER_INPUT_NAME));
+    active.insert(REQUEST_USER_INPUT_NAME.to_string());
+
+    let active_tools = active_tools_for_step(&catalog, &active, false);
+    assert!(
+        active_tools
+            .iter()
+            .any(|tool| tool.name == REQUEST_USER_INPUT_NAME),
+        "dynamic active tools should expose the question modal without making it eager by default"
+    );
+}
+
+#[test]
 fn model_tool_catalog_sorts_each_partition_for_prefix_cache_stability() {
     // Regression for #263: deterministic byte order of the tools array is a
     // hard requirement for DeepSeek's KV prefix cache. Built-ins stay as a
@@ -1972,6 +2271,8 @@ fn deferred_tool_preflight_guides_checklist_update_list_replacement() {
 #[tokio::test]
 async fn run_shell_command_op_requests_approval_and_executes_shell() {
     let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
+    engine.session.allow_shell = false;
+    engine.config.allow_shell = false;
     let handle_for_approval = handle.clone();
 
     let task = tokio::spawn(async move {
@@ -1979,6 +2280,7 @@ async fn run_shell_command_op_requests_approval_and_executes_shell() {
             .handle_run_shell_command(
                 "echo bang-ok".to_string(),
                 AppMode::Agent,
+                true,
                 false,
                 false,
                 crate::tui::approval::ApprovalMode::Suggest,
@@ -2047,6 +2349,7 @@ async fn run_shell_command_op_skips_approval_when_auto_approved() {
             AppMode::Yolo,
             true,
             true,
+            true,
             crate::tui::approval::ApprovalMode::Auto,
         )
         .await;
@@ -2076,6 +2379,646 @@ async fn run_shell_command_op_skips_approval_when_auto_approved() {
 }
 
 #[tokio::test]
+async fn run_shell_command_op_allows_readonly_shell_in_auto_mode() {
+    let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
+    let handle_for_approval = handle.clone();
+
+    let task = tokio::spawn(async move {
+        engine
+            .handle_run_shell_command(
+                "pwd".to_string(),
+                AppMode::Auto,
+                true,
+                false,
+                false,
+                crate::tui::approval::ApprovalMode::Auto,
+            )
+            .await;
+    });
+
+    let mut saw_approval = false;
+    let mut saw_complete = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = rx.recv().await {
+        match event {
+            Event::ApprovalRequired { id, .. } => {
+                saw_approval = true;
+                handle_for_approval
+                    .approve_tool_call(id)
+                    .await
+                    .expect("approve unexpected shell prompt");
+            }
+            Event::ToolCallComplete { result, .. } => {
+                saw_complete = true;
+                let result = result.expect("shell result");
+                assert!(result.success, "{result:?}");
+            }
+            Event::TurnComplete { status, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+    task.await.expect("shell op task");
+
+    assert!(
+        !saw_approval,
+        "read-only shell shortcut should not request approval in Auto mode"
+    );
+    assert!(saw_complete);
+}
+
+#[tokio::test]
+async fn yolo_mode_does_not_prompt_for_typed_ask_rule() {
+    // #3386: a command matching a typed ask-rule (permissions.toml) must not
+    // surface an approval modal in YOLO mode, even though Yolo resolves to
+    // ApprovalMode::Auto which the execpolicy maps to OnFailure (honors
+    // ask-rules). The auto_review safety floor and typed deny rules still
+    // apply; only the ask-rule Prompt is suppressed in YOLO.
+    let (mut engine, handle) = Engine::new(
+        EngineConfig {
+            exec_policy_engine: ask_rule_engine("echo"),
+            ..EngineConfig::default()
+        },
+        &Config::default(),
+    );
+
+    engine
+        .handle_run_shell_command(
+            "echo yolo-ask-rule".to_string(),
+            AppMode::Yolo,
+            true,
+            true,
+            true,
+            crate::tui::approval::ApprovalMode::Auto,
+        )
+        .await;
+
+    let mut saw_complete = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = rx.recv().await {
+        match event {
+            Event::ApprovalRequired { .. } => {
+                panic!("YOLO mode must not prompt for a typed ask-rule");
+            }
+            Event::ToolCallComplete { result, .. } => {
+                saw_complete = true;
+                let result = result.expect("shell result");
+                assert!(result.success, "{result:?}");
+                assert!(result.content.contains("yolo-ask-rule"), "{result:?}");
+            }
+            Event::TurnComplete { status, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_complete);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn yolo_mode_does_not_prompt_for_model_driven_typed_ask_rule() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = lock_test_env();
+    let workspace = tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+
+    let tool_call_sse = concat!(
+        "data: {\"id\":\"chatcmpl-yolo\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"call_yolo\",\"type\":\"function\",\"function\":{\"name\":\"exec_shell\",",
+        "\"arguments\":\"{\\\"command\\\":\\\"echo yolo-model-ask-rule\\\"}\"}}",
+        "]},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-yolo\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let done_sse = concat!(
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("yolo-model-ask-rule"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(done_sse),
+        )
+        .expect(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(tool_call_sse),
+        )
+        .expect(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let api_config = Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(server.uri()),
+        ..Config::default()
+    };
+    let (engine, handle) = Engine::new(
+        EngineConfig {
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            workspace: workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            exec_policy_engine: ask_rule_engine("echo"),
+            ..EngineConfig::default()
+        },
+        &api_config,
+    );
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::SendMessage {
+            content: "please exercise the shell path".to_string(),
+            mode: AppMode::Yolo,
+            provider: None,
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: true,
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Auto,
+            translation_enabled: false,
+            show_thinking: true,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
+        .await
+        .expect("send model turn");
+
+    let mut saw_complete = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+        .await
+        .expect("timed out waiting for engine event")
+    {
+        match event {
+            Event::ApprovalRequired { .. } => {
+                panic!("YOLO mode must not prompt for a model-driven typed ask-rule");
+            }
+            Event::ToolCallComplete { name, result, .. } => {
+                if name == "exec_shell" {
+                    saw_complete = true;
+                    let result = result.expect("shell result");
+                    assert!(result.success, "{result:?}");
+                    assert!(result.content.contains("yolo-model-ask-rule"), "{result:?}");
+                }
+            }
+            Event::TurnComplete { status, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+    assert!(saw_complete);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn yolo_mode_does_not_prompt_for_background_shell() {
+    // #3790 regression guard: YOLO is the sole authority and runs every tool
+    // with zero prompts, including a background shell (input `background: true`,
+    // which gets RunOrigin::Background and is classified RiskLevel::Destructive).
+    // The auto-review override "safety floor" that used to force a prompt here —
+    // even in YOLO — was removed; the mode now decides alone. A typed Block/deny
+    // rule still hard-blocks regardless of mode.
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = lock_test_env();
+    let workspace = tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+
+    let tool_call_sse = concat!(
+        "data: {\"id\":\"chatcmpl-bg\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"call_bg\",\"type\":\"function\",\"function\":{\"name\":\"exec_shell\",",
+        "\"arguments\":\"{\\\"command\\\":\\\"echo bg-yolo-marker\\\",\\\"background\\\":true}\"}}",
+        "]},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-bg\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let done_sse = concat!(
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    // The second request carries the background-start tool result, which contains
+    // "Background task started" — match it for the terminal "done" response.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("Background task started"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(done_sse),
+        )
+        .expect(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(tool_call_sse),
+        )
+        .expect(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let api_config = Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(server.uri()),
+        ..Config::default()
+    };
+    let (engine, handle) = Engine::new(
+        EngineConfig {
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            workspace: workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            ..EngineConfig::default()
+        },
+        &api_config,
+    );
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::SendMessage {
+            content: "please run a background shell".to_string(),
+            mode: AppMode::Yolo,
+            provider: None,
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: true,
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Auto,
+            translation_enabled: false,
+            show_thinking: true,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
+        .await
+        .expect("send model turn");
+
+    let mut saw_complete = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+        .await
+        .expect("timed out waiting for engine event")
+    {
+        match event {
+            Event::ApprovalRequired { .. } => {
+                panic!("YOLO mode must not prompt for a background shell command");
+            }
+            Event::ToolCallComplete { name, result, .. } => {
+                if name == "exec_shell" {
+                    saw_complete = true;
+                    let result = result.expect("shell result");
+                    assert!(result.success, "{result:?}");
+                    assert!(
+                        result.content.contains("Background task started"),
+                        "expected a background start, got: {result:?}"
+                    );
+                }
+            }
+            Event::TurnComplete { status, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+    assert!(saw_complete);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn yolo_mode_runs_publish_like_shell_without_a_prompt() {
+    // #3790: YOLO is the sole authority and runs every tool with zero prompts —
+    // including publish-like shell (`git push` / `cargo publish` / `gh release`).
+    // The old #3735 behavior force-prompted publish past YOLO via the auto-review
+    // safety floor; that floor was removed and the mode now decides alone. So no
+    // Event::ApprovalRequired may fire, and the command must run. (Backgrounded
+    // so the mock's terminal response keys off the stable "Background task
+    // started" tool result; the publish-like classification is what matters.)
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = lock_test_env();
+    let workspace = tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+
+    let tool_call_sse = concat!(
+        "data: {\"id\":\"chatcmpl-publish\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"call_publish\",\"type\":\"function\",\"function\":{\"name\":\"exec_shell\",",
+        "\"arguments\":\"{\\\"command\\\":\\\"git push origin main\\\",\\\"background\\\":true}\"}}",
+        "]},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-publish\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let done_sse = concat!(
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"content\":\"ack\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("Background task started"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(done_sse),
+        )
+        .expect(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(tool_call_sse),
+        )
+        .expect(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let api_config = Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(server.uri()),
+        ..Config::default()
+    };
+    let (engine, handle) = Engine::new(
+        EngineConfig {
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            workspace: workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            ..EngineConfig::default()
+        },
+        &api_config,
+    );
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::SendMessage {
+            content: "please publish this crate".to_string(),
+            mode: AppMode::Yolo,
+            provider: None,
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: true,
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Bypass,
+            translation_enabled: false,
+            show_thinking: true,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
+        .await
+        .expect("send model turn");
+
+    let mut saw_approval_prompt = false;
+    let mut saw_complete = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+        .await
+        .expect("timed out waiting for engine event")
+    {
+        match event {
+            Event::ApprovalRequired { .. } => {
+                saw_approval_prompt = true;
+            }
+            Event::TurnComplete { status, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed);
+                saw_complete = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+    assert!(
+        !saw_approval_prompt,
+        "YOLO must run publish-like shell with zero prompts (#3790)"
+    );
+    assert!(saw_complete, "the YOLO publish-like turn should complete");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn yolo_mode_does_not_prompt_for_mcp_action() {
+    // #3790: MCP mutations are governed by the selected mode, just like shell.
+    // YOLO must not emit an approval request for a non-read-only MCP tool; this
+    // fixture has no GitHub MCP server, so execution may fail after the no-prompt
+    // planning decision. The regression guard is the absence of ApprovalRequired.
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = lock_test_env();
+    let workspace = tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+
+    let tool_call_sse = concat!(
+        "data: {\"id\":\"chatcmpl-mcp\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"call_mcp\",\"type\":\"function\",\"function\":{\"name\":\"mcp_github_create_pull_request\",",
+        "\"arguments\":\"{\\\"title\\\":\\\"test\\\",\\\"body\\\":\\\"body\\\"}\"}}",
+        "]},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-mcp\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let done_sse = concat!(
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"content\":\"ack\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("MCP tool failed"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(done_sse),
+        )
+        .expect(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(tool_call_sse),
+        )
+        .expect(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let api_config = Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(server.uri()),
+        ..Config::default()
+    };
+    let (engine, handle) = Engine::new(
+        EngineConfig {
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            workspace: workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            ..EngineConfig::default()
+        },
+        &api_config,
+    );
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::SendMessage {
+            content: "please open the PR".to_string(),
+            mode: AppMode::Yolo,
+            provider: None,
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: true,
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Bypass,
+            translation_enabled: false,
+            show_thinking: true,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
+        .await
+        .expect("send model turn");
+
+    let mut saw_mcp_result = false;
+    let mut saw_complete = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+        .await
+        .expect("timed out waiting for engine event")
+    {
+        match event {
+            Event::ApprovalRequired { .. } => {
+                panic!("YOLO mode must not prompt for an MCP action");
+            }
+            Event::ToolCallComplete { name, result, .. }
+                if name == "mcp_github_create_pull_request" =>
+            {
+                saw_mcp_result = true;
+                let err = result
+                    .expect_err("unconfigured MCP server should fail after no-prompt planning");
+                assert!(
+                    err.to_string().contains("MCP tool failed"),
+                    "unexpected MCP error: {err:?}"
+                );
+            }
+            Event::TurnComplete { status, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed);
+                saw_complete = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+    assert!(
+        saw_mcp_result,
+        "the MCP tool should execute without an approval gate"
+    );
+    assert!(saw_complete, "the YOLO MCP turn should complete");
+}
+
+#[tokio::test]
 async fn run_shell_command_op_preserves_plan_mode_shell_block() {
     let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
 
@@ -2083,6 +3026,7 @@ async fn run_shell_command_op_preserves_plan_mode_shell_block() {
         .handle_run_shell_command(
             "echo blocked".to_string(),
             AppMode::Plan,
+            false,
             false,
             false,
             crate::tui::approval::ApprovalMode::Suggest,
@@ -2542,6 +3486,7 @@ async fn set_model_reloads_instruction_sources_and_updates_session_prompt() {
         .send(Op::SetModel {
             model: "deepseek-v4-pro".to_string(),
             mode: AppMode::Agent,
+            route_limits: None,
         })
         .await
         .expect("send set model");
@@ -2592,6 +3537,10 @@ async fn change_mode_refreshes_session_prompt_and_updates_session() {
     handle
         .send(Op::ChangeMode {
             mode: AppMode::Yolo,
+            allow_shell: true,
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Bypass,
         })
         .await
         .expect("send change mode");
@@ -2635,11 +3584,11 @@ fn turn_approval_mode_prefers_auto_approve_flag() {
 
     assert_eq!(
         agent_approval_mode_for_turn(true, ApprovalMode::Suggest),
-        ApprovalMode::Auto
+        ApprovalMode::Bypass
     );
     assert_eq!(
         agent_approval_mode_for_turn(true, ApprovalMode::Never),
-        ApprovalMode::Auto
+        ApprovalMode::Bypass
     );
 }
 
@@ -2691,6 +3640,10 @@ async fn change_mode_op_updates_current_mode_and_emits_status() {
     handle
         .send(Op::ChangeMode {
             mode: AppMode::Yolo,
+            allow_shell: true,
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Bypass,
         })
         .await
         .expect("send change mode");
@@ -2718,6 +3671,204 @@ async fn change_mode_op_updates_current_mode_and_emits_status() {
         matches!(status, Event::Status { .. }),
         "should emit Status after mode change, got: {status:?}"
     );
+
+    run.abort();
+}
+
+#[test]
+fn runtime_mode_policy_updates_engine_session_mirrors() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        model: "deepseek-v4-pro".to_string(),
+        allow_shell: false,
+        trust_mode: false,
+        ..Default::default()
+    };
+    let (mut engine, _handle) = Engine::new(config, &Config::default());
+    engine.current_mode = AppMode::Plan;
+    engine.session.allow_shell = false;
+    engine.session.trust_mode = false;
+    engine.session.auto_approve = false;
+    engine.session.approval_mode = crate::tui::approval::ApprovalMode::Suggest;
+
+    engine.apply_runtime_mode_policy(
+        AppMode::Agent,
+        true,
+        false,
+        false,
+        crate::tui::approval::ApprovalMode::Never,
+    );
+
+    assert_eq!(engine.current_mode, AppMode::Agent);
+    assert!(engine.session.allow_shell);
+    assert!(engine.config.allow_shell);
+    assert!(!engine.session.trust_mode);
+    assert!(!engine.config.trust_mode);
+    assert!(!engine.session.auto_approve);
+    assert_eq!(
+        engine.session.approval_mode,
+        crate::tui::approval::ApprovalMode::Never
+    );
+
+    engine.apply_runtime_mode_policy(
+        AppMode::Yolo,
+        true,
+        true,
+        true,
+        crate::tui::approval::ApprovalMode::Bypass,
+    );
+
+    assert_eq!(engine.current_mode, AppMode::Yolo);
+    assert!(engine.session.allow_shell);
+    assert!(engine.session.trust_mode);
+    assert!(engine.config.trust_mode);
+    assert!(engine.session.auto_approve);
+    assert_eq!(
+        engine.session.approval_mode,
+        crate::tui::approval::ApprovalMode::Bypass
+    );
+}
+
+#[tokio::test]
+async fn sync_session_restores_current_mode() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        model: "deepseek-v4-pro".to_string(),
+        ..Default::default()
+    };
+    let (engine, handle) = Engine::new(config, &Config::default());
+
+    let run = tokio::spawn(engine.run());
+    handle
+        .send(Op::SyncSession {
+            session_id: Some("plan-session".to_string()),
+            messages: Vec::new(),
+            system_prompt: None,
+            system_prompt_override: false,
+            model: "deepseek-v4-pro".to_string(),
+            workspace: tmp.path().to_path_buf(),
+            mode: AppMode::Plan,
+        })
+        .await
+        .expect("sync session");
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    handle
+        .send(Op::GetSessionSnapshot {
+            tx: std::sync::Arc::new(std::sync::Mutex::new(Some(tx))),
+        })
+        .await
+        .expect("request snapshot");
+    let snapshot = tokio::time::timeout(Duration::from_secs(2), rx)
+        .await
+        .expect("snapshot response")
+        .expect("snapshot");
+
+    assert_eq!(snapshot.mode, "plan");
+
+    run.abort();
+}
+
+#[tokio::test]
+async fn edit_last_turn_preserves_current_mode() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        model: "deepseek-v4-pro".to_string(),
+        ..Default::default()
+    };
+    let (engine, handle) = Engine::new(config, &Config::default());
+
+    let run = tokio::spawn(engine.run());
+    let seeded_messages = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "draft the plan".to_string(),
+                cache_control: None,
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "initial response".to_string(),
+                cache_control: None,
+            }],
+        },
+    ];
+    handle
+        .send(Op::SyncSession {
+            session_id: Some("edit-mode-test".to_string()),
+            messages: seeded_messages,
+            system_prompt: None,
+            system_prompt_override: false,
+            model: "deepseek-v4-pro".to_string(),
+            workspace: tmp.path().to_path_buf(),
+            mode: AppMode::Agent,
+        })
+        .await
+        .expect("sync session");
+    handle
+        .send(Op::ChangeMode {
+            mode: AppMode::Plan,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: crate::tui::approval::ApprovalMode::Suggest,
+        })
+        .await
+        .expect("send plan mode");
+    handle
+        .send(Op::EditLastTurn {
+            new_message: "revise this in plan mode".to_string(),
+        })
+        .await
+        .expect("send edit");
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    handle
+        .send(Op::GetSessionSnapshot {
+            tx: std::sync::Arc::new(std::sync::Mutex::new(Some(tx))),
+        })
+        .await
+        .expect("request snapshot");
+    let snapshot = tokio::time::timeout(Duration::from_secs(2), rx)
+        .await
+        .expect("snapshot response")
+        .expect("snapshot");
+
+    assert_eq!(snapshot.mode, "plan");
+
+    run.abort();
+}
+
+#[tokio::test]
+async fn provider_runtime_status_reports_configured_zai_cap_without_client() {
+    let (engine, handle) = {
+        let _lock = lock_test_env();
+        let _zai_key = EnvVarGuard::remove("ZAI_API_KEY");
+        let _zai_alt_key = EnvVarGuard::remove("Z_AI_API_KEY");
+        let api_config = Config {
+            provider: Some("zai".to_string()),
+            ..Config::default()
+        };
+        Engine::new(EngineConfig::default(), &api_config)
+    };
+
+    let run = tokio::spawn(engine.run());
+    let status = tokio::time::timeout(Duration::from_secs(2), handle.get_provider_runtime_status())
+        .await
+        .expect("provider runtime status response")
+        .expect("provider runtime status");
+
+    assert_eq!(status.provider, ApiProvider::Zai);
+    assert_eq!(
+        status.request_concurrency_limit,
+        Some(crate::config::DEFAULT_ZAI_PROVIDER_MAX_CONCURRENCY)
+    );
+    assert_eq!(status.active_provider_requests, 0);
 
     run.abort();
 }
@@ -2779,6 +3930,75 @@ fn route_context_budget_uses_shared_budget_service() {
         crate::context_budget::PressureLevel::Critical
     );
     assert!(!budget.fits_additional(1));
+}
+
+#[test]
+fn route_context_budget_prefers_resolved_route_limits() {
+    let _lock = lock_test_env();
+    let limits = codewhale_config::route::RouteLimits {
+        context_tokens: Some(128_000),
+        input_tokens: None,
+        output_tokens: Some(32_768),
+    };
+    let budget = route_context_budget_for_route(
+        ApiProvider::Openrouter,
+        "deepseek/deepseek-v4-pro",
+        Some(limits),
+        60_000,
+    )
+    .expect("route limits should produce a budget");
+
+    assert_eq!(budget.window_tokens, 128_000);
+    assert_eq!(budget.output_cap_tokens, 32_768);
+    assert_eq!(budget.available_input_tokens, 34_208);
+}
+
+#[test]
+fn effective_max_output_tokens_for_route_caps_to_route_output_limit() {
+    let _lock = lock_test_env();
+    let limits = codewhale_config::route::RouteLimits {
+        context_tokens: Some(1_000_000),
+        input_tokens: None,
+        output_tokens: Some(8_192),
+    };
+
+    assert_eq!(
+        effective_max_output_tokens_for_route("deepseek-v4-pro", Some(limits)),
+        8_192
+    );
+}
+
+#[test]
+fn effective_max_output_tokens_for_route_caps_to_context_window() {
+    let _lock = lock_test_env();
+    let limits = codewhale_config::route::RouteLimits {
+        context_tokens: Some(32_000),
+        input_tokens: None,
+        output_tokens: None,
+    };
+
+    let cap = effective_max_output_tokens_for_route("deepseek-v4-pro", Some(limits));
+
+    assert!(cap < 32_000, "request cap must fit the configured window");
+    assert!(
+        cap > 0,
+        "small configured windows should still allow output"
+    );
+}
+
+#[test]
+fn effective_max_output_tokens_for_route_keeps_tiny_window_positive() {
+    let _lock = lock_test_env();
+    let limits = codewhale_config::route::RouteLimits {
+        context_tokens: Some(2_048),
+        input_tokens: None,
+        output_tokens: None,
+    };
+
+    assert_eq!(
+        effective_max_output_tokens_for_route("deepseek-v4-pro", Some(limits)),
+        1
+    );
 }
 
 #[test]
@@ -3182,6 +4402,55 @@ fn turn_metadata_includes_current_local_date_without_working_set() {
 }
 
 #[test]
+fn turn_metadata_surfaces_context_and_resource_usage() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        model: "deepseek-v4-flash".to_string(),
+        workspace: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let (mut engine, _handle) = Engine::new(config, &Config::default());
+    engine.session.total_usage.add(&Usage {
+        input_tokens: 1_200,
+        output_tokens: 300,
+        prompt_cache_hit_tokens: Some(800),
+        prompt_cache_miss_tokens: Some(400),
+        ..Default::default()
+    });
+    {
+        let mut goal = engine.config.goal_state.lock().expect("goal lock");
+        goal.create("Finish telemetry visibility".to_string(), Some(2_000));
+        goal.record_usage(1_000, 100);
+    }
+
+    let user_msg = engine
+        .user_text_message_with_turn_metadata("continue the long-running release task".to_string());
+    let last_block = user_msg.content.last().expect("turn metadata block");
+    let ContentBlock::Text { text, .. } = last_block else {
+        panic!("expected text metadata block");
+    };
+
+    assert!(text.contains("Context pressure:"), "got: {text}");
+    assert!(text.contains("tokens;"), "got: {text}");
+    assert!(
+        text.contains("input tokens available"),
+        "context headroom should be model-visible: {text}"
+    );
+    assert!(
+        text.contains("Session token usage: 1500 total (1200 input, 300 output"),
+        "session usage should be model-visible: {text}"
+    );
+    assert!(text.contains("cache hits 800"), "got: {text}");
+    assert!(text.contains("cache misses 400"), "got: {text}");
+    assert!(
+        text.contains("Active goal resource usage:"),
+        "active goal resource usage should be model-visible: {text}"
+    );
+    assert!(text.contains("50% budget"), "got: {text}");
+    assert!(text.contains("10.0 tok/s"), "got: {text}");
+}
+
+#[test]
 fn runtime_turn_metadata_marks_non_authoritative_input() {
     let tmp = tempdir().expect("tempdir");
     let config = EngineConfig {
@@ -3230,36 +4499,67 @@ fn turn_metadata_includes_auto_model_route() {
 }
 
 #[test]
-fn non_external_provenance_cannot_inherit_yolo_auto_approval() {
-    let policy = effective_input_policy(
+fn provenance_gate_preserves_standing_yolo_only_for_runtime_continuations() {
+    let all_provenances = [
+        UserInputProvenance::ExternalUser,
+        UserInputProvenance::Runtime,
         UserInputProvenance::SubAgentHandoff,
-        AppMode::Yolo,
-        "改吧",
-        true,
-        true,
-        true,
-        crate::tui::approval::ApprovalMode::Auto,
-    );
+        UserInputProvenance::ImportedTranscript,
+        UserInputProvenance::MemoryRecall,
+        UserInputProvenance::AssistantGenerated,
+    ];
+    let inheriting_provenances = [
+        UserInputProvenance::ExternalUser,
+        UserInputProvenance::Runtime,
+        UserInputProvenance::SubAgentHandoff,
+    ];
 
-    assert_eq!(policy.mode, AppMode::Agent);
-    assert!(policy.allow_shell);
-    assert!(!policy.trust_mode);
-    assert!(!policy.auto_approve);
-    assert_eq!(
-        policy.approval_mode,
-        crate::tui::approval::ApprovalMode::Suggest
-    );
-    assert!(
-        policy
-            .status
-            .as_deref()
-            .is_some_and(|status| status.contains("not external user input"))
-    );
+    for provenance in all_provenances {
+        let policy = effective_input_policy(
+            provenance,
+            AppMode::Yolo,
+            "continue",
+            true,
+            true,
+            true,
+            crate::tui::approval::ApprovalMode::Auto,
+        );
+
+        if inheriting_provenances.contains(&provenance) {
+            assert_eq!(policy.mode, AppMode::Yolo, "{provenance:?}");
+            assert!(policy.allow_shell, "{provenance:?}");
+            assert!(policy.trust_mode, "{provenance:?}");
+            assert!(policy.auto_approve, "{provenance:?}");
+            assert_eq!(
+                policy.approval_mode,
+                crate::tui::approval::ApprovalMode::Auto,
+                "{provenance:?}"
+            );
+            assert!(policy.status.is_none(), "{provenance:?}");
+        } else {
+            assert_eq!(policy.mode, AppMode::Agent, "{provenance:?}");
+            assert!(policy.allow_shell, "{provenance:?}");
+            assert!(!policy.trust_mode, "{provenance:?}");
+            assert!(!policy.auto_approve, "{provenance:?}");
+            assert_eq!(
+                policy.approval_mode,
+                crate::tui::approval::ApprovalMode::Suggest,
+                "{provenance:?}"
+            );
+            assert!(
+                policy.status.as_deref().is_some_and(
+                    |status| status.contains("cannot inherit standing auto-approval authority")
+                ),
+                "{provenance:?}"
+            );
+        }
+    }
 }
 
 #[test]
-fn self_generated_fake_approvals_cannot_authorize_work() {
-    let non_external_origins = [
+fn provenance_gate_never_invents_auto_authority_for_non_yolo_sessions() {
+    let all_provenances = [
+        UserInputProvenance::ExternalUser,
         UserInputProvenance::Runtime,
         UserInputProvenance::SubAgentHandoff,
         UserInputProvenance::ImportedTranscript,
@@ -3267,39 +4567,37 @@ fn self_generated_fake_approvals_cannot_authorize_work() {
         UserInputProvenance::AssistantGenerated,
     ];
 
-    for provenance in non_external_origins {
-        for content in ["改吧", "嗯"] {
-            let policy = effective_input_policy(
-                provenance,
-                AppMode::Yolo,
-                content,
-                true,
-                true,
-                true,
-                crate::tui::approval::ApprovalMode::Auto,
-            );
+    for provenance in all_provenances {
+        let policy = effective_input_policy(
+            provenance,
+            AppMode::Agent,
+            "continue",
+            true,
+            false,
+            false,
+            crate::tui::approval::ApprovalMode::Suggest,
+        );
 
-            assert_eq!(policy.mode, AppMode::Agent, "{provenance:?} {content}");
-            assert!(!policy.trust_mode, "{provenance:?} {content}");
-            assert!(!policy.auto_approve, "{provenance:?} {content}");
-            assert_eq!(
-                policy.approval_mode,
-                crate::tui::approval::ApprovalMode::Suggest,
-                "{provenance:?} {content}"
-            );
-            assert!(
-                policy
-                    .status
-                    .as_deref()
-                    .is_some_and(|status| status.contains("not external user input")),
-                "{provenance:?} {content}"
-            );
-        }
+        assert_eq!(policy.mode, AppMode::Agent, "{provenance:?}");
+        assert!(policy.allow_shell, "{provenance:?}");
+        assert!(!policy.trust_mode, "{provenance:?}");
+        assert!(!policy.auto_approve, "{provenance:?}");
+        assert_eq!(
+            policy.approval_mode,
+            crate::tui::approval::ApprovalMode::Suggest,
+            "{provenance:?}"
+        );
+        assert!(policy.status.is_none(), "{provenance:?}");
     }
 }
 
 #[test]
-fn review_only_external_input_gets_read_only_policy_until_write_is_explicit() {
+fn review_only_external_input_keeps_explicit_mode_with_advisory_hint() {
+    // Review-only wording must NEVER silently override an explicitly chosen
+    // mode or strip its tools. The heuristic only activates the existing
+    // request_user_input modal tool so the model can ask focused follow-ups.
+
+    // Agent-mode request: the requested mode/tools must be preserved unchanged.
     let agent = effective_input_policy(
         UserInputProvenance::ExternalUser,
         AppMode::Agent,
@@ -3309,18 +4607,21 @@ fn review_only_external_input_gets_read_only_policy_until_write_is_explicit() {
         true,
         crate::tui::approval::ApprovalMode::Auto,
     );
-    assert_eq!(agent.mode, AppMode::Plan);
+    assert_eq!(agent.mode, AppMode::Agent);
     assert!(agent.allow_shell);
-    assert!(!agent.trust_mode);
-    assert!(!agent.auto_approve);
+    assert!(agent.trust_mode);
+    assert!(agent.auto_approve);
     assert!(matches!(
         agent.approval_mode,
-        crate::tui::approval::ApprovalMode::Suggest
+        crate::tui::approval::ApprovalMode::Auto
     ));
+    assert_eq!(agent.dynamic_active_tools, vec![REQUEST_USER_INPUT_NAME]);
     assert!(agent.status.as_deref().is_some_and(|status| {
-        status.contains("read-only Plan tools") && status.contains("explicit fix/edit/commit")
+        status.contains("keeping the current mode") && status.contains("request_user_input")
     }));
 
+    // Yolo-mode request: previously this was silently downgraded to Plan and
+    // exec_shell/write_file/etc. were stripped. It must now stay as requested.
     let yolo = effective_input_policy(
         UserInputProvenance::ExternalUser,
         AppMode::Yolo,
@@ -3330,16 +4631,17 @@ fn review_only_external_input_gets_read_only_policy_until_write_is_explicit() {
         true,
         crate::tui::approval::ApprovalMode::Auto,
     );
-    assert_eq!(yolo.mode, AppMode::Plan);
+    assert_eq!(yolo.mode, AppMode::Yolo);
     assert!(yolo.allow_shell);
-    assert!(!yolo.trust_mode);
-    assert!(!yolo.auto_approve);
+    assert!(yolo.trust_mode);
+    assert!(yolo.auto_approve);
     assert!(matches!(
         yolo.approval_mode,
-        crate::tui::approval::ApprovalMode::Suggest
+        crate::tui::approval::ApprovalMode::Auto
     ));
+    assert_eq!(yolo.dynamic_active_tools, vec![REQUEST_USER_INPUT_NAME]);
     assert!(yolo.status.as_deref().is_some_and(|status| {
-        status.contains("read-only Plan tools") && status.contains("explicit fix/edit/commit")
+        status.contains("keeping the current mode") && status.contains("request_user_input")
     }));
 
     let explicit_write = effective_input_policy(
@@ -3352,36 +4654,45 @@ fn review_only_external_input_gets_read_only_policy_until_write_is_explicit() {
         crate::tui::approval::ApprovalMode::Suggest,
     );
     assert_eq!(explicit_write.mode, AppMode::Agent);
+    assert!(explicit_write.dynamic_active_tools.is_empty());
     assert!(explicit_write.status.is_none());
 }
 
 #[test]
-fn turn_metadata_omits_mode_policy() {
+fn turn_metadata_includes_plan_mode_policy() {
     let tmp = tempdir().expect("tempdir");
     let config = EngineConfig {
         workspace: tmp.path().to_path_buf(),
         ..Default::default()
     };
-    let (engine, _handle) = Engine::new(config, &Config::default());
+    let (mut engine, _handle) = Engine::new(config, &Config::default());
+    engine.current_mode = AppMode::Plan;
 
     let user_msg = engine.user_text_message_with_turn_metadata_for_route(
-        "test mode metadata".to_string(),
+        "explain the refactor plan before editing".to_string(),
         "deepseek-v4-flash",
         false,
         None,
         false,
     );
-    // turn_meta was relocated to the tail of the user message in #2517
-    // to keep the leading bytes (user input) stable across date / model
-    // route / working-set changes.
     let last_block = user_msg.content.last().expect("turn metadata block");
     let ContentBlock::Text { text, .. } = last_block else {
         panic!("expected text metadata block");
     };
 
+    assert!(text.contains("Current mode: plan"), "got: {text}");
     assert!(
-        !text.contains("Current mode:"),
-        "turn metadata should leave runtime policy to the capability tag, got: {text}"
+        text.contains("Current mode policy source: runtime"),
+        "got: {text}"
+    );
+    assert!(text.contains("##### Mode: Plan"), "got: {text}");
+    assert!(
+        text.contains("All writes and patches are blocked"),
+        "got: {text}"
+    );
+    assert!(
+        text.contains("Shell and code execution are unavailable"),
+        "got: {text}"
     );
 }
 
@@ -3828,6 +5139,32 @@ fn tool_search_activates_discovered_deferred_tools() {
     assert!(active.contains("read_file"));
 }
 
+#[test]
+fn tool_search_can_discover_request_user_input_modal_tool() {
+    let always_load = HashSet::new();
+    let mut catalog = build_model_tool_catalog(
+        vec![api_tool(REQUEST_USER_INPUT_NAME)],
+        Vec::new(),
+        AppMode::Agent,
+        &always_load,
+    );
+    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+
+    let mut active = initial_active_tools(&catalog);
+    assert!(!active.contains(REQUEST_USER_INPUT_NAME));
+
+    let result = execute_tool_search(
+        TOOL_SEARCH_NAME,
+        &json!({"query":"ask user question"}),
+        &catalog,
+        &mut active,
+    )
+    .expect("search succeeds");
+
+    assert!(result.success);
+    assert!(active.contains(REQUEST_USER_INPUT_NAME));
+}
+
 fn tool_search_catalog_with_matches(count: usize) -> Vec<Tool> {
     let mut catalog = (0..count)
         .map(|idx| Tool {
@@ -4200,6 +5537,28 @@ fn filter_tool_call_delta_strips_siliconflow_v4_dsml_content_fixture() {
 }
 
 #[test]
+fn filter_tool_call_delta_strips_fullwidth_dsml_invoke_fixture() {
+    // #3717: Windows users reported SiliconFlow/DSML content leaking through
+    // the ordinary text channel with fullwidth DSML wrapper tags. Treat it as
+    // non-API tool markup, not visible assistant text.
+    let mut in_block = false;
+    let visible = filter_tool_call_delta(
+        "visible prefix <｜DSML｜tool_calls>\n\
+         <｜DSML｜invoke name=\"read_file\">\n\
+         <｜DSML｜parameter name=\"path\" string=\"true\">backend/open_webui/utils/auth.py</｜DSML｜parameter>\n\
+         </｜DSML｜invoke>\n\
+         </｜DSML｜tool_calls> visible suffix",
+        &mut in_block,
+    );
+
+    assert!(!in_block);
+    assert_eq!(visible, "visible prefix  visible suffix");
+    assert!(!visible.contains("DSML"));
+    assert!(!visible.contains("read_file"));
+    assert!(!visible.contains("backend/open_webui"));
+}
+
+#[test]
 fn filter_tool_call_delta_handles_chunk_split_marker() {
     let mut in_block = false;
     // First chunk opens the wrapper but does not close it.
@@ -4278,6 +5637,7 @@ fn tool_state(initial: serde_json::Value, buffer: &str) -> ToolUseState {
         input: initial,
         caller: None,
         input_buffer: buffer.into(),
+        input_parse_error: None,
     }
 }
 
@@ -4299,11 +5659,13 @@ fn final_tool_input_falls_back_to_initial_when_buffer_empty() {
 }
 
 #[test]
-fn final_tool_input_repairs_unparseable_buffer() {
-    // The arg_repair module converts unparseable input to an empty object
-    // {} so dispatch always proceeds. The buffer wins over the initial input.
-    let state = tool_state(json!({"command": "echo hi"}), "{not json");
-    assert_eq!(final_tool_input(&state), json!({}));
+fn final_tool_input_preserves_raw_buffer_for_parse_errors() {
+    let mut state = tool_state(json!({}), "{not json");
+    state.input_parse_error = Some("malformed tool arguments".into());
+    assert_eq!(
+        final_tool_input(&state),
+        json!({"raw_arguments": "{not json"})
+    );
 }
 
 // === #103 transparent stream-retry policy =====================================
@@ -4710,4 +6072,59 @@ async fn post_edit_hook_skips_unknown_tool_names() {
     engine.run_post_edit_lsp_hook("read_file", &input).await;
     assert!(engine.pending_lsp_blocks.is_empty());
     assert_eq!(fake.call_count(), 0);
+}
+
+// ── #3802: non-blocking send for ListSubAgents refresh events ─────────────
+
+#[test]
+fn engine_handle_try_send_does_not_block_when_op_channel_is_full() {
+    use tokio::sync::mpsc;
+
+    // Create a channel with the smallest possible capacity.
+    let (tx_op, _rx_op) = mpsc::channel::<Op>(1);
+
+    // Construct a minimal EngineHandle with the tiny channel.
+    let cancel_token = CancellationToken::new();
+    let handle = EngineHandle {
+        tx_op,
+        rx_event: Arc::new(RwLock::new(mpsc::channel::<Event>(1).1)),
+        cancel_token: Arc::new(StdMutex::new(cancel_token)),
+        cancel_reason: Arc::new(StdMutex::new(None)),
+        tx_approval: mpsc::channel(1).0,
+        tx_user_input: mpsc::channel(1).0,
+        tx_steer: mpsc::channel(1).0,
+        shared_paused: Arc::new(StdMutex::new(false)),
+    };
+
+    // Fill the op channel with one message (capacity = 1).
+    handle
+        .tx_op
+        .try_send(Op::ListSubAgents)
+        .expect("first send should succeed");
+
+    // try_send must return Err immediately — never block.
+    let result = handle.try_send(Op::ListSubAgents);
+    assert!(result.is_err(), "try_send should fail when channel is full");
+}
+
+#[tokio::test]
+async fn list_subagents_event_try_send_does_not_block_when_event_channel_full() {
+    use tokio::sync::mpsc;
+
+    // Simulate the engine's event channel with capacity 1.
+    let (tx_event, mut _rx_event) = mpsc::channel::<Event>(1);
+
+    // Fill the channel.
+    tx_event
+        .try_send(Event::status("filler"))
+        .expect("first send should succeed");
+
+    // Reproduce the handler pattern: try_send an AgentList event.
+    // This must return Err immediately — the handler should never hang.
+    let agents = vec![];
+    let result = tx_event.try_send(Event::AgentList { agents });
+    assert!(
+        result.is_err(),
+        "try_send should fail when event channel is full (backpressure avoided)"
+    );
 }

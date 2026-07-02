@@ -25,6 +25,7 @@
 //! — probing a binary involves a `Command::output` per candidate and
 //! we'd rather not pay that on every model turn.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -68,6 +69,7 @@ pub fn probe_executable_with_flag(spec: &str, version_flag: &str) -> bool {
         return false;
     };
     let mut cmd = Command::new(program);
+    crate::utils::suppress_console_window(&mut cmd);
     for arg in parts {
         cmd.arg(arg);
     }
@@ -80,6 +82,61 @@ pub fn probe_executable_with_flag(spec: &str, version_flag: &str) -> bool {
     cmd.stderr(std::process::Stdio::null());
 
     matches!(cmd.status(), Ok(status) if status.success())
+}
+
+fn executable_path_candidates(program: &str) -> Vec<PathBuf> {
+    let program_path = Path::new(program);
+    if program_path.components().count() > 1 {
+        return vec![program_path.to_path_buf()];
+    }
+
+    let Some(path) = std::env::var_os("PATH") else {
+        return vec![PathBuf::from(program)];
+    };
+
+    let mut candidates = Vec::new();
+    for dir in std::env::split_paths(&path) {
+        let bare = dir.join(program);
+        candidates.push(bare.clone());
+
+        #[cfg(windows)]
+        if Path::new(program).extension().is_none() {
+            let pathext =
+                std::env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+            for ext in pathext.to_string_lossy().split(';') {
+                if ext.is_empty() {
+                    continue;
+                }
+                candidates.push(bare.with_extension(ext.trim_start_matches('.')));
+            }
+        }
+    }
+
+    candidates
+}
+
+fn resolve_executable_path(spec: &str, version_flag: &str) -> Option<String> {
+    let mut parts = spec.split_whitespace();
+    let program = parts.next()?;
+    let args: Vec<&str> = parts.collect();
+
+    for candidate in executable_path_candidates(program) {
+        if !candidate.is_file() {
+            continue;
+        }
+
+        let mut cmd = Command::new(&candidate);
+        cmd.args(&args)
+            .arg(version_flag)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        if matches!(cmd.status(), Ok(status) if status.success()) {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+
+    None
 }
 
 /// Resolve the Python interpreter once per process. Returns the
@@ -169,12 +226,12 @@ pub fn resolve_pandoc() -> Option<String> {
     static CACHE: OnceLock<Option<String>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            if probe_executable("pandoc") {
+            if let Some(path) = resolve_executable_path("pandoc", "--version") {
                 tracing::info!(
                     target: "tool_dependencies",
                     "Resolved pandoc binary for pandoc_convert",
                 );
-                Some("pandoc".to_string())
+                Some(path)
             } else {
                 tracing::warn!(
                     target: "tool_dependencies",
@@ -258,6 +315,7 @@ pub trait ExternalTool {
         let spec = Self::resolve()?;
         let (program, fixed_args) = split_interpreter_spec(&spec);
         let mut cmd = Command::new(&program);
+        crate::utils::suppress_console_window(&mut cmd);
         for arg in &fixed_args {
             cmd.arg(arg);
         }
@@ -299,6 +357,7 @@ pub trait ExternalTool {
         let spec = Self::resolve()?;
         let (program, fixed_args) = split_interpreter_spec(&spec);
         let mut cmd = tokio::process::Command::new(&program);
+        crate::utils::suppress_tokio_console_window(&mut cmd);
         for arg in &fixed_args {
             cmd.arg(arg);
         }

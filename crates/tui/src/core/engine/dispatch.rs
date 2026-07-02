@@ -72,6 +72,60 @@ pub(super) struct ParallelToolResult {
     pub(super) results: Vec<ParallelToolResultEntry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ToolApprovalStamp {
+    ApprovedByUser,
+    ApprovedWithPolicy,
+}
+
+impl ToolApprovalStamp {
+    fn decision(self) -> &'static str {
+        match self {
+            Self::ApprovedByUser => "approved_by_user",
+            Self::ApprovedWithPolicy => "approved_with_policy",
+        }
+    }
+
+    fn model_visible_note(self) -> &'static str {
+        match self {
+            Self::ApprovedByUser => {
+                "[approval] This tool call required approval and was approved by the user before execution."
+            }
+            Self::ApprovedWithPolicy => {
+                "[approval] This tool call required approval and was approved by the user with an adjusted execution policy before execution."
+            }
+        }
+    }
+}
+
+pub(super) fn stamp_tool_result_approval(result: &mut ToolResult, approval: ToolApprovalStamp) {
+    let approval_metadata = json!({
+        "required": true,
+        "decision": approval.decision(),
+        "model_visible": true,
+    });
+    let metadata = result.metadata.get_or_insert_with(|| json!({}));
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("approval".to_string(), approval_metadata);
+    } else {
+        let prior = std::mem::replace(metadata, json!({}));
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("_prior".to_string(), prior);
+            object.insert("approval".to_string(), approval_metadata);
+        }
+    }
+
+    let note = approval.model_visible_note();
+    if result.content.starts_with("[approval] ") {
+        return;
+    }
+    if result.content.is_empty() {
+        result.content = note.to_string();
+    } else {
+        result.content = format!("{note}\n\n{}", result.content);
+    }
+}
+
 // Hold the lock guard for the duration of a tool execution.
 // The inner guards are held for RAII purposes (dropped when the guard is dropped).
 pub(super) enum ToolExecGuard<'a> {
@@ -111,7 +165,7 @@ fn mentions_mode_word(lower: &str) -> bool {
 }
 
 pub(super) fn format_tool_error(err: &ToolError, tool_name: &str) -> String {
-    match err {
+    let message = match err {
         ToolError::InvalidInput { message } => {
             format!("Invalid input for tool '{tool_name}': {message}")
         }
@@ -159,7 +213,103 @@ pub(super) fn format_tool_error(err: &ToolError, tool_name: &str) -> String {
                 )
             }
         }
+    };
+
+    with_transient_tool_fallback_hint(message, err, tool_name)
+}
+
+fn with_transient_tool_fallback_hint(message: String, err: &ToolError, tool_name: &str) -> String {
+    if message_already_has_recovery_hint(&message) {
+        return message;
     }
+
+    let Some(hint) = transient_tool_fallback_hint(err, tool_name, &message) else {
+        return message;
+    };
+
+    format!("{message} Fallback: {hint}")
+}
+
+fn message_already_has_recovery_hint(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("recovery:") || lower.contains("fallback:")
+}
+
+fn transient_tool_fallback_hint(
+    err: &ToolError,
+    tool_name: &str,
+    formatted_message: &str,
+) -> Option<&'static str> {
+    if !is_transient_tool_failure(err, formatted_message) {
+        return None;
+    }
+
+    let lower_tool = tool_name.to_ascii_lowercase();
+    if lower_tool.contains("web_search")
+        || lower_tool.contains("web_run")
+        || lower_tool == "web.run"
+    {
+        return Some(
+            "after one retry, switch to a direct URL/open/fetch path or cached context instead of repeating the same search.",
+        );
+    }
+
+    if lower_tool.contains("fetch_url") {
+        return Some(
+            "after one retry, try a narrower URL/source, use search results or cached context, or state the access limit instead of repeating the same request.",
+        );
+    }
+
+    if lower_tool.contains("file_search") || lower_tool.contains("grep") {
+        return Some(
+            "after one retry, narrow the query/path or inspect likely files directly instead of repeating the same search unchanged.",
+        );
+    }
+
+    if lower_tool.contains("exec_shell")
+        || lower_tool.contains("run_tests")
+        || lower_tool.contains("run_verifiers")
+    {
+        return Some(
+            "after one retry, narrow the command/scope, increase timeout only for expected long runs, or switch to file-level evidence.",
+        );
+    }
+
+    if lower_tool.contains("agent") {
+        return Some(
+            "after one retry, reduce delegated scope or continue in the parent context instead of repeatedly spawning the same agent.",
+        );
+    }
+
+    Some(
+        "after one retry, choose a different tool or narrower strategy instead of repeating the same call unchanged.",
+    )
+}
+
+fn is_transient_tool_failure(err: &ToolError, formatted_message: &str) -> bool {
+    if matches!(err, ToolError::Timeout { .. }) {
+        return true;
+    }
+
+    if !matches!(err, ToolError::ExecutionFailed { .. }) {
+        return false;
+    }
+
+    let lower = formatted_message.to_ascii_lowercase();
+    [
+        "timeout",
+        "timed out",
+        "request failed",
+        "connection",
+        "network",
+        "http 429",
+        "rate limit",
+        "http 5",
+        "anti-bot",
+        "captcha",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 // === Streaming-buffer parsing =========================================
@@ -177,6 +327,9 @@ pub(super) fn format_tool_error(err: &ToolError, tool_name: &str) -> String {
 ///      (the per-delta parser has already mirrored the most recent valid
 ///      partial parse into `tool_state.input`).
 pub(super) fn final_tool_input(state: &ToolUseState) -> serde_json::Value {
+    if state.input_parse_error.is_some() {
+        return malformed_tool_arguments_input(&state.input_buffer);
+    }
     if !state.input_buffer.trim().is_empty()
         && let Some(parsed) = parse_tool_input(&state.input_buffer)
     {
@@ -209,6 +362,14 @@ pub(super) fn parse_tool_input(buffer: &str) -> Option<serde_json::Value> {
     }
     extract_json_segment(trimmed)
         .and_then(|segment| serde_json::from_str::<serde_json::Value>(&segment).ok())
+}
+
+pub(super) fn malformed_tool_arguments_input(buffer: &str) -> serde_json::Value {
+    json!({ "raw_arguments": buffer })
+}
+
+pub(super) fn malformed_tool_arguments_error(buffer: &str) -> String {
+    format!("malformed tool arguments from model: expected valid JSON, got {buffer:?}")
 }
 
 fn strip_code_fences(text: &str) -> Option<String> {

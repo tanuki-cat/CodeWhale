@@ -49,19 +49,20 @@ use crate::client::{
 use crate::commands;
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::config::{
-    ApiProvider, Config, DEFAULT_NVIDIA_NIM_BASE_URL, ProviderConfig, ProvidersConfig,
-    UpdateConfig, provider_capability, save_provider_auth_mode_for,
+    ApiProvider, Config, ProviderConfig, ProvidersConfig, UpdateConfig, provider_capability,
+    save_provider_auth_mode_for,
 };
 use crate::config_ui::{self, ConfigUiMode, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
 use crate::core::events::Event as EngineEvent;
-use crate::core::ops::{Op, USER_SHELL_TOOL_ID_PREFIX};
+use crate::core::ops::{Op, ProviderRuntimeStatus, USER_SHELL_TOOL_ID_PREFIX};
 use crate::hooks::{HookEvent, HookExecutor, TurnEndPayloadInput, TurnEndTotals};
 use crate::llm_client::LlmClient;
 use crate::localization::{MessageId, tr};
 use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt, Usage};
 use crate::palette;
 use crate::prompts;
+use crate::route_runtime::{resolve_route_candidate, resolve_runtime_route};
 use crate::session_manager::{
     OfflineQueueState, QueuedSessionMessage, SavedSession, SessionManager,
     create_saved_session_with_id_and_mode, create_saved_session_with_mode, update_session,
@@ -220,9 +221,11 @@ fn should_auto_approve_approval_request(
     grouping_key: &str,
     approval_force_prompt: bool,
 ) -> bool {
-    !approval_force_prompt
-        && (is_session_approved_for_tool(app, tool_name, grouping_key)
-            || app.approval_mode == ApprovalMode::Auto)
+    !approval_force_prompt && is_session_approved_for_tool(app, tool_name, grouping_key)
+}
+
+fn app_auto_approve_enabled(app: &App) -> bool {
+    app.mode == AppMode::Yolo || app.approval_mode == ApprovalMode::Bypass
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +333,8 @@ const TERMINAL_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TERMINAL_INPUT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 const TERMINAL_INPUT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_INPUT_RECOVERY_COOLDOWN: Duration = Duration::from_secs(10);
+const TERMINAL_INPUT_CHILD_PAUSE_TIMEOUT: Duration = Duration::from_millis(500);
+const TERMINAL_INPUT_CHILD_PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_ENGINE_EVENTS_PER_DRAIN: usize = 128;
 
 enum TerminalInputMessage {
@@ -341,34 +346,52 @@ enum TerminalInputMessage {
 struct TerminalInputPump {
     rx: std::sync::mpsc::Receiver<TerminalInputMessage>,
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    paused_ack: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     last_alive_at: Cell<Instant>,
 }
 
+struct TerminalInputPumpParts {
+    rx: std::sync::mpsc::Receiver<TerminalInputMessage>,
+    stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    paused_ack: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
 impl TerminalInputPump {
     fn spawn() -> io::Result<Self> {
-        let (rx, stop, handle) = Self::spawn_parts()?;
+        let parts = Self::spawn_parts()?;
         Ok(Self {
-            rx,
-            stop,
-            handle: Some(handle),
+            rx: parts.rx,
+            stop: parts.stop,
+            paused: parts.paused,
+            paused_ack: parts.paused_ack,
+            handle: Some(parts.handle),
             last_alive_at: Cell::new(Instant::now()),
         })
     }
 
-    fn spawn_parts() -> io::Result<(
-        std::sync::mpsc::Receiver<TerminalInputMessage>,
-        Arc<AtomicBool>,
-        JoinHandle<()>,
-    )> {
+    fn spawn_parts() -> io::Result<TerminalInputPumpParts> {
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let paused_ack = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let thread_paused = Arc::clone(&paused);
+        let thread_paused_ack = Arc::clone(&paused_ack);
         let handle = thread::Builder::new()
             .name("codewhale-terminal-input".to_string())
             .spawn(move || {
                 let mut last_heartbeat = Instant::now();
                 while !thread_stop.load(Ordering::Acquire) {
+                    if thread_paused.load(Ordering::Acquire) {
+                        thread_paused_ack.store(true, Ordering::Release);
+                        thread::sleep(TERMINAL_INPUT_CHILD_PAUSE_POLL_INTERVAL);
+                        continue;
+                    }
+                    thread_paused_ack.store(false, Ordering::Release);
                     match event::poll(TERMINAL_INPUT_POLL_INTERVAL) {
                         Ok(true) => match event::read() {
                             Ok(event) => {
@@ -400,7 +423,13 @@ impl TerminalInputPump {
                     }
                 }
             })?;
-        Ok((rx, stop, handle))
+        Ok(TerminalInputPumpParts {
+            rx,
+            stop,
+            paused,
+            paused_ack,
+            handle,
+        })
     }
 
     fn recv_timeout(&self, timeout: Duration) -> io::Result<Option<Event>> {
@@ -461,14 +490,46 @@ impl TerminalInputPump {
         now.saturating_duration_since(self.last_alive_at.get())
     }
 
+    fn pause_for_child_terminal(&self) -> io::Result<()> {
+        self.paused.store(true, Ordering::Release);
+        if self.handle.is_none() {
+            self.paused_ack.store(true, Ordering::Release);
+            self.mark_alive();
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + TERMINAL_INPUT_CHILD_PAUSE_TIMEOUT;
+        while !self.paused_ack.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                self.paused_ack.store(false, Ordering::Release);
+                self.paused.store(false, Ordering::Release);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "terminal input pump did not pause before launching editor",
+                ));
+            }
+            thread::sleep(TERMINAL_INPUT_CHILD_PAUSE_POLL_INTERVAL);
+        }
+        self.mark_alive();
+        Ok(())
+    }
+
+    fn resume_after_child_terminal(&self) {
+        self.paused_ack.store(false, Ordering::Release);
+        self.paused.store(false, Ordering::Release);
+        self.mark_alive();
+    }
+
     #[cfg(target_os = "windows")]
     fn restart_detached(&mut self) -> io::Result<()> {
         self.stop.store(true, Ordering::Release);
         let _ = self.handle.take();
-        let (rx, stop, handle) = Self::spawn_parts()?;
-        self.rx = rx;
-        self.stop = stop;
-        self.handle = Some(handle);
+        let parts = Self::spawn_parts()?;
+        self.rx = parts.rx;
+        self.stop = parts.stop;
+        self.paused = parts.paused;
+        self.paused_ack = parts.paused_ack;
+        self.handle = Some(parts.handle);
         self.last_alive_at.set(Instant::now());
         Ok(())
     }
@@ -507,6 +568,15 @@ fn try_next_terminal_event(
         return Ok(Some(event));
     }
     input.try_recv()
+}
+
+fn drain_terminal_input_queue(
+    input: &TerminalInputPump,
+    pending: &mut VecDeque<Event>,
+) -> io::Result<()> {
+    pending.clear();
+    while input.try_recv()?.is_some() {}
+    Ok(())
 }
 
 /// Run the interactive TUI event loop.
@@ -663,6 +733,13 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
     let mut app = App::new(options.clone(), config);
     sync_config_provider_from_app(config, &app);
 
+    // One-time Fleet + Hotbar intro for returning (non-resuming) users. First-
+    // time users see it when they finish onboarding. Gated by a persisted flag,
+    // so it shows exactly once and never inside a resumed session transcript.
+    if options.resume_session_id.is_none() {
+        app.maybe_show_feature_intro();
+    }
+
     // Load existing session if resuming.
     if let Some(ref session_id) = options.resume_session_id
         && let Ok(manager) = SessionManager::default_location()
@@ -814,6 +891,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
                 system_prompt_override: false,
                 model: app.model.clone(),
                 workspace: app.workspace.clone(),
+                mode: app.mode,
             })
             .await;
     }
@@ -871,7 +949,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
         execute!(terminal.backend_mut(), DisableMouseCapture)?;
     }
     if use_bracketed_paste {
-        execute!(terminal.backend_mut(), DisableBracketedPaste)?;
+        disable_bracketed_paste_mode(terminal.backend_mut());
     }
     terminal.show_cursor()?;
     drop(terminal);
@@ -1060,7 +1138,7 @@ impl Drop for TerminalCleanupGuard {
             let _ = execute!(stdout, DisableMouseCapture);
         }
         if self.use_bracketed_paste {
-            let _ = execute!(stdout, DisableBracketedPaste);
+            disable_bracketed_paste_mode(&mut stdout);
         }
         let _ = execute!(stdout, crossterm::cursor::Show);
     }
@@ -1092,6 +1170,54 @@ fn is_memory_quick_add(input: &str) -> bool {
     !trimmed.trim_start_matches('#').trim().is_empty()
 }
 
+fn should_intercept_memory_quick_add(config: &Config, input: &str) -> bool {
+    config.memory_enabled() && !config.moraine_fallback() && is_memory_quick_add(input)
+}
+
+#[cfg(test)]
+mod memory_quick_add_tests {
+    use super::should_intercept_memory_quick_add;
+    use crate::config::Config;
+
+    #[test]
+    fn memory_quick_add_interception_respects_moraine_fallback() {
+        let enabled: Config = toml::from_str(
+            r#"
+            [memory]
+            enabled = true
+            "#,
+        )
+        .expect("parse enabled memory config");
+        assert!(should_intercept_memory_quick_add(
+            &enabled,
+            "# remember this"
+        ));
+
+        let moraine: Config = toml::from_str(
+            r#"
+            [memory]
+            enabled = true
+            moraine_fallback = true
+            "#,
+        )
+        .expect("parse moraine memory config");
+        assert!(!should_intercept_memory_quick_add(
+            &moraine,
+            "# remember this"
+        ));
+
+        let disabled: Config = Config::default();
+        assert!(!should_intercept_memory_quick_add(
+            &disabled,
+            "# remember this"
+        ));
+        assert!(!should_intercept_memory_quick_add(
+            &enabled,
+            "## Markdown heading"
+        ));
+    }
+}
+
 /// Persist a `# foo` quick-add to the memory file and surface a status
 /// note to the user. Errors land in the same status channel so a missing
 /// memory directory becomes visible without crashing the composer.
@@ -1116,6 +1242,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
     let max_subagents = app.max_subagents.clamp(1, crate::config::MAX_SUBAGENTS);
     EngineConfig {
         model: app.model.clone(),
+        active_route_limits: app.active_route_limits,
         workspace: app.workspace.clone(),
         allow_shell: app.allow_shell,
         trust_mode: app.trust_mode,
@@ -1181,6 +1308,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         ),
         prefer_bwrap: config.prefer_bwrap.unwrap_or(false),
         memory_enabled: config.memory_enabled(),
+        moraine_fallback: config.moraine_fallback(),
         memory_path: config.memory_path(),
         speech_output_dir: config.speech_output_dir(),
         vision_config: config.vision_model_config(),
@@ -1299,26 +1427,42 @@ async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManag
     entries.extend(active_reasoning_task_entries(app));
     entries.extend(active_rlm_task_entries(app));
 
-    if let Some(shell_mgr) = app.runtime_services.shell_manager.as_ref()
-        && let Ok(mut mgr) = shell_mgr.lock()
-    {
-        for job in mgr.list_jobs() {
-            if !matches!(job.status, crate::tools::shell::ShellStatus::Running) {
-                continue;
-            }
-            entries.push(TaskPanelEntry {
-                id: job.id,
-                status: "running".to_string(),
-                prompt_summary: format!("shell: {}", job.command),
-                duration_ms: Some(job.elapsed_ms),
-                kind: TaskPanelEntryKind::Background,
-                stale: job.stale,
-                elapsed_since_output_ms: job.elapsed_since_output_ms,
-                owner_agent_id: job.owner_agent_id,
-                owner_agent_name: job.owner_agent_name,
-            });
-        }
-    }
+    // #3804: this is a render-only read of shell jobs and must not block the
+    // async UI loop on the shell manager's std::sync Mutex. Use try_lock; on
+    // contention, retain the previous frame's background shell entries so
+    // running shells don't flicker out of the Work panel. Shell ownership,
+    // cancellation, approval state, and output capture never depend on this
+    // refresh succeeding.
+    let prev_shell_entries: Vec<TaskPanelEntry> = app
+        .task_panel
+        .iter()
+        .filter(|entry| matches!(entry.kind, TaskPanelEntryKind::Background))
+        .cloned()
+        .collect();
+    let shell_entries: Vec<TaskPanelEntry> = match app.runtime_services.shell_manager.as_ref() {
+        Some(shell_mgr) => match shell_mgr.try_lock() {
+            Ok(mut mgr) => mgr
+                .list_jobs()
+                .into_iter()
+                .filter(|job| matches!(job.status, crate::tools::shell::ShellStatus::Running))
+                .map(|job| TaskPanelEntry {
+                    id: job.id,
+                    status: "running".to_string(),
+                    prompt_summary: format!("shell: {}", job.command),
+                    duration_ms: Some(job.elapsed_ms),
+                    kind: TaskPanelEntryKind::Background,
+                    stale: job.stale,
+                    elapsed_since_output_ms: job.elapsed_since_output_ms,
+                    owner_agent_id: job.owner_agent_id,
+                    owner_agent_name: job.owner_agent_name,
+                })
+                .collect(),
+            // Contended: keep the last known snapshot rather than blocking.
+            Err(_) => prev_shell_entries,
+        },
+        None => Vec::new(),
+    };
+    entries.extend(shell_entries);
 
     app.task_panel = entries;
 }
@@ -1327,8 +1471,11 @@ fn refresh_shell_exec_live_output(app: &mut App) -> bool {
     let Some(shell_mgr) = app.runtime_services.shell_manager.as_ref().cloned() else {
         return false;
     };
+    // #3804: render-only read — try_lock so a contended shell Mutex can never
+    // block the async UI loop; skip this frame's live-output update on
+    // contention (the next refresh picks it up).
     let jobs = {
-        let Ok(mut mgr) = shell_mgr.lock() else {
+        let Ok(mut mgr) = shell_mgr.try_lock() else {
             return false;
         };
         mgr.list_jobs()
@@ -2111,6 +2258,7 @@ async fn run_event_loop(
                         tool_catalog,
                         base_url,
                     } => {
+                        let pending_turn_route = app.pending_turn_route.take();
                         app.session.last_tool_catalog = tool_catalog;
                         app.session.last_base_url = base_url;
                         let was_locally_cancelled = app.suppress_stream_events_until_turn_complete;
@@ -2226,7 +2374,15 @@ async fn run_event_loop(
                         app.session.last_prompt_cache_hit_tokens = usage.prompt_cache_hit_tokens;
                         app.session.last_prompt_cache_miss_tokens = usage.prompt_cache_miss_tokens;
                         app.session.last_reasoning_replay_tokens = usage.reasoning_replay_tokens;
+                        let (provider, model, auto_model) = pending_turn_route
+                            .map(|(provider, model, auto_model)| {
+                                (Some(provider), Some(model), auto_model)
+                            })
+                            .unwrap_or((None, None, false));
                         app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
+                            provider,
+                            model,
+                            auto_model,
                             input_tokens: usage.input_tokens,
                             output_tokens: usage.output_tokens,
                             cache_hit_tokens: usage.prompt_cache_hit_tokens,
@@ -2733,7 +2889,7 @@ async fn run_event_loop(
                         let view_agents = subagent_view_agents(app, &app.subagent_cache);
                         if app.view_stack.update_subagents(&view_agents) {
                             app.status_message =
-                                Some(format!("Sub-agents: {} total", view_agents.len()));
+                                Some(format!("Fleet workers: {} total", view_agents.len()));
                         }
                         // Individual spawn/complete events already log to history;
                         // full list available via /agents command.
@@ -2792,7 +2948,7 @@ async fn run_event_loop(
                             approval_force_prompt,
                         ) {
                             log_sensitive_event(
-                                "tool.approval.auto_approve",
+                                "tool.approval.auto_approve_session",
                                 serde_json::json!({
                                     "tool_name": tool_name,
                                     "approval_key": approval_key,
@@ -2876,8 +3032,8 @@ async fn run_event_loop(
                         blocked_network,
                         blocked_write,
                     } => {
-                        // In YOLO mode, auto-elevate to full access
-                        if app.approval_mode == ApprovalMode::Auto {
+                        // Auto-approved modes may retry denied tools without another prompt.
+                        if app_auto_approve_enabled(app) {
                             log_sensitive_event(
                                 "tool.sandbox.auto_elevate",
                                 serde_json::json!({
@@ -2951,6 +3107,7 @@ async fn run_event_loop(
                         system_prompt_override: false,
                         model: app.model.clone(),
                         workspace: app.workspace.clone(),
+                        mode: app.mode,
                     })
                     .await;
             }
@@ -2986,8 +3143,11 @@ async fn run_event_loop(
         }
         // #freeze: one trailing-edge sub-agent list refresh per drain, no
         // matter how many spawn/complete/mailbox events arrived this batch.
+        // #3802: non-blocking send — ListSubAgents is a refresh op that can
+        // be dropped when the op channel is full; the next drain cycle
+        // will re-request.
         if subagent_list_refresh_requested {
-            let _ = engine_handle.send(Op::ListSubAgents).await;
+            let _ = engine_handle.try_send(Op::ListSubAgents);
         }
 
         if let Some(next) = queued_to_send {
@@ -3124,7 +3284,7 @@ async fn run_event_loop(
         }
         if app.needs_redraw && draw_wait.is_none() {
             let was_full_repaint = force_terminal_repaint;
-            draw_app_frame_inner(terminal, app, force_terminal_repaint)?;
+            draw_app_frame_inner(terminal, app, config, force_terminal_repaint)?;
             force_terminal_repaint = false;
             if was_full_repaint {
                 draws_since_last_full_repaint = 0;
@@ -3354,7 +3514,7 @@ async fn run_event_loop(
                     backend.force_size(new_size);
                     backend.set_terminal_size(new_size);
                 }
-                draw_app_frame_inner(terminal, app, true)?;
+                draw_app_frame_inner(terminal, app, config, true)?;
                 draws_since_last_full_repaint = 0;
                 {
                     let backend = terminal.backend_mut();
@@ -3416,39 +3576,39 @@ async fn run_event_loop(
             if app.view_stack.is_empty()
                 && let Some(card) = app.decision_card.as_mut()
             {
-                match key.code {
-                    KeyCode::Char(c @ '1'..='9') => {
-                        let n = (c as u8 - b'1' + 1) as usize;
-                        card.select_number(n);
-                        card.confirm();
-                        app.status_message = card
-                            .confirmed_label()
-                            .map(|label| format!("Selected: {label}"));
-                        app.decision_card = None;
-                        app.needs_redraw = true;
+                if let Some(n) = decision_card_number_from_key(&key) {
+                    card.select_number(n);
+                    card.confirm();
+                    app.status_message = card
+                        .confirmed_label()
+                        .map(|label| format!("Selected: {label}"));
+                    app.decision_card = None;
+                    app.needs_redraw = true;
+                } else {
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            card.select_next();
+                            app.needs_redraw = true;
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            card.select_prev();
+                            app.needs_redraw = true;
+                        }
+                        KeyCode::Enter => {
+                            card.confirm();
+                            app.status_message = card
+                                .confirmed_label()
+                                .map(|label| format!("Selected: {label}"));
+                            app.decision_card = None;
+                            app.needs_redraw = true;
+                        }
+                        KeyCode::Esc => {
+                            app.decision_card = None;
+                            app.status_message = Some("Decision cancelled".to_string());
+                            app.needs_redraw = true;
+                        }
+                        _ => {}
                     }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        card.select_next();
-                        app.needs_redraw = true;
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        card.select_prev();
-                        app.needs_redraw = true;
-                    }
-                    KeyCode::Enter => {
-                        card.confirm();
-                        app.status_message = card
-                            .confirmed_label()
-                            .map(|label| format!("Selected: {label}"));
-                        app.decision_card = None;
-                        app.needs_redraw = true;
-                    }
-                    KeyCode::Esc => {
-                        app.decision_card = None;
-                        app.status_message = Some("Decision cancelled".to_string());
-                        app.needs_redraw = true;
-                    }
-                    _ => {}
                 }
                 submit_initial_input_if_ready(app, config, &engine_handle).await?;
                 continue;
@@ -3558,6 +3718,7 @@ async fn run_event_loop(
                                                 system_prompt_override: false,
                                                 model: app.model.clone(),
                                                 workspace: app.workspace.clone(),
+                                                mode: app.mode,
                                             })
                                             .await;
                                     }
@@ -3933,11 +4094,17 @@ async fn run_event_loop(
                 {
                     continue;
                 }
-                // Bare `v` / `V` no longer opens the tool-details pager — that
-                // path is owned exclusively by `Alt+V` at the lower arm, so
-                // the letter `v` is freely usable as the first character of
-                // a message. `details_shortcut_modifiers` previously allowed
-                // empty/Shift here, eating the keystroke on empty composers.
+                // This detail shortcut intentionally precedes vim-normal-mode
+                // handling: visual selection has no useful empty-composer
+                // target, while selected tool cards do.
+                KeyCode::Char('v')
+                    if key.modifiers == KeyModifiers::NONE
+                        && app.input.is_empty()
+                        && detail_target_cell_index(app).is_some() =>
+                {
+                    open_tool_details_pager(app);
+                    continue;
+                }
                 KeyCode::Char('o')
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && app.input.is_empty()
@@ -4361,13 +4528,14 @@ async fn run_event_loop(
                     let prior_mode = app.mode;
                     app.cycle_mode();
                     if app.mode != prior_mode {
-                        sync_mode_update(&engine_handle, app.mode).await;
+                        sync_mode_update(app, &engine_handle).await;
                     }
                     if app.model != prior_model {
                         let _ = engine_handle
                             .send(Op::SetModel {
                                 model: app.model.clone(),
                                 mode: app.mode,
+                                route_limits: app.active_route_limits,
                             })
                             .await;
                     }
@@ -4375,12 +4543,12 @@ async fn run_event_loop(
                 KeyCode::BackTab => {
                     app.cycle_effort();
                 }
-                // Transcript-nav shortcuts now require Alt, leaving the bare
+                // Transcript-nav shortcuts now require Alt, leaving most bare
                 // letters free to insert as text. Before v0.8.30, bare `g`,
-                // `G`, `[`, `]`, `?`, `l`, and `v` on an empty composer were
+                // `G`, `[`, `]`, `?`, and `l` on an empty composer were
                 // hijacked for navigation — typing "good" yielded "ood" with
                 // no whale and no warning. The Alt-prefixed shortcuts mirror
-                // the Alt+R / Alt+V / Alt+C pattern already in use. Shift is
+                // the Alt+R / Alt+C pattern already in use. Shift is
                 // permitted for most capital-letter forms.
                 KeyCode::Char('g')
                     if key_shortcuts::alt_nav_modifiers(key.modifiers)
@@ -4574,7 +4742,8 @@ async fn run_event_loop(
                         // appended to the user memory file and the input
                         // is consumed without firing a turn. Disabled
                         // behaviour falls through to normal turn submit.
-                        if config.memory_enabled() && is_memory_quick_add(&input) {
+                        // TODO(v0.8.71): remove legacy quick-add when Moraine recall stable; see #3490, #3495
+                        if should_intercept_memory_quick_add(config, &input) {
                             handle_memory_quick_add(app, &input, config);
                             continue;
                         }
@@ -4617,6 +4786,7 @@ async fn run_event_loop(
                                         system_prompt_override: false,
                                         model: app.model.clone(),
                                         workspace: app.workspace.clone(),
+                                        mode: app.mode,
                                     })
                                     .await;
                             }
@@ -4739,13 +4909,25 @@ async fn run_event_loop(
                     // shortcut whether or not a model turn is streaming —
                     // editing the buffer never disturbs in-flight work.
                     let seed = app.input.clone();
-                    match super::external_editor::spawn_editor_for_input(
-                        terminal,
-                        app.use_alt_screen,
-                        app.use_mouse_capture,
-                        app.use_bracketed_paste,
-                        &seed,
-                    ) {
+                    let editor_result = terminal_input.pause_for_child_terminal().and_then(|()| {
+                        let result = drain_terminal_input_queue(
+                            &terminal_input,
+                            &mut pending_terminal_events,
+                        )
+                        .and_then(|()| {
+                            super::external_editor::spawn_editor_for_input(
+                                terminal,
+                                app.use_alt_screen,
+                                app.use_mouse_capture,
+                                app.use_bracketed_paste,
+                                &seed,
+                            )
+                        });
+                        terminal_input.resume_after_child_terminal();
+                        force_terminal_repaint = true;
+                        result
+                    });
+                    match editor_result {
                         Ok(super::external_editor::EditorOutcome::Edited(new)) => {
                             app.input = new;
                             app.move_cursor_end();
@@ -4916,10 +5098,6 @@ async fn run_event_loop(
 }
 
 fn hotbar_slot_from_key(app: &App, key: &event::KeyEvent) -> Option<u8> {
-    if app.onboarding != OnboardingState::None || !app.view_stack.is_empty() {
-        return None;
-    }
-
     let KeyCode::Char(c) = key.code else {
         return None;
     };
@@ -4932,10 +5110,30 @@ fn hotbar_slot_from_key(app: &App, key: &event::KeyEvent) -> Option<u8> {
         && !key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::SUPER)
     {
+        if app.onboarding != OnboardingState::None
+            || !app.view_stack.is_empty()
+            || app.is_history_search_active()
+            || app.decision_card.is_some()
+            || !visible_slash_menu_entries(app, SLASH_MENU_LIMIT).is_empty()
+        {
+            return None;
+        }
+
         return Some(slot);
     }
 
     None
+}
+
+fn decision_card_number_from_key(key: &event::KeyEvent) -> Option<usize> {
+    let KeyCode::Char(c @ '1'..='9') = key.code else {
+        return None;
+    };
+    if !key.modifiers.is_empty() {
+        return None;
+    }
+
+    Some((c as u8 - b'1' + 1) as usize)
 }
 
 fn dispatch_hotbar_slot(
@@ -4964,6 +5162,14 @@ fn dispatch_hotbar_slot(
         app.needs_redraw = true;
         return Ok(Some(HotbarDispatch::Handled));
     };
+
+    if let Some(reason) = action.disabled_reason(app) {
+        app.status_message = Some(format!(
+            "Hotbar slot {slot} action is not available: {reason}"
+        ));
+        app.needs_redraw = true;
+        return Ok(Some(HotbarDispatch::Handled));
+    }
 
     action.dispatch(app).map(Some)
 }
@@ -5472,6 +5678,8 @@ fn rollback_provider_after_auth_failure(app: &mut App, config: &mut Config) -> O
         previous_provider,
         previous_model,
         previous_model_ids_passthrough,
+        previous_route_limits,
+        previous_context_window_override,
         previous_config,
         previous_onboarding,
         previous_onboarding_needs_api_key,
@@ -5484,6 +5692,8 @@ fn rollback_provider_after_auth_failure(app: &mut App, config: &mut Config) -> O
     app.provider_models
         .insert(previous_provider.as_str().to_string(), previous_model);
     app.model_ids_passthrough = previous_model_ids_passthrough;
+    app.active_context_window_override = previous_context_window_override;
+    app.active_route_limits = previous_route_limits;
     app.update_model_compaction_budget();
     app.clear_model_scoped_telemetry();
     app.offline_mode = false;
@@ -6220,6 +6430,7 @@ async fn dispatch_user_message(
         app.last_effective_model = None;
     }
 
+    app.pending_turn_route = Some((effective_provider, effective_model.clone(), app.auto_model));
     if let Err(err) = engine_handle
         .send(Op::SendMessage {
             content,
@@ -6234,7 +6445,7 @@ async fn dispatch_user_message(
             auto_model: app.auto_model,
             allow_shell: app.allow_shell,
             trust_mode: app.trust_mode,
-            auto_approve: app.mode == AppMode::Yolo,
+            auto_approve: app_auto_approve_enabled(app),
             approval_mode: app.approval_mode,
             translation_enabled: app.translation_enabled,
             show_thinking: app.show_thinking,
@@ -6249,6 +6460,7 @@ async fn dispatch_user_message(
         app.is_loading = false;
         app.dispatch_started_at = None;
         app.last_send_at = None;
+        app.pending_turn_route = None;
         return Err(err);
     }
 
@@ -6302,13 +6514,21 @@ pub(crate) fn apply_goal_snapshot_to_app(app: &mut App, snapshot: &GoalSnapshot)
     true
 }
 
-async fn sync_mode_update(engine_handle: &EngineHandle, mode: AppMode) {
-    let _ = engine_handle.send(Op::ChangeMode { mode }).await;
+async fn sync_mode_update(app: &App, engine_handle: &EngineHandle) {
+    let _ = engine_handle
+        .send(Op::ChangeMode {
+            mode: app.mode,
+            allow_shell: app.allow_shell,
+            trust_mode: app.trust_mode,
+            auto_approve: app_auto_approve_enabled(app),
+            approval_mode: app.approval_mode,
+        })
+        .await;
 }
 
 async fn apply_mode_update(app: &mut App, engine_handle: &EngineHandle, mode: AppMode) -> bool {
     if app.set_mode(mode) {
-        sync_mode_update(engine_handle, mode).await;
+        sync_mode_update(app, engine_handle).await;
         true
     } else {
         false
@@ -6333,8 +6553,9 @@ async fn handle_bang_shell_input(
         .send(Op::RunShellCommand {
             command: command.to_string(),
             mode: app.mode,
+            allow_shell: app.allow_shell,
             trust_mode: app.trust_mode,
-            auto_approve: app.mode == AppMode::Yolo,
+            auto_approve: app_auto_approve_enabled(app),
             approval_mode: app.approval_mode,
         })
         .await?;
@@ -6350,11 +6571,13 @@ async fn apply_model_and_compaction_update(
     engine_handle: &EngineHandle,
     compaction: crate::compaction::CompactionConfig,
     mode: AppMode,
+    route_limits: Option<codewhale_config::route::RouteLimits>,
 ) {
     let _ = engine_handle
         .send(Op::SetModel {
             model: compaction.model.clone(),
             mode,
+            route_limits,
         })
         .await;
     let _ = engine_handle
@@ -6383,6 +6606,7 @@ async fn drain_web_config_events(
                                 engine_handle,
                                 app.compaction_config(),
                                 app.mode,
+                                app.active_route_limits,
                             )
                             .await;
                         }
@@ -6408,6 +6632,7 @@ async fn drain_web_config_events(
                                 engine_handle,
                                 app.compaction_config(),
                                 app.mode,
+                                app.active_route_limits,
                             )
                             .await;
                         }
@@ -6489,25 +6714,43 @@ async fn apply_model_picker_choice(
         return;
     }
 
-    // Reject a model that does not belong to the active provider before we
-    // mutate session state or persist it (#3227). The picker can surface
-    // cross-provider saved models, so this is the in-session safety net for
-    // the same-provider path; cross-provider picks go through
-    // `switch_provider`, which validates the route atomically. Skip the strict
-    // check when the app accepts custom ids (pass-through provider or custom
-    // DeepSeek-compatible base URL) — the upstream is the authority there.
-    if model_changed
-        && !app.accepts_custom_model_ids()
-        && let Err(reason) = crate::config::validate_route(app.api_provider, &model)
-    {
-        app.status_message = Some(reason);
-        return;
+    let mut resolved_model = model.clone();
+    if model_changed && !model_is_auto {
+        let saved_provider_model = config
+            .provider_config_for(app.api_provider)
+            .and_then(|provider| provider.model.as_deref());
+        match resolve_route_candidate(
+            app.api_provider,
+            Some(&model),
+            saved_provider_model,
+            Some(config.deepseek_base_url()),
+            config.context_window_for_provider_config(app.api_provider),
+        ) {
+            Ok(candidate) => {
+                resolved_model = candidate.wire_model_id.as_str().to_string();
+                app.set_active_context_window_override(
+                    config.context_window_for_provider_config(app.api_provider),
+                );
+                app.set_active_route_limits(candidate.limits);
+            }
+            Err(reason) => {
+                app.status_message = Some(reason);
+                return;
+            }
+        }
+    } else if model_changed && model_is_auto {
+        app.set_active_context_window_override(
+            config.context_window_for_provider_config(app.api_provider),
+        );
+        app.active_route_limits = app.context_window_override_limits();
     }
 
     if model_changed {
-        app.set_model_selection(model.clone());
-        app.provider_models
-            .insert(app.api_provider.as_str().to_string(), model.clone());
+        app.set_model_selection(resolved_model.clone());
+        app.provider_models.insert(
+            app.api_provider.as_str().to_string(),
+            resolved_model.clone(),
+        );
         app.clear_model_scoped_telemetry();
     }
     if effort_changed {
@@ -6528,9 +6771,9 @@ async fn apply_model_picker_choice(
                 app.api_provider,
                 ApiProvider::Deepseek | ApiProvider::DeepseekCN
             ) {
-                settings.set("default_model", &model)?;
+                settings.set("default_model", &resolved_model)?;
             }
-            settings.set_model_for_provider(app.api_provider.as_str(), &model);
+            settings.set_model_for_provider(app.api_provider.as_str(), &resolved_model);
         }
         if effort_changed {
             settings.set(
@@ -6545,13 +6788,19 @@ async fn apply_model_picker_choice(
     }
 
     if model_changed {
-        apply_model_and_compaction_update(engine_handle, app.compaction_config(), app.mode).await;
+        apply_model_and_compaction_update(
+            engine_handle,
+            app.compaction_config(),
+            app.mode,
+            app.active_route_limits,
+        )
+        .await;
     }
 
     let model_summary = if model_is_auto {
         "auto (per-turn model)".to_string()
     } else {
-        model.clone()
+        resolved_model.clone()
     };
     let previous_effort_summary = previous_effort.display_label_for_provider(app.api_provider);
     let effort_summary = if effort == ReasoningEffort::Auto {
@@ -6607,7 +6856,13 @@ async fn apply_picker_effort_choice(
     .err()
     .map(|err| format!(" (not persisted: {err})"));
 
-    apply_model_and_compaction_update(engine_handle, app.compaction_config(), app.mode).await;
+    apply_model_and_compaction_update(
+        engine_handle,
+        app.compaction_config(),
+        app.mode,
+        app.active_route_limits,
+    )
+    .await;
 
     let mut summary = format!(
         "Thinking: {} → {} · model {}",
@@ -6621,11 +6876,10 @@ async fn apply_picker_effort_choice(
     app.status_message = Some(summary);
 }
 
-/// Apply a `/provider` switch by mutating the in-memory config, validating
-/// that credentials exist for the new provider, then respawning the engine
-/// so the API client picks up the new base URL/key. When `model_override`
-/// is set, it replaces the active model post-switch (already normalized,
-/// will be provider-prefixed by `Config::default_model`).
+/// Apply a `/provider` switch by resolving a complete route candidate before
+/// mutating state, then respawning the engine so the API client picks up the
+/// new base URL/key. When `model_override` is set, it replaces the active
+/// model post-switch after provider-scoped normalization.
 async fn switch_provider(
     app: &mut App,
     engine_handle: &mut EngineHandle,
@@ -6641,38 +6895,38 @@ async fn switch_provider(
         previous_provider,
         previous_model: previous_model.clone(),
         previous_model_ids_passthrough,
+        previous_route_limits: app.active_route_limits,
+        previous_context_window_override: app.active_context_window_override,
         previous_config: previous_config.clone(),
         previous_onboarding: app.onboarding,
         previous_onboarding_needs_api_key: app.onboarding_needs_api_key,
         previous_api_key_env_only: app.api_key_env_only,
     });
 
-    config.provider = Some(target.as_str().to_string());
-    if matches!(target, ApiProvider::NvidiaNim)
-        && config
-            .base_url
-            .as_deref()
-            .map(|base| !base.contains("integrate.api.nvidia.com"))
-            .unwrap_or(true)
-    {
-        config.base_url = Some(DEFAULT_NVIDIA_NIM_BASE_URL.to_string());
-    }
-    if matches!(target, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
-        && config
-            .base_url
-            .as_deref()
-            .map(root_base_url_belongs_to_non_deepseek_provider)
-            .unwrap_or(false)
-    {
-        config.base_url = None;
-    }
-    if let Some(ref model) = model_override {
-        config.provider_config_for_mut(target).model = Some(model.clone());
-    }
+    let resolved_route = match resolve_runtime_route(config, target, model_override.as_deref()) {
+        Ok(route) => route,
+        Err(reason) => {
+            app.pending_provider_switch = None;
+            app.add_message(HistoryCell::System {
+                content: format!(
+                    "Cannot switch to {}: {reason}\nProvider unchanged ({}).",
+                    target.as_str(),
+                    previous_provider.as_str()
+                ),
+            });
+            app.status_message = Some(format!(
+                "Route rejected before provider switch: {}.",
+                target.as_str()
+            ));
+            return;
+        }
+    };
+    let resolved_endpoint = resolved_route.candidate.endpoint.base_url.clone();
+    let next_config = resolved_route.config;
+    let new_model = resolved_route.model;
 
-    if let Err(err) = DeepSeekClient::new(config) {
+    if let Err(err) = DeepSeekClient::from_candidate(&next_config, &resolved_route.candidate) {
         app.pending_provider_switch = None;
-        *config = previous_config;
         app.add_message(HistoryCell::System {
             content: format!(
                 "Failed to switch provider to {}: {err}\nProvider unchanged ({}).",
@@ -6682,35 +6936,9 @@ async fn switch_provider(
         });
         return;
     }
+    *config = next_config;
 
-    let new_model = config.default_model();
-    // Validate the resolved (provider, model) tuple as one atomic unit before
-    // we tear down the engine or persist anything (#3227). This catches a
-    // contaminated route — e.g. provider `zai` paired with `deepseek-v4-pro` —
-    // locally with a precise diagnostic instead of a `400 Unknown Model`. On
-    // failure we leave the provider, model, and config exactly as they were.
-    // Pass-through routes (OpenAI-compatible, custom DeepSeek base URLs, …)
-    // skip the strict check; the upstream service is the authority there.
-    if !config.model_ids_pass_through()
-        && let Err(reason) = crate::config::validate_route(target, &new_model)
-    {
-        app.pending_provider_switch = None;
-        *config = previous_config;
-        app.add_message(HistoryCell::System {
-            content: format!(
-                "Cannot switch to {}: {reason}\nProvider unchanged ({}).",
-                target.as_str(),
-                previous_provider.as_str()
-            ),
-        });
-        app.status_message = Some(format!(
-            "Route rejected: {} is not compatible with {}.",
-            new_model,
-            target.as_str()
-        ));
-        return;
-    }
-    let new_base_url = config.deepseek_base_url();
+    let new_base_url = resolved_endpoint;
     let new_endpoint = display_base_url_host(&new_base_url);
     let cache_scope_changed = previous_provider != target || previous_model != new_model;
     app.api_provider = target;
@@ -6725,6 +6953,8 @@ async fn switch_provider(
     app.model_ids_passthrough = config.model_ids_pass_through();
     app.reasoning_effort = app.reasoning_effort.normalize_for_provider(target);
     app.set_model_selection(new_model.clone());
+    app.set_active_context_window_override(config.context_window_for_provider_config(target));
+    app.set_active_route_limits(resolved_route.candidate.limits);
     if model_override.is_some() {
         app.provider_models
             .insert(target.as_str().to_string(), new_model.clone());
@@ -6751,6 +6981,7 @@ async fn switch_provider(
                 system_prompt_override: false,
                 model: app.model.clone(),
                 workspace: app.workspace.clone(),
+                mode: app.mode,
             })
             .await;
     }
@@ -6812,31 +7043,29 @@ async fn apply_provider_fallback_switch(
     previous_provider: ApiProvider,
 ) {
     let target = app.api_provider;
-    let previous_config = config.clone();
     let previous_model = app.model.clone();
 
-    config.provider = Some(target.as_str().to_string());
-    if matches!(target, ApiProvider::NvidiaNim)
-        && config
-            .base_url
-            .as_deref()
-            .map(|base| !base.contains("integrate.api.nvidia.com"))
-            .unwrap_or(true)
-    {
-        config.base_url = Some(DEFAULT_NVIDIA_NIM_BASE_URL.to_string());
-    }
-    if matches!(target, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
-        && config
-            .base_url
-            .as_deref()
-            .map(root_base_url_belongs_to_non_deepseek_provider)
-            .unwrap_or(false)
-    {
-        config.base_url = None;
-    }
+    let resolved_route = match resolve_runtime_route(config, target, None) {
+        Ok(route) => route,
+        Err(reason) => {
+            app.api_provider = previous_provider;
+            app.last_fallback_reason = Some(format!(
+                "Fallback provider {} route was rejected: {reason}",
+                target.as_str()
+            ));
+            app.status_message = Some(format!(
+                "Fallback provider {} rejected; provider remains {}.",
+                target.as_str(),
+                previous_provider.as_str()
+            ));
+            return;
+        }
+    };
+    let resolved_endpoint = resolved_route.candidate.endpoint.base_url.clone();
+    let next_config = resolved_route.config;
+    let new_model = resolved_route.model;
 
-    if let Err(err) = DeepSeekClient::new(config) {
-        *config = previous_config;
+    if let Err(err) = DeepSeekClient::from_candidate(&next_config, &resolved_route.candidate) {
         app.api_provider = previous_provider;
         app.last_fallback_reason = Some(format!(
             "Fallback provider {} was unavailable: {err}",
@@ -6849,14 +7078,16 @@ async fn apply_provider_fallback_switch(
         ));
         return;
     }
+    *config = next_config;
 
-    let new_model = config.default_model();
-    let new_base_url = config.deepseek_base_url();
+    let new_base_url = resolved_endpoint;
     let new_endpoint = display_base_url_host(&new_base_url);
     let cache_scope_changed = previous_provider != target || previous_model != new_model;
     app.model_ids_passthrough = config.model_ids_pass_through();
     app.reasoning_effort = app.reasoning_effort.normalize_for_provider(target);
     app.set_model_selection(new_model.clone());
+    app.set_active_context_window_override(config.context_window_for_provider_config(target));
+    app.set_active_route_limits(resolved_route.candidate.limits);
     app.update_model_compaction_budget();
     if cache_scope_changed {
         app.clear_model_scoped_telemetry();
@@ -6879,6 +7110,7 @@ async fn apply_provider_fallback_switch(
                 system_prompt_override: false,
                 model: app.model.clone(),
                 workspace: app.workspace.clone(),
+                mode: app.mode,
             })
             .await;
     }
@@ -6905,27 +7137,6 @@ async fn apply_provider_fallback_switch(
     ));
 }
 
-fn root_base_url_belongs_to_non_deepseek_provider(base_url: &str) -> bool {
-    let lower = base_url.to_ascii_lowercase();
-    [
-        "integrate.api.nvidia.com",
-        "api.openai.com",
-        "api.atlascloud.ai",
-        "maas-openapi.wanjiedata.com",
-        "volces.com",
-        "openrouter.ai",
-        "xiaomimimo.com",
-        "novita.ai",
-        "fireworks.ai",
-        "siliconflow",
-        "arcee.ai",
-        "moonshot.ai",
-        "api.kimi.com",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
 fn display_base_url_host(base_url: &str) -> String {
     let without_scheme = base_url
         .split_once("://")
@@ -6944,6 +7155,18 @@ fn sync_config_provider_from_app(config: &mut Config, app: &App) {
 
 fn provider_picker_model_override(app: &App, provider: ApiProvider) -> Option<String> {
     (app.api_provider == provider).then(|| app.model.clone())
+}
+
+async fn query_provider_runtime_status(
+    engine_handle: &EngineHandle,
+) -> Option<ProviderRuntimeStatus> {
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        engine_handle.get_provider_runtime_status(),
+    )
+    .await
+    .ok()
+    .and_then(|result| result.ok())
 }
 
 fn open_text_pager(app: &mut App, title: String, content: String) {
@@ -7008,6 +7231,7 @@ async fn apply_command_result(
                 system_prompt,
                 model,
                 workspace,
+                mode,
             } => {
                 let mut session_id = session_id;
                 let is_full_reset = messages.is_empty() && system_prompt.is_none();
@@ -7024,6 +7248,7 @@ async fn apply_command_result(
                         system_prompt_override: false,
                         model,
                         workspace,
+                        mode,
                     })
                     .await;
                 let _ = engine_handle
@@ -7040,8 +7265,8 @@ async fn apply_command_result(
                     persistence_actor::persist(PersistRequest::ClearCheckpoint);
                 }
             }
-            AppAction::ModeChanged(mode) => {
-                sync_mode_update(engine_handle, mode).await;
+            AppAction::ModeChanged(_mode) => {
+                sync_mode_update(app, engine_handle).await;
             }
             AppAction::SendMessage(content) => {
                 let queued = build_queued_message(app, content);
@@ -7075,7 +7300,8 @@ async fn apply_command_result(
                 }
             }
             AppAction::ListSubAgents => {
-                let _ = engine_handle.send(Op::ListSubAgents).await;
+                // #3802: non-blocking send — refresh op, safe to drop.
+                let _ = engine_handle.try_send(Op::ListSubAgents);
             }
             AppAction::FetchModels => {
                 app.status_message = Some("Fetching models...".to_string());
@@ -7206,7 +7432,13 @@ async fn apply_command_result(
                 }
             }
             AppAction::UpdateCompaction(compaction) => {
-                apply_model_and_compaction_update(engine_handle, compaction, app.mode).await;
+                apply_model_and_compaction_update(
+                    engine_handle,
+                    compaction,
+                    app.mode,
+                    app.active_route_limits,
+                )
+                .await;
             }
             AppAction::UpdateStreamChunkTimeout(timeout_secs) => {
                 let _ = engine_handle
@@ -7261,6 +7493,7 @@ async fn apply_command_result(
                                     engine_handle,
                                     app.compaction_config(),
                                     app.mode,
+                                    app.active_route_limits,
                                 )
                                 .await;
                             }
@@ -7306,16 +7539,19 @@ async fn apply_command_result(
             AppAction::OpenModelPicker => {
                 if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
                     app.view_stack
-                        .push(crate::tui::model_picker::ModelPickerView::new(app));
+                        .push(crate::tui::model_picker::ModelPickerView::new(app, config));
                 }
             }
             AppAction::OpenProviderPicker => {
                 if app.view_stack.top_kind() != Some(ModalKind::ProviderPicker) {
-                    app.view_stack
-                        .push(crate::tui::provider_picker::ProviderPickerView::new(
+                    let runtime_status = query_provider_runtime_status(engine_handle).await;
+                    app.view_stack.push(
+                        crate::tui::provider_picker::ProviderPickerView::new_with_runtime_status(
                             app.api_provider,
                             config,
-                        ));
+                            runtime_status,
+                        ),
+                    );
                 }
             }
             AppAction::OpenModePicker => {
@@ -7323,6 +7559,7 @@ async fn apply_command_result(
                     app.view_stack
                         .push(crate::tui::views::mode_picker::ModePickerView::new(
                             app.mode,
+                            app.ui_locale,
                         ));
                 }
             }
@@ -7353,6 +7590,22 @@ async fn apply_command_result(
                         .push(crate::tui::theme_picker::ThemePickerView::new(original));
                 }
             }
+            AppAction::OpenFleetSetup => {
+                if app.view_stack.top_kind() != Some(ModalKind::FleetSetup) {
+                    app.view_stack
+                        .push(crate::tui::views::fleet_setup::FleetSetupView::new(
+                            app, config,
+                        ));
+                }
+            }
+            AppAction::OpenHotbarSetup => {
+                if app.view_stack.top_kind() != Some(ModalKind::HotbarSetup) {
+                    app.view_stack
+                        .push(crate::tui::hotbar::setup::HotbarSetupView::new(app, config));
+                }
+            }
+            AppAction::DisableHotbar => disable_hotbar(app, config),
+            AppAction::RestoreHotbarDefaults => restore_hotbar_defaults(app, config),
             AppAction::OpenExternalUrl { url, label } => match open_external_url(&url) {
                 Ok(()) => {
                     app.status_message = Some(format!("Opened {label} in your browser"));
@@ -7384,7 +7637,7 @@ async fn apply_command_result(
                     mode: Some(task_mode_label(app.mode).to_string()),
                     allow_shell: Some(app.allow_shell),
                     trust_mode: Some(app.trust_mode),
-                    auto_approve: Some(app.approval_mode == ApprovalMode::Auto),
+                    auto_approve: Some(app_auto_approve_enabled(app)),
                 };
                 match task_manager.add_task(request).await {
                     Ok(task) => {
@@ -7456,6 +7709,27 @@ async fn apply_command_result(
                         app.api_provider = config.api_provider();
                         let new_model = config.default_model();
                         app.set_model_selection(new_model.clone());
+                        app.set_active_context_window_override(
+                            config.context_window_for_provider_config(app.api_provider),
+                        );
+                        app.active_route_limits = if app.auto_model {
+                            app.context_window_override_limits()
+                        } else {
+                            let saved_provider_model = config
+                                .provider_config_for(app.api_provider)
+                                .and_then(|provider| provider.model.as_deref());
+                            resolve_route_candidate(
+                                app.api_provider,
+                                Some(&new_model),
+                                saved_provider_model,
+                                Some(config.deepseek_base_url()),
+                                app.active_context_window_override,
+                            )
+                            .ok()
+                            .and_then(|candidate| {
+                                crate::route_budget::known_route_limits(candidate.limits)
+                            })
+                        };
                         app.update_model_compaction_budget();
                         app.session.last_prompt_tokens = None;
                         app.session.last_completion_tokens = None;
@@ -7473,6 +7747,7 @@ async fn apply_command_result(
                                     system_prompt_override: false,
                                     model: app.model.clone(),
                                     workspace: app.workspace.clone(),
+                                    mode: app.mode,
                                 })
                                 .await;
                         }
@@ -7597,6 +7872,7 @@ async fn switch_workspace(
                 system_prompt_override: false,
                 model: app.model.clone(),
                 workspace: workspace.clone(),
+                mode: app.mode,
             })
             .await;
     }
@@ -7676,6 +7952,47 @@ async fn handle_mcp_ui_action(
             mcp::remove_server_config(&path, &name)
                 .map(|()| message = Some(format!("Removed MCP server '{name}'")))
         }
+        crate::tui::app::McpUiAction::Login { name, scopes } => {
+            let result = async {
+                let cfg = mcp::load_config_with_workspace(&path, &app.workspace)?;
+                let server = cfg
+                    .servers
+                    .get(&name)
+                    .ok_or_else(|| anyhow::anyhow!("MCP server '{name}' not found"))?;
+                let explicit_scopes = (!scopes.is_empty()).then_some(scopes);
+                mcp::oauth::perform_oauth_login_for_server(
+                    &name,
+                    server,
+                    explicit_scopes,
+                    config.mcp_oauth_callback_port,
+                    config.mcp_oauth_callback_url.as_deref(),
+                )
+                .await
+            }
+            .await;
+            result.map(|()| {
+                message = Some(format!(
+                    "Stored OAuth credentials for MCP server '{name}'. Restart if the server was already connected."
+                ));
+            })
+        }
+        crate::tui::app::McpUiAction::Logout { name } => {
+            let result = (|| {
+                let cfg = mcp::load_config_with_workspace(&path, &app.workspace)?;
+                let server = cfg
+                    .servers
+                    .get(&name)
+                    .ok_or_else(|| anyhow::anyhow!("MCP server '{name}' not found"))?;
+                mcp::oauth::delete_oauth_tokens_for_server(&name, server)
+            })();
+            result.map(|deleted| {
+                message = Some(if deleted {
+                    format!("Deleted stored OAuth credentials for MCP server '{name}'.")
+                } else {
+                    format!("No stored OAuth credentials found for MCP server '{name}'.")
+                });
+            })
+        }
         crate::tui::app::McpUiAction::Validate | crate::tui::app::McpUiAction::Reload => Ok(()),
     };
 
@@ -7735,6 +8052,8 @@ fn mcp_ui_action_refreshes_discovery(action: &crate::tui::app::McpUiAction) -> b
         crate::tui::app::McpUiAction::Show
             | crate::tui::app::McpUiAction::Validate
             | crate::tui::app::McpUiAction::Reload
+            | crate::tui::app::McpUiAction::Login { .. }
+            | crate::tui::app::McpUiAction::Logout { .. }
     )
 }
 
@@ -8198,7 +8517,7 @@ fn build_pending_input_preview(app: &App) -> PendingInputPreview {
     preview
 }
 
-fn render(f: &mut Frame, app: &mut App) {
+fn render(f: &mut Frame, app: &mut App, config: &Config) {
     let size = f.area();
 
     // Clear entire area with the configured app background.
@@ -8288,9 +8607,11 @@ fn render(f: &mut Frame, app: &mut App) {
         let provider_label = match app.api_provider {
             crate::config::ApiProvider::Deepseek => None,
             crate::config::ApiProvider::DeepseekCN => None,
+            crate::config::ApiProvider::DeepseekAnthropic => Some("DS-A"),
             crate::config::ApiProvider::NvidiaNim => Some("NIM"),
             crate::config::ApiProvider::Openai => Some("OpenAI"),
             crate::config::ApiProvider::Anthropic => Some("Claude"),
+            crate::config::ApiProvider::Openmodel => None,
             crate::config::ApiProvider::Atlascloud => Some("Atlas"),
             crate::config::ApiProvider::WanjieArk => Some("Wanjie"),
             crate::config::ApiProvider::Volcengine => Some("Volc"),
@@ -8314,6 +8635,8 @@ fn render(f: &mut Frame, app: &mut App) {
             crate::config::ApiProvider::Zai => Some("Z.ai"),
             crate::config::ApiProvider::Stepfun => Some("StepFun"),
             crate::config::ApiProvider::Minimax => Some("MiniMax"),
+            crate::config::ApiProvider::Sakana => Some("Sakana"),
+            crate::config::ApiProvider::Custom => Some("Custom"),
         };
         let status_indicator_started_at = if app.low_motion {
             None
@@ -8419,7 +8742,7 @@ fn render(f: &mut Frame, app: &mut App) {
             app.last_sidebar_area = Some(sidebar_area);
 
             // Render sidebar
-            super::sidebar::render_sidebar(f, sidebar_area, app);
+            super::sidebar::render_sidebar(f, sidebar_area, app, config);
 
             // Paint resize handle (1-col draggable bar) on the left edge of
             // the sidebar, over the sidebar content. Mouse drag on this strip
@@ -8567,13 +8890,21 @@ fn render(f: &mut Frame, app: &mut App) {
             content_width,
             budget,
         );
-        let visible_lines = if input_text.is_empty() {
-            1
+        let visual_rows = if input_text.is_empty() {
+            let hint: Option<std::borrow::Cow<'_, str>> = if let Some(ref suggestion) =
+                app.prompt_suggestion
+                && !app.is_history_search_active()
+            {
+                Some(std::borrow::Cow::Borrowed(suggestion.as_str()))
+            } else {
+                Some(crate::tui::widgets::composer_empty_hint_text(app))
+            };
+            crate::tui::widgets::empty_composer_visual_rows(hint.as_deref(), content_width, budget)
         } else {
             // Count wrapped lines (approximation matching the render path).
             crate::tui::widgets::wrap_input_lines_for_mouse(input_text, content_width).len()
         };
-        let top_padding = budget.saturating_sub(visible_lines.clamp(1, budget));
+        let top_padding = budget.saturating_sub(visual_rows.clamp(1, budget));
         app.viewport.last_composer_scroll_offset = scroll_offset;
         app.viewport.last_composer_top_padding = top_padding;
     }
@@ -8632,6 +8963,7 @@ fn render(f: &mut Frame, app: &mut App) {
 fn draw_app_frame_inner(
     terminal: &mut AppTerminal,
     app: &mut App,
+    config: &Config,
     full_repaint: bool,
 ) -> Result<()> {
     terminal.backend_mut().set_palette_mode(app.ui_theme.mode);
@@ -8655,7 +8987,7 @@ fn draw_app_frame_inner(
             terminal.backend_mut().write_all(TERMINAL_ORIGIN_RESET)?;
             terminal.clear()?;
         }
-        terminal.draw(|f| render(f, app))?;
+        terminal.draw(|f| render(f, app, config))?;
         Ok(())
     })();
 
@@ -8710,6 +9042,100 @@ fn toggle_live_transcript_overlay(app: &mut App) {
     overlay.refresh_from_app(app);
     app.view_stack.push(overlay);
     app.status_message = Some("Live transcript: tailing (Esc to close)".to_string());
+    app.needs_redraw = true;
+}
+
+/// Open the `/model` picker pre-filtered to `provider` (#3083). The model
+/// picker's search already scopes rows by provider display name, so we reuse
+/// the standard "open model picker" path and seed its query by replaying the
+/// provider's display name as character input through the public view-stack
+/// key path — no model-picker internals are touched.
+fn open_model_picker_for_provider(
+    app: &mut App,
+    config: &Config,
+    provider: crate::config::ApiProvider,
+) {
+    if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
+        app.view_stack
+            .push(crate::tui::model_picker::ModelPickerView::new(app, config));
+    }
+    for ch in provider.display_name().chars() {
+        // Char input updates the query and never emits a ViewEvent, so the
+        // returned (empty) event list is safe to drop.
+        let _ = app.view_stack.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        ));
+    }
+    app.needs_redraw = true;
+}
+
+fn apply_hotbar_setup_saved(
+    app: &mut App,
+    config: &mut Config,
+    bindings: Vec<codewhale_config::HotbarBindingToml>,
+) {
+    match crate::config_persistence::persist_hotbar_bindings(app.config_path.as_deref(), &bindings)
+    {
+        Ok(path) => {
+            config.hotbar = Some(bindings);
+            app.status_message = Some(format!("Hotbar bindings saved to {}", path.display()));
+        }
+        Err(err) => {
+            app.status_message = Some(format!("Failed to save Hotbar bindings: {err}"));
+            app.add_message(HistoryCell::System {
+                content: format!("Failed to save Hotbar bindings: {err}"),
+            });
+        }
+    }
+    app.needs_redraw = true;
+}
+
+/// Hide the Hotbar: persist `hotbar = []` (the canonical "disabled" state) and
+/// clear the live in-memory slots so the panel disappears immediately. The
+/// explicit empty array — not a missing key — is what disables defaults, so we
+/// store `Some(vec![])` rather than `None`.
+fn disable_hotbar(app: &mut App, config: &mut Config) {
+    match crate::config_persistence::persist_hotbar_bindings(app.config_path.as_deref(), &[]) {
+        Ok(path) => {
+            config.hotbar = Some(Vec::new());
+            app.status_message = Some(format!(
+                "Hotbar hidden (hotbar = [] in {}). Bring it back with `/hotbar on`.",
+                path.display()
+            ));
+        }
+        Err(err) => {
+            app.status_message = Some(format!("Failed to hide Hotbar: {err}"));
+            app.add_message(HistoryCell::System {
+                content: format!("Failed to hide Hotbar: {err}"),
+            });
+        }
+    }
+    app.needs_redraw = true;
+}
+
+/// Show the default recommended Hotbar slots. Since #3807 an absent `hotbar`
+/// key means "hidden", so `/hotbar on` persists the explicit default bindings
+/// rather than deleting the key. This is an explicit reset, so any custom
+/// bindings are replaced with the recommended set.
+fn restore_hotbar_defaults(app: &mut App, config: &mut Config) {
+    let defaults = codewhale_config::default_hotbar_bindings_toml();
+    match crate::config_persistence::persist_hotbar_bindings(app.config_path.as_deref(), &defaults)
+    {
+        Ok(path) => {
+            config.hotbar = Some(defaults);
+            app.status_message = Some(format!(
+                "Hotbar enabled with the default slots ({}). Customize with `/hotbar`.",
+                path.display()
+            ));
+        }
+        Err(err) => {
+            app.status_message = Some(format!("Failed to enable the Hotbar: {err}"));
+            app.add_message(HistoryCell::System {
+                content: format!("Failed to enable the Hotbar: {err}"),
+            });
+        }
+    }
     app.needs_redraw = true;
 }
 
@@ -8878,6 +9304,7 @@ async fn handle_view_events(
                                 system_prompt_override: false,
                                 model: app.model.clone(),
                                 workspace: app.workspace.clone(),
+                                mode: app.mode,
                             })
                             .await;
                         let _ = engine_handle
@@ -8938,8 +9365,13 @@ async fn handle_view_events(
                 if let Some(action) = result.action {
                     match action {
                         AppAction::UpdateCompaction(compaction) => {
-                            apply_model_and_compaction_update(engine_handle, compaction, app.mode)
-                                .await;
+                            apply_model_and_compaction_update(
+                                engine_handle,
+                                compaction,
+                                app.mode,
+                                app.active_route_limits,
+                            )
+                            .await;
                         }
                         AppAction::UpdateStreamChunkTimeout(timeout_secs) => {
                             let _ = engine_handle
@@ -8994,9 +9426,16 @@ async fn handle_view_events(
                     }
                 }
             }
+            ViewEvent::HotbarSetupSaved { bindings } => {
+                apply_hotbar_setup_saved(app, config, bindings);
+            }
+            ViewEvent::HotbarDisableRequested => {
+                disable_hotbar(app, config);
+            }
             ViewEvent::SubAgentsRefresh => {
                 app.status_message = Some("Refreshing sub-agents...".to_string());
-                let _ = engine_handle.send(Op::ListSubAgents).await;
+                // #3802: non-blocking send — refresh op, safe to drop.
+                let _ = engine_handle.try_send(Op::ListSubAgents);
             }
             ViewEvent::FilePickerSelected { path } => {
                 // Insert `@<path>` at the composer's cursor with surrounding
@@ -9055,11 +9494,14 @@ async fn handle_view_events(
                 )
                 .await;
             }
+            ViewEvent::ProviderPickerOpenModels { provider } => {
+                open_model_picker_for_provider(app, config, provider);
+            }
             ViewEvent::ModeSelected { mode } => {
                 let prior_mode = app.mode;
                 let msg = commands::switch_mode(app, mode);
                 if app.mode != prior_mode {
-                    sync_mode_update(engine_handle, app.mode).await;
+                    sync_mode_update(app, engine_handle).await;
                 }
                 app.add_message(HistoryCell::System { content: msg });
             }
@@ -9080,6 +9522,7 @@ async fn handle_view_events(
                             system_prompt_override: false,
                             model: app.model.clone(),
                             workspace: app.workspace.clone(),
+                            mode: app.mode,
                         })
                         .await;
                 }
@@ -9133,6 +9576,7 @@ fn push_approval_request_view(
         tool_input,
         approval_key,
         intent_summary,
+        &app.workspace,
     );
     app.view_stack
         .push(ApprovalView::new_for_locale(request, app.ui_locale));
@@ -9418,6 +9862,13 @@ async fn apply_provider_picker_api_key(
     if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
         config.api_key = Some(api_key);
     } else {
+        // Capture the custom entry key before borrowing `providers` (#1519).
+        let custom_key = (provider == ApiProvider::Custom).then(|| {
+            config
+                .provider
+                .clone()
+                .unwrap_or_else(|| "__custom__".to_string())
+        });
         let providers = config
             .providers
             .get_or_insert_with(ProvidersConfig::default);
@@ -9426,6 +9877,11 @@ async fn apply_provider_picker_api_key(
                 // Guarded by the outer `if` above; safety net against refactors.
                 return;
             }
+            ApiProvider::Custom => providers
+                .custom
+                .entry(custom_key.expect("custom key captured for custom provider"))
+                .or_default(),
+            ApiProvider::DeepseekAnthropic => &mut providers.deepseek_anthropic,
             ApiProvider::NvidiaNim => &mut providers.nvidia_nim,
             ApiProvider::Openai => &mut providers.openai,
             ApiProvider::Atlascloud => &mut providers.atlascloud,
@@ -9447,9 +9903,11 @@ async fn apply_provider_picker_api_key(
             ApiProvider::Qianfan => &mut providers.qianfan,
             ApiProvider::OpenaiCodex => &mut providers.openai_codex,
             ApiProvider::Anthropic => &mut providers.anthropic,
+            ApiProvider::Openmodel => &mut providers.openmodel,
             ApiProvider::Zai => &mut providers.zai,
             ApiProvider::Stepfun => &mut providers.stepfun,
             ApiProvider::Minimax => &mut providers.minimax,
+            ApiProvider::Sakana => &mut providers.sakana,
         };
         entry.api_key = Some(api_key);
     }
@@ -9486,11 +9944,24 @@ async fn apply_provider_picker_auth_mode(
 }
 
 fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, auth_mode: String) {
+    // Capture the custom entry key (the selected provider name) before the
+    // mutable borrow of `providers` below (#1519).
+    let custom_key = (provider == ApiProvider::Custom).then(|| {
+        config
+            .provider
+            .clone()
+            .unwrap_or_else(|| "__custom__".to_string())
+    });
     let providers = config
         .providers
         .get_or_insert_with(ProvidersConfig::default);
     let entry: &mut ProviderConfig = match provider {
         ApiProvider::Deepseek | ApiProvider::DeepseekCN => return,
+        ApiProvider::Custom => providers
+            .custom
+            .entry(custom_key.expect("custom key captured for custom provider"))
+            .or_default(),
+        ApiProvider::DeepseekAnthropic => &mut providers.deepseek_anthropic,
         ApiProvider::NvidiaNim => &mut providers.nvidia_nim,
         ApiProvider::Openai => &mut providers.openai,
         ApiProvider::Atlascloud => &mut providers.atlascloud,
@@ -9512,9 +9983,11 @@ fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, 
         ApiProvider::Qianfan => &mut providers.qianfan,
         ApiProvider::OpenaiCodex => &mut providers.openai_codex,
         ApiProvider::Anthropic => &mut providers.anthropic,
+        ApiProvider::Openmodel => &mut providers.openmodel,
         ApiProvider::Zai => &mut providers.zai,
         ApiProvider::Stepfun => &mut providers.stepfun,
         ApiProvider::Minimax => &mut providers.minimax,
+        ApiProvider::Sakana => &mut providers.sakana,
     };
     entry.auth_mode = Some(auth_mode);
 }
@@ -9567,6 +10040,9 @@ fn apply_loaded_session(app: &mut App, config: &Config, session: &SavedSession) 
     app.set_model_selection(session.metadata.model.clone());
     app.update_model_compaction_budget();
     apply_workspace_runtime_state(app, config, session.metadata.workspace.clone());
+    if let Some(mode) = session.metadata.mode.as_deref().and_then(AppMode::parse) {
+        app.set_mode(mode);
+    }
     app.session.total_tokens = u32::try_from(session.metadata.total_tokens).unwrap_or(u32::MAX);
     app.session.total_conversation_tokens = app.session.total_tokens;
     app.session.session_cost = session.metadata.cost.session_cost_usd;
@@ -9725,7 +10201,7 @@ fn pause_terminal(
         execute!(terminal.backend_mut(), DisableMouseCapture)?;
     }
     if use_bracketed_paste {
-        execute!(terminal.backend_mut(), DisableBracketedPaste)?;
+        disable_bracketed_paste_mode(terminal.backend_mut());
     }
     Ok(())
 }
@@ -9871,7 +10347,7 @@ fn enable_alternate_scroll_mode<W: Write>(writer: &mut W) {
     set_alternate_scroll_mode(writer, true);
 }
 
-fn disable_alternate_scroll_mode<W: Write>(writer: &mut W) {
+pub(crate) fn disable_alternate_scroll_mode<W: Write>(writer: &mut W) {
     set_alternate_scroll_mode(writer, false);
 }
 
@@ -9887,7 +10363,7 @@ pub fn emergency_restore_terminal() {
     pop_keyboard_enhancement_flags(&mut stdout);
     disable_alternate_scroll_mode(&mut stdout);
     let _ = execute!(stdout, DisableFocusChange);
-    let _ = execute!(stdout, DisableBracketedPaste);
+    disable_bracketed_paste_mode(&mut stdout);
     let _ = execute!(stdout, DisableMouseCapture);
     let _ = disable_raw_mode();
     let _ = execute!(stdout, LeaveAlternateScreen);
@@ -9936,7 +10412,7 @@ fn enable_windows_ime_console_mode() {
 /// across focus events and are only re-established by `resume_terminal`
 /// after a suspension, which always runs a separate path.
 ///
-fn recover_terminal_modes<W: Write>(
+pub(crate) fn recover_terminal_modes<W: Write>(
     writer: &mut W,
     use_mouse_capture: bool,
     use_bracketed_paste: bool,
@@ -9950,11 +10426,27 @@ fn recover_terminal_modes<W: Write>(
     if use_mouse_capture && let Err(err) = execute!(writer, EnableMouseCapture) {
         tracing::debug!(?err, "EnableMouseCapture ignored");
     }
-    if use_bracketed_paste && let Err(err) = execute!(writer, EnableBracketedPaste) {
-        tracing::debug!(?err, "EnableBracketedPaste ignored");
+    if use_bracketed_paste {
+        try_enable_bracketed_paste_mode(writer);
     }
     if let Err(err) = execute!(writer, EnableFocusChange) {
         tracing::debug!(?err, "EnableFocusChange ignored");
+    }
+}
+
+fn try_enable_bracketed_paste_mode<W: Write>(writer: &mut W) -> bool {
+    match execute!(writer, EnableBracketedPaste) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::debug!(?err, "EnableBracketedPaste ignored");
+            false
+        }
+    }
+}
+
+pub(crate) fn disable_bracketed_paste_mode<W: Write>(writer: &mut W) {
+    if let Err(err) = execute!(writer, DisableBracketedPaste) {
+        tracing::debug!(?err, "DisableBracketedPaste ignored");
     }
 }
 
@@ -10189,8 +10681,11 @@ fn estimated_context_tokens(app: &App) -> Option<i64> {
 }
 
 pub(crate) fn context_usage_snapshot(app: &App) -> Option<(i64, u32, f64)> {
-    let max =
-        provider_capability(app.api_provider, app.effective_model_for_budget()).context_window;
+    let max = crate::route_budget::route_context_window_tokens(
+        app.api_provider,
+        app.effective_model_for_budget(),
+        app.active_route_limits,
+    );
     let max_i64 = i64::from(max);
     let reported = app
         .session
@@ -10384,7 +10879,7 @@ fn open_thinking_pager(app: &mut App) -> bool {
 /// then a live activity in the current turn, then the most recent meaningful
 /// activity across history + active cells. Tool activity is intentionally
 /// rendered through the compact live view so Activity Detail does not become
-/// an accidental raw-output dump; Alt+V remains the direct full tool-detail
+/// an accidental raw-output dump; `v` remains the direct full tool-detail
 /// surface.
 fn open_activity_detail_pager(app: &mut App) -> bool {
     let Some(idx) = activity_target_cell_index(app) else {
@@ -10815,19 +11310,19 @@ fn activity_detail_handle_line(app: &App, cell_index: usize, cell: &HistoryCell)
             .find(|artifact| artifact.tool_call_id == detail.tool_id)
         {
             return Some(format!(
-                "Detail handle: {} (retrieve_tool_result ref={}; Alt+V raw details)",
+                "Detail handle: {} (retrieve_tool_result ref={}; v raw details)",
                 artifact.id, artifact.id
             ));
         }
         return Some(format!(
-            "Detail handle: tool:{} (Alt+V raw details)",
+            "Detail handle: tool:{} (v raw details)",
             detail.tool_id
         ));
     }
 
     match cell {
-        HistoryCell::Tool(_) => Some("Detail handle: Alt+V details".to_string()),
-        HistoryCell::SubAgent(_) => Some("Detail handle: Alt+V details".to_string()),
+        HistoryCell::Tool(_) => Some("Detail handle: v details".to_string()),
+        HistoryCell::SubAgent(_) => Some("Detail handle: v details".to_string()),
         _ => None,
     }
 }
@@ -11034,11 +11529,11 @@ pub(crate) fn selected_detail_footer_label(app: &App) -> Option<String> {
         let noun = if matches!(cell, HistoryCell::SubAgent(_)) {
             "details"
         } else {
-            "raw"
+            "raw details"
         };
         format!(
-            " · {} {noun}",
-            key_shortcuts::tool_details_shortcut_hint_label()
+            " · {}",
+            key_shortcuts::tool_details_shortcut_action_hint(noun)
         )
     } else {
         String::new()

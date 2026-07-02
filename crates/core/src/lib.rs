@@ -830,6 +830,46 @@ impl Runtime {
         }
     }
 
+    /// Update the live configuration in-place so the next turn picks up
+    /// changes without a restart.  Called by the app-server after
+    /// `ConfigSet` or `ConfigUnset`.
+    ///
+    /// Only `config.toml` is touched by those operations, so the sibling
+    /// `permissions.toml` (and therefore `exec_policy`) is left unchanged.
+    ///
+    /// Fields that the TUI caches on its `App` struct (`api_provider`,
+    /// `reasoning_effort`, `mcp_config_path`, `skills_dir`, …) are read
+    /// live from `self.config` here via `resolve_runtime_options`, so they
+    /// take effect on the next prompt turn without any extra plumbing.
+    pub fn update_config(&mut self, config: ConfigToml) {
+        self.config = config;
+    }
+
+    /// Reload the live configuration **and** the exec policy from a
+    /// freshly-loaded `ConfigStore`.  Used by the app-server's
+    /// `ConfigReload` request, which re-reads both `config.toml` and the
+    /// sibling `permissions.toml` from disk.
+    ///
+    /// Unlike `update_config`, this also refreshes `self.exec_policy` so
+    /// externally edited permission rules take effect without a restart.
+    ///
+    /// Mirrors the TUI `reload_runtime_config` codepath for everything
+    /// that is reachable from the headless `Runtime`. The TUI-only caches
+    /// (`last_effective_reasoning_effort`, `model_compaction_budget`,
+    /// `ui_locale`, …) do not exist on `Runtime` and need no work here.
+    ///
+    /// **Not** refreshed by this call:
+    /// * `mcp_manager` — MCP server connections are loaded once at
+    ///   startup from `mcp_config_path`. Changing `mcp_config_path` or the
+    ///   referenced `mcp.json` still requires a restart, exactly as the
+    ///   TUI flags via `mcp_restart_required`.
+    /// * `tool_registry` — built once at startup.
+    /// * `model_registry` — static catalog.
+    pub fn reload_config_and_policy(&mut self, config: ConfigToml, exec_policy: ExecPolicyEngine) {
+        self.config = config;
+        self.exec_policy = exec_policy;
+    }
+
     fn persisted_thread_data(&self, thread_id: &str) -> Result<Value> {
         let history = self
             .thread_manager

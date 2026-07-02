@@ -7,7 +7,7 @@ DeepInfra 以及本地 vLLM/SGLang/Ollama 都是一等路由；当你手里是 A
 或 OpenAI 的 key 时，CodeWhale 也以原生协议直连。工具经审批放行、操作系统级沙箱，
 每一轮都可用 `/restore` 回滚。
 
-[English README](README.md) · [日本語 README](README.ja-JP.md) · [Tiếng Việt README](README.vi.md) · [codewhale.net](https://codewhale.net/) · [安装指南](docs/INSTALL.md) · [Provider 注册表](docs/PROVIDERS.md) · [更新日志](CHANGELOG.md)
+[English README](README.md) · [日本語 README](README.ja-JP.md) · [Tiếng Việt README](README.vi.md) · [한국어 README](README.ko-KR.md) · [codewhale.net](https://codewhale.net/) · [安装指南](docs/INSTALL.md) · [Provider 注册表](docs/PROVIDERS.md) · [更新日志](CHANGELOG.md)
 
 [![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
@@ -20,7 +20,7 @@ DeepInfra 以及本地 vLLM/SGLang/Ollama 都是一等路由；当你手里是 A
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.63
+codewhale --version   # 0.8.66
 ```
 
 npm wrapper（Node 18+）会从 GitHub Releases 下载经 SHA-256 校验的二进制，并安装
@@ -32,7 +32,7 @@ cargo install codewhale-cli --locked
 cargo install codewhale-tui --locked
 ```
 
-> **Linux 用户注意：** 请先安装系统构建依赖：
+> **Linux / WSL2 用户注意：** 从源码构建前请先安装系统构建依赖：
 > `sudo apt-get install -y build-essential pkg-config libdbus-1-dev`。
 > 详见 [INSTALL.md](docs/INSTALL.md#4-install-via-cargo-any-tier-1-rust-target)。
 
@@ -49,8 +49,8 @@ nix run github:Hmbown/CodeWhale
 scoop install codewhale        # 或使用 GitHub Releases 中的 NSIS 安装包
 
 # CNB 镜像：适合无法稳定访问 GitHub 的用户
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.64 codewhale-cli --locked --force
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.64 codewhale-tui --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-cli --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-tui --locked --force
 
 # 旧 Homebrew 兼容路径：formula 改名期间仍沿用 deepseek-tui
 brew tap Hmbown/deepseek-tui

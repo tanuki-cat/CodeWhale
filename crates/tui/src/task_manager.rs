@@ -196,6 +196,8 @@ pub struct TaskRecord {
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hunt_verdict: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,6 +236,8 @@ pub struct TaskSummary {
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hunt_verdict: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -254,6 +258,7 @@ impl From<&TaskRecord> for TaskSummary {
             started_at: value.started_at,
             ended_at: value.ended_at,
             duration_ms: value.duration_ms,
+            hunt_verdict: value.hunt_verdict.clone(),
             error: value.error.clone(),
             thread_id: value.thread_id.clone(),
             turn_id: value.turn_id.clone(),
@@ -853,6 +858,7 @@ impl TaskManager {
             started_at: None,
             ended_at: None,
             duration_ms: None,
+            hunt_verdict: None,
             result_summary: None,
             result_detail_path: None,
             error: None,
@@ -1418,6 +1424,22 @@ impl TaskManager {
             });
         }
 
+        if let Some(value) = updates.get("hunt_verdict") {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| anyhow!("hunt_verdict task update must be a string"))?;
+            let verdict = normalize_hunt_verdict(raw)?;
+            if task.hunt_verdict.as_deref() != Some(verdict) {
+                task.hunt_verdict = Some(verdict.to_string());
+                task.timeline.push(TaskTimelineEntry {
+                    timestamp: now,
+                    kind: "hunt_verdict".to_string(),
+                    summary: format!("Hunt verdict updated: {verdict}"),
+                    detail_path: None,
+                });
+            }
+        }
+
         if let Some(value) = updates.get("attempt") {
             let attempt: TaskAttemptRecord = serde_json::from_value(value.clone())
                 .context("Failed to parse attempt task update")?;
@@ -1488,6 +1510,18 @@ impl TaskManager {
     fn persist_task_locked(&self, task: &TaskRecord) -> Result<()> {
         let path = self.tasks_dir.join(format!("{}.json", task.id));
         write_json_atomic(&path, task)
+    }
+}
+
+fn normalize_hunt_verdict(raw: &str) -> Result<&'static str> {
+    match raw.trim() {
+        "hunting" => Ok("hunting"),
+        "hunted" => Ok("hunted"),
+        "wounded" => Ok("wounded"),
+        "escaped" => Ok("escaped"),
+        other => bail!(
+            "unsupported hunt_verdict task update '{other}'. Expected one of: hunting, hunted, wounded, escaped"
+        ),
     }
 }
 
@@ -1849,6 +1883,7 @@ mod tests {
             started_at: Some(started_at),
             ended_at: None,
             duration_ms: None,
+            hunt_verdict: None,
             result_summary: None,
             result_detail_path: None,
             error: None,
@@ -1971,6 +2006,37 @@ mod tests {
 
         assert_eq!(updated.gates.len(), 1);
         assert_eq!(updated.gates[0].classification, "passed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_tool_metadata_updates_hunt_verdict_summary() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let manager =
+            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
+
+        let task = manager
+            .add_task(NewTaskRequest::from_prompt("test verdict metadata"))
+            .await?;
+        let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
+        let updated = manager
+            .record_tool_metadata(
+                &finished.id,
+                &serde_json::json!({
+                    "task_updates": {
+                        "hunt_verdict": "wounded"
+                    }
+                }),
+            )
+            .await?;
+
+        assert_eq!(updated.hunt_verdict.as_deref(), Some("wounded"));
+        let summaries = manager.list_tasks(Some(10)).await;
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.id == updated.id)
+            .expect("updated task summary");
+        assert_eq!(summary.hunt_verdict.as_deref(), Some("wounded"));
         Ok(())
     }
 

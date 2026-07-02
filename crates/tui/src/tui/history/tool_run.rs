@@ -54,7 +54,7 @@ impl ToolRunActivitySummary {
 ///
 /// Failed, running, patch, review, diff, and plan-update cells split runs so
 /// important state never disappears into a summary row. Successful command
-/// cells can join dense runs; Alt+V / expansion keeps their raw details
+/// cells can join dense runs; `v` / expansion keeps their raw details
 /// available without making routine verifier/shell work dominate the default
 /// transcript.
 pub fn detect_tool_runs(history: &[HistoryCell], min_size: usize) -> Vec<ToolRun> {
@@ -185,7 +185,8 @@ fn classify_tool_run_activity(tool: &ToolCell) -> ToolRunActivity {
 fn classify_tool_name_activity(name: &str) -> ToolRunActivity {
     let normalized = name.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "read_file" | "list_dir" | "view_image" | "explore" => ToolRunActivity::File,
+        "read_file" | "list_dir" | "view_image" | "explore" | "git_log" | "git_show"
+        | "git_blame" => ToolRunActivity::File,
         "grep_files" | "file_search" | "web_search" | "fetch_url" => ToolRunActivity::Search,
         "shell"
         | "exec_shell"
@@ -264,12 +265,19 @@ pub fn tool_run_summary(run: &ToolRun) -> String {
 
     let mut clauses = Vec::new();
     if !parts.is_empty() {
-        clauses.push(format!("Explored {}", parts.join(", ")));
+        let mut explore_clause = format!("Explored {}", parts.join(", "));
+        if let Some(families) =
+            activity_family_summary(run, &[ToolRunActivity::File, ToolRunActivity::Search])
+        {
+            explore_clause.push_str(": ");
+            explore_clause.push_str(&families);
+        }
+        clauses.push(explore_clause);
     }
     if activity.commands > 0 {
         let mut command_clause =
             format!("ran {}", counted(activity.commands, "command", "commands"));
-        if let Some(families) = command_family_summary(run) {
+        if let Some(families) = activity_family_summary(run, &[ToolRunActivity::Command]) {
             command_clause.push_str(": ");
             command_clause.push_str(&families);
         }
@@ -299,14 +307,10 @@ pub fn tool_run_summary(run: &ToolRun) -> String {
     sentence_case_activity(summary)
 }
 
-fn command_family_summary(run: &ToolRun) -> Option<String> {
-    if run.activity.commands == 0 {
-        return None;
-    }
-
+fn activity_family_summary(run: &ToolRun, activities: &[ToolRunActivity]) -> Option<String> {
     let mut families = Vec::new();
     for family in &run.tool_families {
-        if classify_tool_name_activity(family) == ToolRunActivity::Command
+        if activities.contains(&classify_tool_name_activity(family))
             && !families.iter().any(|existing| existing == family)
         {
             families.push(family.as_str());

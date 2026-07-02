@@ -4,18 +4,29 @@
 //! prompt, and cancel. It keeps stdout protocol-clean for editor clients and
 //! routes prompts through the same configured DeepSeek client as one-shot CLI
 //! mode.
+//!
+//! `session/prompt` streams the provider response: each text delta is emitted
+//! as a `session/update` agent_message_chunk as it arrives, instead of buffering
+//! the whole turn and sending one chunk at the end. The stream is consumed
+//! concurrently with the input reader so that a `session/cancel` for the same
+//! session can interrupt the turn mid-stream (returning `stopReason: "cancelled"`)
+//! instead of being queued behind it. A single writer task is preserved so
+//! stdout stays protocol-clean.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 
 use crate::client::DeepSeekClient;
-use crate::config::Config;
-use crate::llm_client::LlmClient;
-use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt};
+use crate::config::{ApiProvider, Config};
+use crate::llm_client::{LlmClient, StreamEventBox};
+use crate::models::{
+    ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent, SystemPrompt,
+};
 
 const ACP_PROTOCOL_VERSION: u64 = 1;
 
@@ -61,7 +72,69 @@ pub async fn run_acp_server(config: Config, model: String, default_cwd: PathBuf)
         };
         let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
 
-        match server.handle_request(method, params, &mut writer).await {
+        // `session/prompt` is driven concurrently with the reader so a
+        // `session/cancel` can interrupt the in-flight provider call. Every
+        // other method is request/response and handled synchronously below.
+        if method == "session/prompt" {
+            match server.begin_prompt(params) {
+                Ok(prepared) => {
+                    let PreparedPrompt {
+                        session_id,
+                        messages,
+                        cwd,
+                    } = prepared;
+                    // Opening the stream borrows `&server` only briefly; the
+                    // returned `StreamEventBox` is `'static`, so it can be raced
+                    // against the reader without holding a borrow on the server,
+                    // and the main task keeps exclusive ownership of stdout.
+                    match server.open_prompt_stream(&messages, &cwd).await {
+                        Ok(stream) => {
+                            let outcome =
+                                drive_prompt_stream(stream, &session_id, &mut reader, &mut writer)
+                                    .await;
+                            match outcome {
+                                Ok(PromptOutcome::Completed(output)) => {
+                                    // Chunks were already streamed; record the full
+                                    // assistant turn in history for the next prompt.
+                                    server.finish_prompt(&session_id, &output);
+                                    if let Some(id) = id {
+                                        write_jsonrpc_result(
+                                            &mut writer,
+                                            id,
+                                            json!({ "stopReason": "end_turn" }),
+                                        )
+                                        .await?;
+                                    }
+                                }
+                                Ok(PromptOutcome::Cancelled) => {
+                                    if let Some(id) = id {
+                                        write_jsonrpc_result(
+                                            &mut writer,
+                                            id,
+                                            json!({ "stopReason": "cancelled" }),
+                                        )
+                                        .await?;
+                                    }
+                                }
+                                Err(err) => {
+                                    write_jsonrpc_error(&mut writer, id, -32603, err.to_string())
+                                        .await?;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            write_jsonrpc_error(&mut writer, id, -32603, err.to_string()).await?;
+                        }
+                    }
+                }
+                Err(err) => {
+                    write_jsonrpc_error(&mut writer, id, err.code, err.message).await?;
+                }
+            }
+            continue;
+        }
+
+        match server.handle_request(method, params).await {
             Ok(AcpDispatch::Response(result)) => {
                 if let Some(id) = id {
                     write_jsonrpc_result(&mut writer, id, result).await?;
@@ -82,6 +155,146 @@ pub async fn run_acp_server(config: Config, model: String, default_cwd: PathBuf)
     Ok(())
 }
 
+/// Outcome of a `session/prompt` turn driven against the input stream.
+#[derive(Debug, PartialEq, Eq)]
+enum PromptOutcome {
+    /// The provider call finished first; carries the assistant text.
+    Completed(String),
+    /// A matching `session/cancel` arrived before the call finished.
+    Cancelled,
+}
+
+/// The text payload an ACP client should see for a given stream event, if any.
+/// ACP baseline is text-only, so thinking/tool/control events carry no chunk.
+fn stream_text_chunk(event: &StreamEvent) -> Option<&str> {
+    match event {
+        StreamEvent::ContentBlockDelta {
+            delta: Delta::TextDelta { text },
+            ..
+        } => Some(text),
+        StreamEvent::ContentBlockStart {
+            content_block: ContentBlockStart::Text { text },
+            ..
+        } => Some(text),
+        _ => None,
+    }
+}
+
+/// Consume a provider response `stream`, emitting each text delta as a
+/// `session/update` chunk, while concurrently watching `reader` for a
+/// `session/cancel` targeting `session_id`.
+///
+/// This is the streaming + cancellation control point. It is generic over the
+/// reader/writer and takes the boxed stream, so it is unit-tested with canned
+/// in-memory streams and readers — no real provider call required. The caller
+/// keeps the only writer, so streamed chunks and acknowledgements all stay on
+/// the single protocol-clean stdout stream.
+///
+/// Returns [`PromptOutcome::Completed`] with the full accumulated text once the
+/// stream ends (or emits `message_stop`), so the caller can record the turn in
+/// history. A matching `session/cancel` (request or notification form) ends it
+/// early with [`PromptOutcome::Cancelled`] — dropping the stream aborts the
+/// underlying provider connection. The turn is single-flight: a cancel for a
+/// different session is acknowledged and ignored; any other concurrent *request*
+/// is rejected with a clear error so the client is not left waiting;
+/// notifications without an id are ignored.
+async fn drive_prompt_stream<R, W>(
+    mut stream: StreamEventBox,
+    session_id: &str,
+    reader: &mut Lines<R>,
+    writer: &mut W,
+) -> Result<PromptOutcome>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut accumulated = String::new();
+    // Once input closes mid-turn we stop selecting on the reader and just drain
+    // the stream to completion, rather than spinning on repeated EOFs.
+    let mut reader_open = true;
+    loop {
+        tokio::select! {
+            event = stream.next() => {
+                match event {
+                    // Stream exhausted without an explicit stop: turn is done.
+                    None => return Ok(PromptOutcome::Completed(accumulated)),
+                    Some(Ok(event)) => {
+                        if let Some(text) = stream_text_chunk(&event) {
+                            if !text.is_empty() {
+                                accumulated.push_str(text);
+                                write_session_update(writer, session_id, text.to_string()).await?;
+                            }
+                        }
+                        match event {
+                            StreamEvent::MessageStop => {
+                                return Ok(PromptOutcome::Completed(accumulated));
+                            }
+                            StreamEvent::Error { error } => {
+                                return Err(anyhow!("provider stream error: {error}"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Err(err)) => return Err(err),
+                }
+            }
+            line = reader.next_line(), if reader_open => {
+                let line = match line? {
+                    Some(line) => line,
+                    // Input closed mid-turn: stop watching it, keep draining.
+                    None => {
+                        reader_open = false;
+                        continue;
+                    }
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let message: Value = match serde_json::from_str(&line) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        write_jsonrpc_error(writer, None, -32700, format!("invalid json: {err}"))
+                            .await?;
+                        continue;
+                    }
+                };
+                let id = message.get("id").cloned();
+                match message.get("method").and_then(Value::as_str) {
+                    Some("session/cancel") => {
+                        let target = message.pointer("/params/sessionId").and_then(Value::as_str);
+                        // A cancel with no sessionId is treated as targeting the
+                        // single in-flight turn.
+                        if target.is_none() || target == Some(session_id) {
+                            if let Some(id) = id {
+                                write_jsonrpc_result(writer, id, json!(null)).await?;
+                            }
+                            // Dropping `stream` on return aborts the provider call.
+                            return Ok(PromptOutcome::Cancelled);
+                        }
+                        // Cancel for some other session: acknowledge, keep going.
+                        if let Some(id) = id {
+                            write_jsonrpc_result(writer, id, json!(null)).await?;
+                        }
+                    }
+                    _ => {
+                        // The turn is single-flight; do not silently drop a
+                        // request the client expects a response to.
+                        if let Some(id) = id {
+                            write_jsonrpc_error(
+                                writer,
+                                Some(id),
+                                -32603,
+                                "a session/prompt turn is already in progress",
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct AcpServer {
     config: Config,
     model: String,
@@ -92,6 +305,15 @@ struct AcpServer {
 struct AcpSession {
     cwd: PathBuf,
     messages: Vec<Message>,
+}
+
+/// The `&mut self` result of validating a `session/prompt`: the user turn is
+/// already recorded, and the cloned conversation + cwd are ready for the
+/// borrow-free provider call that the prompt driver races against cancellation.
+struct PreparedPrompt {
+    session_id: String,
+    messages: Vec<Message>,
+    cwd: PathBuf,
 }
 
 enum AcpDispatch {
@@ -115,25 +337,24 @@ impl AcpServer {
         }
     }
 
-    async fn handle_request<W>(
+    // `session/prompt` is handled in the main loop (it needs to run concurrently
+    // with the reader for cancellation); every other method is request/response.
+    async fn handle_request(
         &mut self,
         method: &str,
         params: Value,
-        writer: &mut W,
-    ) -> std::result::Result<AcpDispatch, AcpError>
-    where
-        W: AsyncWrite + Unpin,
-    {
+    ) -> std::result::Result<AcpDispatch, AcpError> {
         match method {
             "initialize" => Ok(AcpDispatch::Response(initialize_result(
                 params.get("protocolVersion").and_then(Value::as_u64),
                 &self.config,
             ))),
             "session/new" => Ok(AcpDispatch::Response(self.new_session(params)?)),
-            "session/prompt" => {
-                self.prompt(params, writer).await?;
-                Ok(AcpDispatch::Response(json!({ "stopReason": "end_turn" })))
-            }
+            "session/listProviders" => Ok(AcpDispatch::Response(self.list_providers())),
+            "session/currentModel" => Ok(AcpDispatch::Response(self.current_model())),
+            "session/selectModel" => Ok(AcpDispatch::Response(self.select_model(params)?)),
+            // A cancel that arrives with no prompt in flight is an idempotent
+            // no-op (the in-flight case is handled by the prompt driver).
             "session/cancel" => Ok(AcpDispatch::Response(json!(null))),
             "shutdown" => Ok(AcpDispatch::Shutdown),
             _ => Err(AcpError::method_not_found(method)),
@@ -157,14 +378,91 @@ impl AcpServer {
         Ok(json!({ "sessionId": session_id }))
     }
 
-    async fn prompt<W>(
-        &mut self,
-        params: Value,
-        writer: &mut W,
-    ) -> std::result::Result<(), AcpError>
-    where
-        W: AsyncWrite + Unpin,
-    {
+    fn list_providers(&self) -> Value {
+        let mut providers = ApiProvider::sorted_for_display()
+            .into_iter()
+            .map(|provider| {
+                json!({
+                    "id": provider.as_str(),
+                    "displayName": provider.display_name(),
+                    "defaultModel": provider.metadata().map(|metadata| metadata.default_model())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // Include user-defined `[providers.<name>]` custom entries so ACP
+        // clients can discover and round-trip the provider names that
+        // `session/selectModel` now accepts (#1519).
+        if let Some(custom) = self.config.providers.as_ref().map(|p| &p.custom) {
+            let mut names = custom.keys().collect::<Vec<_>>();
+            names.sort();
+            for name in names {
+                providers.push(json!({
+                    "id": name,
+                    "displayName": name,
+                    "defaultModel": custom.get(name).and_then(|cfg| cfg.model.clone())
+                }));
+            }
+        }
+
+        json!({ "providers": providers })
+    }
+
+    fn current_model(&self) -> Value {
+        // Prefer the raw configured provider key so a custom `[providers.<name>]`
+        // entry round-trips through ACP instead of canonicalizing to "custom".
+        let provider = match self.config.provider.as_deref() {
+            Some(name) if !name.trim().is_empty() => name.to_string(),
+            _ => self.config.api_provider().as_str().to_string(),
+        };
+        json!({
+            "provider": provider,
+            "model": self.model.as_str()
+        })
+    }
+
+    fn select_model(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
+        let model = params
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AcpError::invalid_params("model is required"))?
+            .to_string();
+
+        if let Some(provider_value) = params.get("provider") {
+            let provider_name = provider_value
+                .as_str()
+                .ok_or_else(|| AcpError::invalid_params("provider must be a string"))?;
+            // Accept either a built-in provider id/alias or a user-defined
+            // custom provider name that has a `[providers.<name>]` table. For
+            // custom providers, preserve the raw key so routing can still find
+            // the configured base URL / auth / model (#1519); canonicalizing to
+            // "custom" would lose that table key.
+            let is_custom = self
+                .config
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.custom_provider_config(provider_name))
+                .is_some();
+            if !is_custom && ApiProvider::parse(provider_name).is_none() {
+                return Err(AcpError::invalid_params(format!(
+                    "unknown provider: {provider_name}"
+                )));
+            }
+            self.config.provider = Some(provider_name.to_string());
+        }
+
+        self.model = model;
+        Ok(self.current_model())
+    }
+
+    /// Validate a `session/prompt` request and append the user turn to history,
+    /// returning the cloned conversation for the (borrow-free) provider call.
+    ///
+    /// This is the `&mut self` half of a prompt turn; the streaming provider
+    /// call lives in [`AcpServer::open_prompt_stream`] (which borrows `&self`
+    /// only and returns a `'static` stream) so it can be raced against the
+    /// reader for cancellation.
+    fn begin_prompt(&mut self, params: Value) -> std::result::Result<PreparedPrompt, AcpError> {
         let session_id = params
             .get("sessionId")
             .and_then(Value::as_str)
@@ -174,7 +472,6 @@ impl AcpServer {
             .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| AcpError::invalid_params("prompt must include text content"))?;
 
-        // Append user message to session history and clone for the LLM call (avoids borrowing self across await)
         let (messages, cwd) = {
             let session = self
                 .sessions
@@ -190,36 +487,41 @@ impl AcpServer {
             (session.messages.clone(), session.cwd.clone())
         };
 
-        let output = self
-            .run_prompt(&messages, &cwd)
-            .await
-            .map_err(|err| AcpError::internal(err.to_string()))?;
-
-        // Append assistant response to session history
-        if !output.is_empty() {
-            {
-                let session = self
-                    .sessions
-                    .get_mut(&session_id)
-                    .ok_or_else(|| AcpError::invalid_params("unknown sessionId"))?;
-                session.messages.push(Message {
-                    role: "assistant".to_string(),
-                    content: vec![ContentBlock::Text {
-                        text: output.clone(),
-                        cache_control: None,
-                    }],
-                });
-            }
-
-            write_session_update(writer, &session_id, output)
-                .await
-                .map_err(|err| AcpError::internal(err.to_string()))?;
-        }
-
-        Ok(())
+        Ok(PreparedPrompt {
+            session_id,
+            messages,
+            cwd,
+        })
     }
 
-    async fn run_prompt(&self, messages: &[Message], cwd: &PathBuf) -> Result<String> {
+    /// Append a completed assistant turn to session history. A cancelled turn
+    /// never calls this, so cancelled output does not pollute the transcript.
+    fn finish_prompt(&mut self, session_id: &str, output: &str) {
+        if output.is_empty() {
+            return;
+        }
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.messages.push(Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: output.to_string(),
+                    cache_control: None,
+                }],
+            });
+        }
+    }
+
+    /// Resolve the route, build the streaming request, and open the provider
+    /// response stream. Borrows `&self` only to read config/model; the returned
+    /// [`StreamEventBox`] is `'static`, so the caller can race it against the
+    /// reader without holding any borrow on the server. The cwd guard only needs
+    /// to cover route resolution and client construction, not stream
+    /// consumption (ACP exposes no file/shell tools), so it is dropped here.
+    async fn open_prompt_stream(
+        &self,
+        messages: &[Message],
+        cwd: &PathBuf,
+    ) -> Result<StreamEventBox> {
         let _cwd_guard = ScopedCurrentDir::new(cwd)?;
         let last_user_text = messages
             .iter()
@@ -256,19 +558,12 @@ impl AcpServer {
             metadata: None,
             thinking: None,
             reasoning_effort,
-            stream: Some(false),
+            stream: Some(true),
             temperature: Some(0.2),
             top_p: Some(0.9),
         };
 
-        let response = client.create_message(request).await?;
-        let mut output = String::new();
-        for block in response.content {
-            if let ContentBlock::Text { text, .. } = block {
-                output.push_str(&text);
-            }
-        }
-        Ok(output)
+        client.create_message_stream(request).await
     }
 }
 
@@ -308,13 +603,6 @@ impl AcpError {
             message: format!("method not found: {method}"),
         }
     }
-
-    fn internal(message: impl Into<String>) -> Self {
-        Self {
-            code: -32603,
-            message: message.into(),
-        }
-    }
 }
 
 fn initialize_result(client_protocol_version: Option<u64>, config: &Config) -> Value {
@@ -324,6 +612,7 @@ fn initialize_result(client_protocol_version: Option<u64>, config: &Config) -> V
             .unwrap_or(ACP_PROTOCOL_VERSION),
         "agentCapabilities": {
             "loadSession": false,
+            "modelSelection": true,
             "promptCapabilities": {
                 "image": false,
                 "audio": false,
@@ -503,6 +792,92 @@ mod tests {
     }
 
     #[test]
+    fn initialize_advertises_model_selection_capability() {
+        let result = initialize_result(Some(1), &Config::default());
+
+        assert_eq!(result["agentCapabilities"]["modelSelection"], true);
+    }
+
+    #[test]
+    fn list_providers_returns_provider_set() {
+        let server = AcpServer::new(
+            Config::default(),
+            "deepseek-chat".into(),
+            PathBuf::from("/tmp"),
+        );
+        let result = server.list_providers();
+        let providers = result["providers"].as_array().expect("providers array");
+
+        assert!(!providers.is_empty());
+        assert!(
+            providers
+                .iter()
+                .any(|provider| provider["id"] == "deepseek")
+        );
+    }
+
+    #[test]
+    fn current_model_reflects_constructor_default() {
+        let config = Config::default();
+        let expected_provider = config.api_provider().as_str();
+        let server = AcpServer::new(config, "deepseek-reasoner".into(), PathBuf::from("/tmp"));
+        let result = server.current_model();
+
+        assert_eq!(result["provider"], expected_provider);
+        assert_eq!(result["model"], "deepseek-reasoner");
+    }
+
+    #[test]
+    fn select_model_updates_active_selection() {
+        let mut server = AcpServer::new(
+            Config::default(),
+            "deepseek-chat".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        let result = server
+            .select_model(json!({ "provider": "openai", "model": "gpt-4o" }))
+            .expect("select model");
+
+        assert_eq!(result["provider"], "openai");
+        assert_eq!(result["model"], "gpt-4o");
+        assert_eq!(server.current_model()["provider"], "openai");
+        assert_eq!(server.current_model()["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn select_model_rejects_unknown_provider() {
+        let mut server = AcpServer::new(
+            Config::default(),
+            "deepseek-chat".into(),
+            PathBuf::from("/tmp"),
+        );
+        let before = server.current_model();
+
+        let err = server
+            .select_model(json!({ "provider": "unknown-provider", "model": "gpt-4o" }))
+            .expect_err("unknown provider rejected");
+
+        assert_eq!(err.code, -32602);
+        assert_eq!(server.current_model(), before);
+    }
+
+    #[test]
+    fn select_model_rejects_missing_model() {
+        let mut server = AcpServer::new(
+            Config::default(),
+            "deepseek-chat".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        let err = server
+            .select_model(json!({ "provider": "openai" }))
+            .expect_err("missing model rejected");
+
+        assert_eq!(err.code, -32602);
+    }
+
+    #[test]
     fn extract_prompt_text_accepts_text_and_resource_blocks() {
         let prompt = json!([
             { "type": "text", "text": "Review this file" },
@@ -659,6 +1034,141 @@ mod tests {
                 _ => String::new(),
             },
             "add one more"
+        );
+    }
+
+    fn lines_from(input: &'static str) -> Lines<BufReader<&'static [u8]>> {
+        BufReader::new(input.as_bytes()).lines()
+    }
+
+    fn text_delta(text: &str) -> StreamEvent {
+        StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: Delta::TextDelta {
+                text: text.to_string(),
+            },
+        }
+    }
+
+    /// A stream that yields the given events immediately, then ends.
+    fn ready_stream(events: Vec<StreamEvent>) -> StreamEventBox {
+        Box::pin(futures_util::stream::iter(
+            events.into_iter().map(Ok::<_, anyhow::Error>),
+        ))
+    }
+
+    /// A stream that never yields, so a concurrent cancel always wins.
+    fn pending_stream() -> StreamEventBox {
+        Box::pin(futures_util::stream::pending::<Result<StreamEvent>>())
+    }
+
+    /// A stream that yields `events` immediately, then emits `message_stop`
+    /// after a short delay — long enough that an already-buffered reader line is
+    /// processed first, making the ordering deterministic in tests.
+    fn events_then_delayed_stop(events: Vec<StreamEvent>) -> StreamEventBox {
+        let head = futures_util::stream::iter(events.into_iter().map(Ok::<_, anyhow::Error>));
+        let tail = futures_util::stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Ok(StreamEvent::MessageStop)
+        });
+        Box::pin(head.chain(tail))
+    }
+
+    fn parse_lines(out: Vec<u8>) -> Vec<Value> {
+        String::from_utf8(out)
+            .expect("utf8")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("json"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn drive_prompt_streams_each_delta_as_a_chunk_then_completes() {
+        let stream = ready_stream(vec![
+            text_delta("hello"),
+            text_delta(" world"),
+            StreamEvent::MessageStop,
+        ]);
+        let mut reader = lines_from("");
+        let mut out = Vec::new();
+
+        let outcome = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
+            .await
+            .expect("driver ok");
+
+        // Full text is accumulated for history...
+        assert_eq!(outcome, PromptOutcome::Completed("hello world".to_string()));
+        // ...and each delta was emitted as its own session/update chunk.
+        let updates = parse_lines(out);
+        assert_eq!(updates.len(), 2);
+        assert!(updates.iter().all(|u| u["method"] == "session/update"));
+        assert_eq!(updates[0]["params"]["update"]["content"]["text"], "hello");
+        assert_eq!(updates[1]["params"]["update"]["content"]["text"], " world");
+    }
+
+    #[tokio::test]
+    async fn drive_prompt_cancels_when_matching_cancel_arrives() {
+        // A provider stream that never finishes within the test.
+        let stream = pending_stream();
+        let mut reader = lines_from(
+            r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"sess_1"}}"#,
+        );
+        let mut out = Vec::new();
+
+        let outcome = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
+            .await
+            .expect("driver ok");
+
+        assert_eq!(outcome, PromptOutcome::Cancelled);
+        // Notification-form cancel (no id) is acknowledged by acting, not writing.
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drive_prompt_ignores_cancel_for_a_different_session() {
+        // The unrelated cancel line is buffered and ready; the delayed stop makes
+        // it process first, proving it does not abort the turn.
+        let stream = events_then_delayed_stop(vec![text_delta("kept")]);
+        let mut reader = lines_from(
+            r#"{"jsonrpc":"2.0","id":7,"method":"session/cancel","params":{"sessionId":"other"}}"#,
+        );
+        let mut out = Vec::new();
+
+        let outcome = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
+            .await
+            .expect("driver ok");
+
+        assert_eq!(outcome, PromptOutcome::Completed("kept".to_string()));
+        // The other-session cancel carried an id, so it was acknowledged with null.
+        let lines = parse_lines(out);
+        assert!(
+            lines
+                .iter()
+                .any(|v| v["id"] == "7" && v["result"] == Value::Null),
+            "expected a null ack for the other-session cancel, got {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_prompt_rejects_a_concurrent_request_but_keeps_running() {
+        let stream = events_then_delayed_stop(vec![text_delta("done")]);
+        // A non-cancel request arrives mid-turn.
+        let mut reader =
+            lines_from(r#"{"jsonrpc":"2.0","id":9,"method":"session/new","params":{}}"#);
+        let mut out = Vec::new();
+
+        let outcome = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
+            .await
+            .expect("driver ok");
+
+        assert_eq!(outcome, PromptOutcome::Completed("done".to_string()));
+        let lines = parse_lines(out);
+        assert!(
+            lines
+                .iter()
+                .any(|v| v["id"] == "9" && v["error"]["code"] == -32603),
+            "expected a prompt-in-progress error for the concurrent request, got {lines:?}"
         );
     }
 

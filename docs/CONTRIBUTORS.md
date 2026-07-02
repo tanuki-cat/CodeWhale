@@ -27,6 +27,35 @@ notes, and relevant issue/PR comments.
 
 ## Contributors by time
 
+<details open>
+<summary><strong>v0.8.66 — release readiness, provider intake &amp; UI hardening</strong></summary>
+
+The v0.8.66 release prepared the 0.8.66 package lane, hardened provider/model
+routing and modal surfaces, advanced Hotbar/sub-agent UI reliability, and pulled
+in several community provider and bridge contributions with release credit.
+
+- **[lerugray](https://github.com/lerugray)** — Sakana AI Fugu provider
+  support across config, CLI, TUI provider picker, docs, and model completions
+  (#3748, harvested)
+- **[greyfreedom](https://github.com/greyfreedom)** — read-only `/config
+  ask-rules` view for resolved ask-rule paths, status, and configured
+  tool/command/path rules (#3569, merged)
+- **[noaft](https://github.com/noaft)** — `/links` provider docs fallback
+  update, including the current CodeWhale docs URL and a Baidu Qianfan docs
+  link (#3621, harvested)
+- **[noaft](https://github.com/noaft)** — OpenModel provider support across
+  config, CLI, TUI provider picker, docs, and registry checks (#3585,
+  harvested)
+- **[pkeging](https://github.com/pkeging)** — WeCom Bridge deployment and
+  security documentation, including the approval-timeout configuration surface
+  (#3640, harvested)
+- **[buko](https://github.com/buko)** — precise Ctrl+O external-editor freeze
+  reproduction that shaped the terminal input-pump fix (#3657)
+- **[cyq1017](https://github.com/cyq1017)** — sub-agent progress-event
+  headroom report that shaped the fanout reliability hardening (#3783)
+
+</details>
+
 <details>
 <summary><strong>v0.8.63 — sub-agent budgets, command extraction &amp; reliability</strong></summary>
 
@@ -258,7 +287,7 @@ patches, and TUI fixes landed alongside first-time and returning contributor wor
 - **[wlon](https://github.com/wlon)** — NVIDIA NIM provider API-key preference diagnosis (#1081)
 - **[Horace Liu](https://github.com/liuhq)** — Nix package support and install documentation (#1173)
 - **[jieshu666](https://github.com/jieshu666)** — terminal repaint flicker reduction (#1563)
-- **[gordonlu](https://github.com/gordonlu)** — Windows Enter / CSI-u input fix, status picker localization (7 MessageIds), and approval dialog localization across 7 locales (#1612, #2896, #2891)
+- **[gordonlu](https://github.com/gordonlu)** — Windows Enter / CSI-u input fix, status picker localization (7 MessageIds), approval dialog localization across 7 locales, and mode picker + composer Vim indicator localization across 7 locales (#1612, #2896, #2891, #2239)
 - **[mdrkrg](https://github.com/mdrkrg)** — first-run onboarding crash fix when the API key is missing (#1598)
 - **[Aitensa](https://github.com/Aitensa)** — CJK wrapping propagation for diff and pager output (#1622)
 - **[qiyan233](https://github.com/qiyan233)** — legacy DeepSeek CN provider alias compatibility (#1645)
@@ -360,6 +389,33 @@ in the changelog. Restoring them with thanks — every one shipped real code.
 - **[Anyexyz](https://github.com/Anyexyz)** — GitHub Actions workflow to sync with the CNB repo
 - **[nightfallsad](https://github.com/nightfallsad)** — clearer `/continue` hint copy
 - **[zxyasfas](https://github.com/zxyasfas)** — align Rust MSRV references with the workspace (#739)
+
+_A follow-up audit of harvested commits (work reimplemented onto a maintainer
+branch rather than merged) surfaced contributors whose machine-readable credit
+was dropped. Restoring them here — every one shipped real code:_
+
+- **[CrepuscularIRIS](https://github.com/CrepuscularIRIS)** — OpenHarmony→Linux npm binary mapping, O(1) job-panel refresh, file-mention UTF-8 boundary safety, Kitty keyboard protocol on Windows, and auto low-motion under Termius/SSH (#1479, #1483, #1494, #1495, #1499, #1475)
+- **[MMMarcinho](https://github.com/MMMarcinho)** — `image_analyze` vision tool (#1467)
+- **[MeAiRobot](https://github.com/MeAiRobot)** — toast-stack overlay z-order fix (#1485)
+- **[NorethSea](https://github.com/NorethSea)** — `update` refreshing the sibling TUI binary (#1492)
+- **[SamhandsomeLee](https://github.com/SamhandsomeLee)** — bundled v4-best-practices skill (#1448)
+- **[YaYII](https://github.com/YaYII)** — opt-in `/translate` command (#1462)
+- **[sandofree](https://github.com/sandofree)** — Tavily and Bocha `web_search` backends (#1294)
+- **[tiger-dog](https://github.com/tiger-dog)** — approval one-line banner and Markdown underscore handling (#1455)
+- **[Jianfengwu2024](https://github.com/Jianfengwu2024)** — preserving MSVC toolchain vars in the child environment (#1487)
+- **[wplll](https://github.com/wplll)** — prompt-cache warmup keys, tool-catalog handling, a dedup test, and pack ordering (#2390, #2391, #2392, #2393)
+
+Additional harvested PRs from the same audit, credited to contributors already
+listed above: **[axobase001](https://github.com/axobase001)** (#2400, #2405, #2406, #2407, #2408, #2415), **[cyq1017](https://github.com/cyq1017)** (#2516, #2534, #2540), **[Oliver-ZPLiu](https://github.com/Oliver-ZPLiu)** (#1451, #1456), **[reidliu41](https://github.com/reidliu41)** (#1444, #1493), **[lucaszhu-hue](https://github.com/lucaszhu-hue)** (#1436, #2343), **[h3c-hexin](https://github.com/h3c-hexin)** (#1480), **[Duducoco](https://github.com/Duducoco)** (#1345), **[zhuangbiaowei](https://github.com/zhuangbiaowei)** (#1416), **[wdw8276](https://github.com/wdw8276)** (#1498), and **[buko](https://github.com/buko)** (#2377).
+
+_A further machine-credit pass restored these contributors, missing from both the
+list above and the contribution graph (AUTHOR_MAP entries added; logins/IDs
+verified against the GitHub user API) — every one shipped real code:_
+
+- **[1Git2Clone](https://github.com/1Git2Clone)** — `Ctrl+P`/`Ctrl+N` slash-menu navigation
+- **[rockeverm3m](https://github.com/rockeverm3m)** — community ACP adapter reference in the docs
+- **[hxy91819](https://github.com/hxy91819)** — stable MCP tool ordering for prefix-cache stability (#1319)
+- **[heloanc](https://github.com/heloanc)** — Home/End keys moving the cursor in the input box (#1246)
 
 </details>
 

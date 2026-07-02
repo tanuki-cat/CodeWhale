@@ -6,15 +6,18 @@
   **not** hard-code a device-specific checkout path here — work in whichever
   local checkout you have and always **confirm with
   `git branch --show-current` before editing.**
-- **Active branch:** `codex/v0.8.63-integration` (also at
-  `origin/codex/v0.8.63-integration`) for the current fix/integration lane.
-  If a newer handoff or objective file names a different branch, verify with
-  `git branch --show-current` and follow the live branch.
-- **Workspace version is `0.8.63`** in `Cargo.toml`. Do not bump versions
-  opportunistically; version bumps, tags, release artifacts, publishing, and
-  GitHub Releases require Hunter's explicit approval.
-- **Milestone guidepost:** GitHub milestone `v0.8.63`. Check live state with
-  `gh issue list --repo Hmbown/CodeWhale --milestone "v0.8.63" --state open`.
+- **Active branch:** start from live truth, not a hard-coded lane. Confirm the
+  current fix/integration branch from the latest handoff/objective file and
+  `git branch --show-current`; recent work has landed on `main` through small
+  PRs rather than a long-lived `codex/...` integration branch, so don't assume a
+  named integration branch still exists — verify before relying on it.
+- **Workspace version:** read it from `Cargo.toml` (`[workspace.package]
+  version`); it advances per release lane, so don't trust a number memorized
+  here. Do not bump versions opportunistically; version bumps, tags, release
+  artifacts, publishing, and GitHub Releases require Hunter's explicit approval.
+- **Milestone guidepost:** use the current release milestone named in the active
+  handoff and list it live, e.g.
+  `gh issue list --repo Hmbown/CodeWhale --milestone "<current milestone>" --state open`.
 - **Default branch is `main`.** Never commit directly to `main`; work on the
   active integration branch or a fresh `codex/...` branch/worktree off it for
   an isolated change. Open a PR into `main` only when a unit of work is
@@ -93,11 +96,20 @@
   author where possible, add `Co-authored-by` using `.github/AUTHOR_MAP` or
   GitHub numeric noreply identity, and include `Harvested from PR #N by
   @handle` in the commit body so the auto-close workflow can close the PR with
-  credit after it reaches `main`.
+  credit after it reaches `main`. Merge a PR whose commit carries that line
+  with rebase or a merge commit, never squash: a squash can rewrite the body,
+  drop the `Harvested from PR` line, and silently lose both the
+  machine-readable credit and the auto-close.
+- Never add bot/tool `Co-authored-by` trailers (Claude, codex, cursor,
+  `noreply@anthropic.com`): `scripts/check-coauthor-trailers.py` rejects them on
+  harvest commits — contributor trailers are for humans. Also refresh the manual
+  credit surfaces that do not auto-populate from trailers: `docs/CONTRIBUTORS.md`
+  and `CHANGELOG.md`.
 - Close or update issues and PRs only after verifying the landed commit on the
   relevant branch. If the release branch already contains equivalent behavior,
   leave a clear note linking the commit and describing any remaining delta.
-- For the active release queue, start from the GitHub `v0.8.63` milestone
-  (`gh issue list --repo Hmbown/CodeWhale --milestone "v0.8.63"`) and refresh
-  state before acting. Older per-version triage docs under `docs/` are
+- For the active release queue, start from the current GitHub release milestone
+  named in the active handoff
+  (`gh issue list --repo Hmbown/CodeWhale --milestone "<current milestone>"`) and
+  refresh state before acting. Older per-version triage docs under `docs/` are
   historical reference only.

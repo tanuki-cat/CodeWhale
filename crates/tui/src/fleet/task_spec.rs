@@ -11,7 +11,6 @@ use codewhale_protocol::fleet::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use super::ledger::FleetLedger;
 
@@ -74,6 +73,8 @@ pub struct FleetTaskVerificationInput {
     pub worker_id: String,
     pub exit_code: Option<i32>,
     pub artifacts: Vec<FleetArtifactRef>,
+    /// Resolved-route snapshot to persist on the receipt (#3154).
+    pub resolved_route: Option<FleetResolvedRoute>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,8 +128,64 @@ pub fn validate_task_spec_document(doc: &FleetTaskSpecDocument) -> Result<()> {
         {
             bail!("fleet task {} objective cannot be empty", task.id);
         }
+        validate_worker_profile(&task.id, task.worker.as_ref())?;
         validate_tags(&task.id, &task.tags)?;
         validate_workspace_requirements(task)?;
+    }
+    Ok(())
+}
+
+fn validate_worker_profile(task_id: &str, worker: Option<&FleetTaskWorkerProfile>) -> Result<()> {
+    let Some(worker) = worker else {
+        return Ok(());
+    };
+    validate_worker_token(
+        task_id,
+        "worker.agent_profile",
+        worker.agent_profile.as_deref(),
+    )?;
+    validate_worker_token(task_id, "worker.loadout", worker.loadout.as_deref())?;
+    validate_worker_token(task_id, "worker.model_class", worker.model_class.as_deref())?;
+    validate_worker_model(task_id, worker.model.as_deref())?;
+    Ok(())
+}
+
+fn validate_worker_token(task_id: &str, field: &str, value: Option<&str>) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("fleet task {task_id} {field} cannot be empty");
+    }
+    if trimmed != value || !trimmed.chars().all(is_worker_token_char) {
+        bail!(
+            "fleet task {task_id} {field} must be a simple token, not a path or provider/model id"
+        );
+    }
+    Ok(())
+}
+
+fn is_worker_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
+}
+
+fn validate_worker_model(task_id: &str, value: Option<&str>) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("fleet task {task_id} worker.model cannot be empty");
+    }
+    if trimmed != value
+        || !trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_graphic() && !matches!(ch, '=' | '\'' | '"'))
+    {
+        bail!(
+            "fleet task {task_id} worker.model must be a visible model id without whitespace or secrets"
+        );
     }
     Ok(())
 }
@@ -157,11 +214,10 @@ pub fn write_fleet_artifact_ref(
     }
     std::fs::write(&abs_path, contents)
         .with_context(|| format!("writing fleet artifact {}", abs_path.display()))?;
-    let digest = Sha256::digest(contents);
     Ok(FleetArtifactRef {
         kind,
         path: rel_path,
-        checksum: Some(format!("sha256:{digest:x}")),
+        checksum: Some(format!("sha256:{}", crate::hashing::sha256_hex(contents))),
         mime_type: mime_type.map(str::to_string),
         size_bytes: Some(contents.len() as u64),
     })
@@ -243,6 +299,7 @@ pub fn record_verification_receipt(
         failure_kind: verification.failure_kind,
         artifacts,
         score: Some(verification.score),
+        resolved_route: input.resolved_route.clone(),
     };
     ledger.record_receipt(receipt.clone())?;
     Ok(receipt)
@@ -553,7 +610,11 @@ mod tests {
             objective: Some(format!("Verify {id}")),
             instructions: format!("do {id}"),
             worker: Some(FleetTaskWorkerProfile {
+                agent_profile: None,
                 role: Some("reviewer".to_string()),
+                loadout: None,
+                model_class: None,
+                model: None,
                 tool_profile: Some("read-only".to_string()),
                 tools: vec!["git".to_string()],
                 capabilities: vec!["rust".to_string()],
@@ -614,6 +675,95 @@ mod tests {
     }
 
     #[test]
+    fn fleet_task_spec_document_parses_worker_profile_loadout_intent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("fleet-profile-task.json");
+        let doc = json!({
+            "name": "profile loadout smoke",
+            "tasks": [{
+                "id": "review",
+                "name": "review",
+                "instructions": "review the patch",
+                "worker": {
+                    "profile": "adversarial_reviewer",
+                    "role": "reviewer",
+                    "loadout": "auto",
+                    "model_class": "balanced",
+                    "model": "deepseek-v4-pro",
+                    "tool_profile": "read-only",
+                    "tools": ["read_file", "grep_files"],
+                    "capabilities": ["rust"]
+                }
+            }]
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let parsed = load_task_spec_document(&path).unwrap();
+        let worker = parsed.tasks[0].worker.as_ref().unwrap();
+
+        assert_eq!(
+            worker.agent_profile.as_deref(),
+            Some("adversarial_reviewer")
+        );
+        assert_eq!(worker.role.as_deref(), Some("reviewer"));
+        assert_eq!(worker.loadout.as_deref(), Some("auto"));
+        assert_eq!(worker.model_class.as_deref(), Some("balanced"));
+        assert_eq!(worker.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(worker.tool_profile.as_deref(), Some("read-only"));
+    }
+
+    #[test]
+    fn fleet_task_spec_rejects_unsafe_worker_profile_intent_tokens() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("unsafe-profile-task.json");
+        let doc = json!({
+            "tasks": [{
+                "id": "review",
+                "name": "review",
+                "instructions": "review the patch",
+                "worker": {
+                    "profile": "../secrets",
+                    "loadout": "openrouter/deepseek",
+                    "model_class": "",
+                    "model": "deepseek/deepseek-v4-pro"
+                }
+            }]
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let err = load_task_spec_document(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("worker.agent_profile must be a simple token"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn fleet_task_spec_rejects_secret_like_worker_model() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("unsafe-worker-model.json");
+        let doc = json!({
+            "tasks": [{
+                "id": "review",
+                "name": "review",
+                "instructions": "review the patch",
+                "worker": {
+                    "model": "deepseek-v4-pro api_key=secret"
+                }
+            }]
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let err = load_task_spec_document(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("worker.model must be a visible model id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn fleet_task_spec_artifact_refs_are_bounded_paths() {
         let tmp = TempDir::new().unwrap();
         let artifact = write_fleet_artifact_ref(
@@ -647,6 +797,7 @@ mod tests {
             worker_id: "worker-1".to_string(),
             exit_code: Some(0),
             artifacts: vec![],
+            resolved_route: None,
         };
 
         let pass = verify_task_result(
@@ -753,6 +904,7 @@ mod tests {
             worker_id: "worker-1".to_string(),
             exit_code: Some(1),
             artifacts: vec![log],
+            resolved_route: None,
         };
         let verification = verify_task_result(
             tmp.path(),

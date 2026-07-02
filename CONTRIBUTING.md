@@ -162,7 +162,10 @@ dependent layers. For those changes, use this workflow:
    but leaves follow-up work.
 7. Structured commits are fine during review. Maintainers may squash or harvest
    at merge time, with contributor credit preserved through authorship,
-   co-author trailers, changelog entries, or PR/issue comments.
+   co-author trailers, changelog entries, or PR/issue comments. When the merge
+   commit itself carries a `Harvested from PR #N by @author` line, that PR is
+   merged with rebase or a merge commit rather than squashed, so the line
+   reaches `main` intact and the auto-close credit fires.
 
 Before asking for merge review on a layered PR, check that it is:
 
@@ -329,13 +332,13 @@ these crates, including the bottom-up build order.
 
 A well-structured PR follows a consistent pattern. Recent exemplars include:
 
-- **#386** — `/init` command: new `crates/tui/src/commands/init.rs` module, project-type detection,
+- **#386** — `/init` command: new `crates/tui/src/commands/groups/project/init.rs` module, project-type detection,
   AGENTS.md generation, command registration in `commands/mod.rs`, localization strings.
 - **#389** — Inline LSP diagnostics: LSP subsystem in `crates/tui/src/lsp/`, engine hooks in
-  `core/engine/lsp_hooks.rs`, config toggle, test coverage.
+  `crates/tui/src/core/engine/lsp_hooks.rs`, config toggle, test coverage.
 - **#387** — Self-update: new `crates/cli/src/update.rs` module, CLI subcommand registration,
   HTTP download + SHA256 verification + atomic binary replacement.
-- **#393** — `/share` session URL: new `crates/tui/src/commands/share.rs`, HTML rendering,
+- **#393** — `/share` session URL: new `crates/tui/src/commands/groups/project/share.rs`, HTML rendering,
   `gh gist create` integration, command registration.
 - **#343/#346** — (v0.8.5) Runtime thread/turn timeline and durable task manager refactors.
 

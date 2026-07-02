@@ -2,8 +2,8 @@
 //!
 //! These helpers normalise the cross-platform variations between
 //! `Ctrl+…` (Linux/Windows) and `Cmd+…` (macOS), legacy `Ctrl+H`-as-
-//! backspace handling, and the macOS Option-Latin-character escapes
-//! (`Option+V` produces `\u{221A}` instead of `v`). Centralising them
+//! backspace handling, and the macOS Option-Latin-character escapes.
+//! Centralising them
 //! keeps the composer / transcript event loops in `ui.rs` short and
 //! lets us add a new platform without touching the call sites.
 
@@ -57,18 +57,11 @@ pub(super) fn is_file_tree_toggle_shortcut(key: &KeyEvent) -> bool {
 }
 
 pub(super) fn tool_details_shortcut_label() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "\u{2325}+V"
-    } else {
-        "Alt+V"
-    }
+    "v"
 }
 
-pub(super) fn tool_details_shortcut_hint_label() -> &'static str {
-    match tool_details_shortcut_label() {
-        "\u{2325}+V" => "\u{2325}+V/v",
-        _ => "Alt+V/v",
-    }
+pub(super) fn tool_details_shortcut_action_hint(noun: &str) -> String {
+    format!("{} opens {noun}", tool_details_shortcut_label())
 }
 
 pub(super) fn activity_shortcut_label() -> &'static str {
@@ -76,7 +69,7 @@ pub(super) fn activity_shortcut_label() -> &'static str {
 }
 
 /// Modifier predicate for the v0.8.30 family of `Alt+<key>` transcript-
-/// nav shortcuts (`Alt+G` / `Alt+[` / `Alt+]` / `Alt+?` / `Alt+L` / `Alt+V`). Requires
+/// nav shortcuts (`Alt+G` / `Alt+[` / `Alt+]` / `Alt+?` / `Alt+L`). Requires
 /// `Alt` and disallows `Ctrl` / `Super` so the
 /// bindings don't collide with platform clipboard / window-management
 /// shortcuts. `Shift` is permitted so the capital-letter forms work on

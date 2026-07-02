@@ -10,10 +10,14 @@ use std::path::Path;
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 
+use codewhale_config::route::RouteLimits;
+
 use crate::compaction::{estimate_input_tokens_conservative, estimate_text_tokens_conservative};
-use crate::config::Config;
-use crate::models::{ContentBlock, Message, context_window_for_model};
+use crate::config::{ApiProvider, Config, provider_capability};
+use crate::context_budget::PressureLevel;
+use crate::models::{ContentBlock, Message};
 use crate::prompts::{COMPACT_TEMPLATE, Personality};
+use crate::route_budget::route_context_window_tokens;
 use crate::tui::app::App;
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,13 +103,36 @@ impl SourceEntry {
             truncation_reason: Some(reason.into()),
         }
     }
+
+    fn diagnostic(
+        source_kind: SourceKind,
+        label: impl Into<String>,
+        source_path: Option<String>,
+        activation_reason: ActivationReason,
+        detail: impl Into<String>,
+        estimated_tokens: usize,
+        authority_tier: Option<u8>,
+    ) -> Self {
+        Self {
+            source_kind,
+            label: label.into(),
+            source_path,
+            activation_reason,
+            estimated_tokens,
+            counting_confidence: CountingConfidence::High,
+            authority_tier,
+            truncation_reason: Some(detail.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     Constitution,
+    RepoConstitution,
     ProjectContext,
+    ProjectContextWarning,
     ProjectContextPack,
     SkillsBlock,
     ContextManagement,
@@ -157,7 +184,9 @@ impl ReportBuilder {
 
     fn finish(
         self,
+        provider: ApiProvider,
         model: &str,
+        route_limits: Option<RouteLimits>,
         active_context_estimated_tokens: usize,
         note: impl Into<String>,
     ) -> PromptSourceMap {
@@ -166,7 +195,11 @@ impl ReportBuilder {
             .iter()
             .map(|entry| entry.estimated_tokens)
             .sum();
-        let context_window_tokens = context_window_for_model(model);
+        // Overlay the resolved route's context window when known, falling back
+        // to the provider+model capability matrix (route_context_window_tokens
+        // always yields a concrete value, so this is never None at runtime).
+        let context_window_tokens =
+            Some(route_context_window_tokens(provider, model, route_limits));
         let budget_used_percent = context_window_tokens.map(|window| {
             ((active_context_estimated_tokens as f64 / f64::from(window)) * 100.0).clamp(0.0, 100.0)
         });
@@ -188,7 +221,9 @@ pub fn build_context_report(app: &App) -> PromptSourceMap {
     let active_context_estimated_tokens =
         estimate_input_tokens_conservative(&app.api_messages, app.system_prompt.as_ref());
     builder.finish(
+        app.api_provider,
         &app.model,
+        app.active_route_limits,
         active_context_estimated_tokens,
         "Diagnostic source map. Token counts are conservative estimates and may differ from provider billing.",
     )
@@ -201,8 +236,12 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
         crate::tui::app::resolve_skills_dir(workspace, &global_skills_dir, config);
     let mut builder = base_source_entries(&model, workspace, Some(&selected_skills_dir));
     let memory_path = config.memory_path();
+    let memory_enabled = config.memory_enabled();
+    let moraine_fallback = config.moraine_fallback();
 
-    if let Some(memory_block) = crate::memory::compose_block(config.memory_enabled(), &memory_path)
+    // TODO(v0.8.71): remove legacy memory push/inject when Moraine recall stable; see #3490, #3495
+    if let Some(memory_block) =
+        crate::memory::compose_block(memory_enabled && !moraine_fallback, &memory_path)
     {
         builder.push(SourceEntry::text(
             SourceKind::UserMemory,
@@ -219,7 +258,11 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
             "User memory",
             Some(memory_path.display().to_string()),
             Some(6),
-            "disabled, missing, or empty",
+            if moraine_fallback && memory_enabled {
+                "disabled by moraine_fallback"
+            } else {
+                "disabled, missing, or empty"
+            },
         ));
     }
 
@@ -229,10 +272,12 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
         None,
         ActivationReason::RuntimeState,
         &format!(
-            "provider: {}\nmodel: {}\ncontext_window: {:?}",
+            "provider: {}\nmodel: {}\ncontext_window: {}",
             config.api_provider().as_str(),
             model,
-            context_window_for_model(&model)
+            // Route limits aren't resolved in the headless doctor path, so report
+            // the provider+model capability window (route overlay is unavailable).
+            provider_capability(config.api_provider(), &model).context_window
         ),
         CountingConfidence::Approximate,
         None,
@@ -244,7 +289,10 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
         .map(|entry| entry.estimated_tokens)
         .sum();
     builder.finish(
+        config.api_provider(),
         &model,
+        // Route limits aren't resolved in the headless doctor path.
+        None,
         active_context_estimated_tokens,
         "Headless diagnostic source map. Conversation, tool results, and live TUI state are unavailable in doctor mode.",
     )
@@ -266,23 +314,63 @@ fn base_source_entries(model: &str, workspace: &Path, skills_dir: Option<&Path>)
     ));
 
     let project_context = crate::project_context::load_project_context_with_parents(workspace);
-    if let Some(block) = project_context.as_system_block() {
+    if let Some(block) = project_context.constitution_block.as_deref() {
+        builder.push(SourceEntry::text(
+            SourceKind::RepoConstitution,
+            "Repository constitution",
+            project_context
+                .constitution_source_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            ActivationReason::FilePresent,
+            block,
+            CountingConfidence::High,
+            Some(4),
+        ));
+    }
+
+    if let Some(content) = project_context.instructions.as_deref() {
+        let source = project_context
+            .source_path
+            .as_ref()
+            .map_or_else(|| "project".to_string(), |p| p.display().to_string());
+        let block = format!(
+            "<project_instructions source=\"{source}\">\n{content}\n</project_instructions>"
+        );
         builder.push(SourceEntry::text(
             SourceKind::ProjectContext,
-            "Project context and repository instructions",
-            Some(workspace.display().to_string()),
+            "Project instructions",
+            project_context
+                .source_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
             ActivationReason::FilePresent,
             &block,
             CountingConfidence::High,
             Some(5),
         ));
-    } else {
+    }
+
+    if project_context.constitution_block.is_none() && project_context.instructions.is_none() {
         builder.push(SourceEntry::omitted(
             SourceKind::ProjectContext,
             "Project context and repository instructions",
             Some(workspace.display().to_string()),
             Some(5),
             "no project context block available",
+        ));
+    }
+    if !project_context.warnings.is_empty() {
+        let warnings = project_context.warnings.join("\n");
+        let estimated_tokens = estimate_text_tokens_conservative(&warnings);
+        builder.push(SourceEntry::diagnostic(
+            SourceKind::ProjectContextWarning,
+            "Project context warnings",
+            Some(workspace.display().to_string()),
+            ActivationReason::RuntimeState,
+            warnings,
+            estimated_tokens,
+            Some(4),
         ));
     }
 
@@ -374,7 +462,10 @@ fn add_app_runtime_entries(builder: &mut ReportBuilder, app: &App) {
         Some(4),
     ));
 
-    if let Some(memory_block) = crate::memory::compose_block(app.use_memory, &app.memory_path) {
+    // TODO(v0.8.71): remove legacy memory push/inject when Moraine recall stable; see #3490, #3495
+    if let Some(memory_block) =
+        crate::memory::compose_block(app.use_memory && !app.moraine_fallback, &app.memory_path)
+    {
         builder.push(SourceEntry::text(
             SourceKind::UserMemory,
             "User memory",
@@ -390,7 +481,11 @@ fn add_app_runtime_entries(builder: &mut ReportBuilder, app: &App) {
             "User memory",
             Some(app.memory_path.display().to_string()),
             Some(6),
-            "disabled, missing, or empty",
+            if app.moraine_fallback && app.use_memory {
+                "disabled by moraine_fallback"
+            } else {
+                "disabled, missing, or empty"
+            },
         ));
     }
 
@@ -565,11 +660,11 @@ fn content_block_text(block: &ContentBlock) -> String {
 }
 
 fn pressure_label(percent: Option<f64>) -> &'static str {
+    // Delegate to the unified pressure thresholds so this diagnostic label can't
+    // drift from `context_budget::PressureLevel`. `None` (unknown window) keeps
+    // its own sentinel since a level requires a usage percentage.
     match percent {
-        Some(value) if value >= 90.0 => "critical",
-        Some(value) if value >= 70.0 => "high",
-        Some(value) if value >= 40.0 => "moderate",
-        Some(_) => "low",
+        Some(value) => PressureLevel::from_usage_percent(value).label(),
         None => "unknown",
     }
 }
@@ -671,7 +766,11 @@ pub fn context_report_json(report: &PromptSourceMap) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::models::Tool;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
 
     #[test]
     fn context_report_json_contains_sources_and_tool_results() {
@@ -704,11 +803,143 @@ mod tests {
             Some(1),
         ));
         add_message_entries(&mut builder, &messages);
-        let report = builder.finish("deepseek-v4-pro", 123, "test");
+        let report = builder.finish(ApiProvider::Deepseek, "deepseek-v4-pro", None, 123, "test");
         let json = context_report_json(&report);
 
         assert!(json.contains("\"source_kind\": \"tool_result\""));
         assert!(json.contains("\"active_context_estimated_tokens\": 123"));
+    }
+
+    #[test]
+    fn context_report_surfaces_repo_constitution_source_and_warnings() {
+        let tmp = tempdir().expect("tempdir");
+        fs::create_dir(tmp.path().join(".git")).expect("mkdir .git");
+        fs::create_dir(tmp.path().join(".codewhale")).expect("mkdir .codewhale");
+        fs::write(
+            tmp.path().join(".codewhale").join("constitution.json"),
+            r#"{
+                "schema_version": 1,
+                "authority": ["current user request"],
+                "branch_policy": "v0.8.53 work targets the codex/v0.8.53 integration branch, not main"
+            }"#,
+        )
+        .expect("write constitution");
+
+        let report = build_headless_context_report(&Config::default(), tmp.path());
+        assert!(
+            report.entries.iter().any(|entry| {
+                entry.source_kind == SourceKind::RepoConstitution
+                    && entry.source_path.as_deref().is_some_and(|path| {
+                        path.replace('\\', "/")
+                            .ends_with(".codewhale/constitution.json")
+                    })
+            }),
+            "repo constitution source should be an explicit source-map entry: {:?}",
+            report.entries
+        );
+        assert!(
+            report.entries.iter().any(|entry| {
+                entry.source_kind == SourceKind::ProjectContextWarning
+                    && entry
+                        .truncation_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("branch_policy appears stale"))
+                    && entry.estimated_tokens > 0
+            }),
+            "repo constitution warnings should be explicit source-map entries: {:?}",
+            report.entries
+        );
+
+        let formatted = format_context_report(&report);
+        assert!(formatted.contains("Repository constitution"));
+        assert!(formatted.contains("Project context warnings"));
+        let json = context_report_json(&report);
+        assert!(json.contains("\"repo_constitution\""));
+        assert!(json.contains("branch_policy appears stale"));
+    }
+
+    #[test]
+    fn app_context_report_omits_legacy_memory_when_moraine_fallback_enabled() {
+        let tmp = tempdir().expect("tempdir");
+        let memory_path = tmp.path().join("memory.md");
+        fs::write(&memory_path, "private legacy memory").expect("write memory");
+        let config: Config = toml::from_str(
+            r#"
+            [memory]
+            enabled = true
+            moraine_fallback = true
+            "#,
+        )
+        .expect("parse config");
+        let app = App::new(
+            crate::tui::app::TuiOptions {
+                model: "deepseek-v4-pro".to_string(),
+                workspace: tmp.path().to_path_buf(),
+                config_path: None,
+                config_profile: None,
+                allow_shell: false,
+                use_alt_screen: false,
+                use_mouse_capture: false,
+                use_bracketed_paste: false,
+                max_subagents: 1,
+                skills_dir: PathBuf::from("."),
+                memory_path: memory_path.clone(),
+                notes_path: tmp.path().join("notes.txt"),
+                mcp_config_path: tmp.path().join("mcp.json"),
+                use_memory: true,
+                start_in_agent_mode: true,
+                skip_onboarding: true,
+                yolo: false,
+                resume_session_id: None,
+                initial_input: None,
+            },
+            &config,
+        );
+
+        assert!(app.moraine_fallback);
+        let report = build_context_report(&app);
+        let memory_entry = report
+            .entries
+            .iter()
+            .find(|entry| entry.source_kind == SourceKind::UserMemory)
+            .expect("user memory source entry");
+
+        assert_eq!(memory_entry.activation_reason, ActivationReason::Omitted);
+        assert_eq!(
+            memory_entry.truncation_reason.as_deref(),
+            Some("disabled by moraine_fallback")
+        );
+        assert!(!context_report_json(&report).contains("private legacy memory"));
+    }
+
+    #[test]
+    fn headless_context_report_omits_legacy_memory_when_moraine_fallback_enabled() {
+        let tmp = tempdir().expect("tempdir");
+        let memory_path = tmp.path().join("memory.md");
+        fs::write(&memory_path, "private legacy memory").expect("write memory");
+        let mut config: Config = toml::from_str(
+            r#"
+            [memory]
+            enabled = true
+            moraine_fallback = true
+            "#,
+        )
+        .expect("parse config");
+        config.memory_path = Some(memory_path.to_string_lossy().into_owned());
+
+        let report = build_headless_context_report(&config, tmp.path());
+        let memory_entry = report
+            .entries
+            .iter()
+            .find(|entry| entry.source_kind == SourceKind::UserMemory)
+            .expect("user memory source entry");
+
+        assert_eq!(memory_entry.activation_reason, ActivationReason::Omitted);
+        assert_eq!(
+            memory_entry.truncation_reason.as_deref(),
+            Some("disabled by moraine_fallback")
+        );
+        assert!(!context_report_json(&report).contains("private legacy memory"));
     }
 
     #[test]
@@ -732,11 +963,62 @@ mod tests {
             CountingConfidence::High,
             Some(7),
         ));
-        let report = builder.finish("deepseek-v4-pro", 525, "test");
+        let report = builder.finish(ApiProvider::Deepseek, "deepseek-v4-pro", None, 525, "test");
         let summary = format_context_summary(&report);
 
         assert!(summary.contains("Context Summary"));
         assert!(summary.contains("Tool schemas (500)"));
+    }
+
+    #[test]
+    fn finish_reflects_route_context_window_over_model_default() {
+        // deepseek-v4-pro defaults to a 1M window; a resolved route advertising a
+        // smaller window must win in the report's context_window_tokens.
+        let route_window = 128_000u64;
+        let model_default = crate::models::context_window_for_model("deepseek-v4-pro")
+            .expect("model has a default window");
+        assert_ne!(
+            u64::from(model_default),
+            route_window,
+            "test fixture must differ from the model default to be meaningful"
+        );
+
+        let limits = RouteLimits {
+            context_tokens: Some(route_window),
+            input_tokens: None,
+            output_tokens: None,
+        };
+        let builder = ReportBuilder::new();
+        let report = builder.finish(
+            ApiProvider::Deepseek,
+            "deepseek-v4-pro",
+            Some(limits),
+            10_000,
+            "test",
+        );
+
+        assert_eq!(report.context_window_tokens, Some(route_window as u32));
+        // Budget percent is computed against the route window, not the default.
+        let expected = (10_000.0 / route_window as f64) * 100.0;
+        let actual = report.budget_used_percent.expect("window known");
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "got {actual}, want {expected}"
+        );
+    }
+
+    #[test]
+    fn pressure_label_matches_unified_pressure_levels() {
+        // Boundaries mirror context_budget::PressureLevel.
+        assert_eq!(pressure_label(None), "unknown");
+        assert_eq!(pressure_label(Some(0.0)), "low");
+        assert_eq!(pressure_label(Some(39.9)), "low");
+        assert_eq!(pressure_label(Some(40.0)), "moderate");
+        assert_eq!(pressure_label(Some(74.9)), "moderate");
+        assert_eq!(pressure_label(Some(75.0)), "high");
+        assert_eq!(pressure_label(Some(89.9)), "high");
+        assert_eq!(pressure_label(Some(90.0)), "critical");
+        assert_eq!(pressure_label(Some(100.0)), "critical");
     }
 
     #[test]

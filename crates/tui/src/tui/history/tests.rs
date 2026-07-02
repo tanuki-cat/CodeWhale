@@ -103,6 +103,86 @@ fn render_spillover_annotation_omitted_when_no_path_set() {
 }
 
 #[test]
+fn summarize_tool_args_ignores_control_only_defaults() {
+    let summary = super::summarize_tool_args(&serde_json::json!({
+        "max_count": 15,
+        "timeout_ms": 30_000
+    }));
+
+    assert_eq!(summary, None);
+}
+
+#[test]
+fn summarize_tool_args_falls_back_to_meaningful_unknown_key() {
+    let summary = super::summarize_tool_args(&serde_json::json!({
+        "max_count": 15,
+        "branch": "main"
+    }));
+
+    assert_eq!(summary.as_deref(), Some("branch: main"));
+}
+
+#[test]
+fn compact_git_tool_header_names_tool_not_control_default() {
+    let cell = GenericToolCell {
+        name: "git_log".to_string(),
+        status: ToolStatus::Success,
+        input_summary: Some("max_count: 15".to_string()),
+        output: None,
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+
+    let lines = cell.lines_with_mode(120, true, super::RenderMode::Live);
+    let joined: String = lines
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .collect();
+
+    assert_eq!(lines.len(), 1);
+    assert!(
+        joined.contains("read done · git_log"),
+        "expected exact tool name in compact row: {joined:?}"
+    );
+    assert!(
+        !joined.contains("max_count"),
+        "control defaults should not become the visible tool summary: {joined:?}"
+    );
+}
+
+#[test]
+fn compact_unknown_tool_header_names_tool_not_control_default() {
+    let cell = GenericToolCell {
+        name: "future_private_tool".to_string(),
+        status: ToolStatus::Success,
+        input_summary: Some("max_count: 15".to_string()),
+        output: None,
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+
+    let lines = cell.lines_with_mode(120, true, super::RenderMode::Live);
+    let joined: String = lines
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .collect();
+
+    assert_eq!(lines.len(), 1);
+    assert!(
+        joined.contains("tool done · future_private_tool"),
+        "expected exact tool name in compact row: {joined:?}"
+    );
+    assert!(
+        !joined.contains("max_count"),
+        "control defaults should not become the visible tool summary: {joined:?}"
+    );
+}
+
+#[test]
 fn render_spillover_annotation_truncates_to_width() {
     use std::path::PathBuf;
     let long_path = "/Users/dev/.deepseek/tool_outputs/this-is-a-very-long-tool-call-id-that-will-not-fit-in-narrow-widths.txt";
@@ -389,7 +469,7 @@ fn render_checklist_change_card_shows_only_changed_item() {
         "should not show other items: {change_line:?}"
     );
 
-    // The summary line carries the count + Alt+V hint.
+    // The summary line carries the count + explicit details-pager hint.
     let summary_line: String = lines
         .last()
         .unwrap()
@@ -398,7 +478,8 @@ fn render_checklist_change_card_shows_only_changed_item() {
         .map(|s| s.content.as_ref())
         .collect();
     assert!(summary_line.contains("3 items"), "{summary_line:?}");
-    assert!(summary_line.contains("Alt+V"), "{summary_line:?}");
+    let expected_hint = crate::tui::key_shortcuts::tool_details_shortcut_action_hint("full list");
+    assert!(summary_line.contains(&expected_hint), "{summary_line:?}");
 }
 
 #[test]
@@ -1871,9 +1952,9 @@ fn generic_tool_cell_preserves_multi_line_output_in_transcript() {
 }
 
 #[test]
-fn generic_tool_cell_caps_failed_multi_line_output_in_live_with_affordance() {
-    // Failed tools keep error output visible in live mode, capped at
-    // TOOL_OUTPUT_LINE_LIMIT (=6) with an omission marker.
+fn generic_tool_cell_expands_failed_multi_line_output_in_live() {
+    // Failed tools should auto-expand in live mode so the command/input summary
+    // and full error output remain immediately visible.
     let total = 30usize;
     let output = (0..total)
         .map(|i| format!("row {i:02}: payload"))
@@ -1893,20 +1974,16 @@ fn generic_tool_cell_caps_failed_multi_line_output_in_live_with_affordance() {
 
     let live = cell.lines_with_options(80, TranscriptRenderOptions::default());
     let transcript = cell.transcript_lines(80);
-
-    assert!(
-        live.len() < transcript.len(),
-        "live generic-tool output must be shorter than transcript (live={}, transcript={})",
-        live.len(),
-        transcript.len(),
-    );
     let live_text = lines_text(&live);
-    assert!(
-        live_text.contains("lines omitted"),
-        "live view must show the omission marker: {live_text}"
-    );
     let transcript_text = lines_text(&transcript);
+
+    assert!(live_text.contains("command: ls"), "{live_text}");
+    assert!(
+        !live_text.contains("lines omitted"),
+        "failed output must not be hidden behind an omission marker: {live_text}"
+    );
     assert!(transcript_text.contains("row 29"));
+    assert!(live_text.contains("row 29"));
 }
 
 #[test]
@@ -1933,9 +2010,73 @@ fn generic_tool_failed_output_live_renders_card_rail() {
         live_text.starts_with('\u{256D}'),
         "live view must start with card-rail top glyph ╭: {live_text}"
     );
-    assert!(live_text.contains("lines omitted"));
+    assert!(!live_text.contains("lines omitted"), "{live_text}");
     assert!(live_text.contains("line 00"));
     assert!(live_text.contains("line 23"));
+}
+
+#[test]
+fn hidden_tool_details_keeps_failed_generic_output_expanded() {
+    let output = (0..30usize)
+        .map(|i| format!("row {i:02}: payload"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+        name: "read_file".to_string(),
+        status: ToolStatus::Failed,
+        input_summary: Some("command: noisy".to_string()),
+        output: Some(output),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    }));
+
+    let live_text = lines_text(&cell.lines_with_options(
+        80,
+        TranscriptRenderOptions {
+            show_tool_details: false,
+            ..TranscriptRenderOptions::default()
+        },
+    ));
+
+    assert!(
+        !live_text.contains("lines omitted") && !live_text.contains("details"),
+        "failed output must not be hidden behind a details affordance: {live_text}"
+    );
+    assert!(live_text.contains("row 29"), "{live_text}");
+}
+
+#[test]
+fn calm_mode_keeps_failed_generic_output_expanded() {
+    let output = (0..30usize)
+        .map(|i| format!("row {i:02}: payload"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+        name: "read_file".to_string(),
+        status: ToolStatus::Failed,
+        input_summary: Some("command: noisy".to_string()),
+        output: Some(output),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    }));
+
+    let live_text = lines_text(&cell.lines_with_options(
+        80,
+        TranscriptRenderOptions {
+            calm_mode: true,
+            ..TranscriptRenderOptions::default()
+        },
+    ));
+
+    assert!(
+        !live_text.contains("lines omitted") && !live_text.contains("details"),
+        "failed output must not be hidden behind a details affordance: {live_text}"
+    );
+    assert!(live_text.contains("row 29"), "{live_text}");
 }
 
 #[test]
@@ -1997,16 +2138,15 @@ fn tool_output_live_preserves_error_card_rail() {
 
     let live_text = lines_text(&cell.lines_with_options(80, TranscriptRenderOptions::default()));
 
-    // Live mode: one-line summary + omission marker.
     assert!(
-        live_text.contains("lines omitted"),
-        "live view must show the omission marker: {live_text}"
+        !live_text.contains("lines omitted"),
+        "failed output must not be hidden behind an omission marker: {live_text}"
     );
-    // The pre-computed summary captures the first meaningful content.
     assert!(
         live_text.contains("Error:") || live_text.contains("fatal:"),
         "live summary should capture error text: {live_text}"
     );
+    assert!(live_text.contains("final line"), "{live_text}");
 }
 
 // === ErrorEnvelope severity → cell color tests (#66) ===
@@ -2258,7 +2398,25 @@ fn tool_run_summary_reports_compact_success_group() {
 
     let summary = super::tool_run_summary(&run);
 
-    assert_eq!(summary, "Explored 4 files, 1 search");
+    assert_eq!(summary, "Explored 4 files, 1 search: read_file, list_dir");
+}
+
+#[test]
+fn tool_run_summary_keeps_git_history_tools_visible() {
+    let history = vec![
+        success_generic_tool("git_log"),
+        success_generic_tool("git_show"),
+        success_generic_tool("git_blame"),
+    ];
+
+    let runs = super::detect_tool_runs(&history, 3);
+
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].activity.files, 3);
+    assert_eq!(
+        super::tool_run_summary(&runs[0]),
+        "Explored 3 files: git_log, git_show, git_blame"
+    );
 }
 
 #[test]
@@ -2280,7 +2438,7 @@ fn tool_run_summary_lists_only_command_families_for_command_clause() {
 
     assert_eq!(
         super::tool_run_summary(&run),
-        "Explored 2 files, ran 2 commands: run_tests, validate_data"
+        "Explored 2 files: read_file, ran 2 commands: run_tests, validate_data"
     );
 }
 

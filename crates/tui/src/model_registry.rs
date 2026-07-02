@@ -168,7 +168,7 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     // --- MiniMax (config DEFAULT_MINIMAX_MODEL) ---
     ("minimax/minimax-m3", ModelProvider::Minimax),
     ("minimax-m3", ModelProvider::Minimax),
-    ("minimax/minimax-2.7", ModelProvider::Minimax),
+    ("minimax/minimax-m2.7", ModelProvider::Minimax),
     ("minimax-m2.7", ModelProvider::Minimax),
     // --- Qwen (OpenRouter routing defaults) ---
     ("qwen/qwen3.6-flash", ModelProvider::Qwen),

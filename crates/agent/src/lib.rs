@@ -697,9 +697,17 @@ impl Default for ModelRegistry {
                 supports_tools: true,
                 supports_reasoning: false,
             },
+            // OpenModel Anthropic-compatible Messages route
+            ModelInfo {
+                id: "deepseek-v4-flash".to_string(),
+                provider: ProviderKind::Openmodel,
+                aliases: vec!["openmodel".to_string(), "openmodel-deepseek".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
             // MiniMax 2.7 (OpenRouter)
             ModelInfo {
-                id: "minimax/minimax-2.7".to_string(),
+                id: "minimax/minimax-m2.7".to_string(),
                 provider: ProviderKind::Openrouter,
                 aliases: vec![
                     "minimax-2.7".to_string(),
@@ -838,6 +846,21 @@ impl Default for ModelRegistry {
                     "deepseek-v4-flash".to_string(),
                     "di-deepseek-v4-flash".to_string(),
                 ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            // Sakana AI Fugu (https://api.sakana.ai)
+            ModelInfo {
+                id: "fugu".to_string(),
+                provider: ProviderKind::Sakana,
+                aliases: vec!["sakana-fugu".to_string(), "sakana/fugu".to_string()],
+                supports_tools: true,
+                supports_reasoning: false,
+            },
+            ModelInfo {
+                id: "fugu-ultra-20260615".to_string(),
+                provider: ProviderKind::Sakana,
+                aliases: vec!["fugu-ultra".to_string(), "sakana-fugu-ultra".to_string()],
                 supports_tools: true,
                 supports_reasoning: true,
             },
@@ -1447,6 +1470,7 @@ mod tests {
             (ProviderKind::Zai, "GLM-5.2"),
             (ProviderKind::Stepfun, "step-3.7-flash"),
             (ProviderKind::Minimax, "MiniMax-M2.1"),
+            (ProviderKind::Openmodel, "deepseek-v4-flash"),
         ] {
             assert!(
                 models
@@ -1506,7 +1530,7 @@ mod tests {
             ("glm-5.1", "z-ai/glm-5.1"),
             ("glm-5.2", "z-ai/glm-5.2"),
             ("minimax-m3", "minimax/minimax-m3"),
-            ("minimax-2.7", "minimax/minimax-2.7"),
+            ("minimax-2.7", "minimax/minimax-m2.7"),
             ("openrouter-mimo-v2.5-pro", "xiaomi/mimo-v2.5-pro"),
             ("openrouter-kimi-k2.7-code", "moonshotai/kimi-k2.7-code"),
             ("openrouter-kimi-k2.6", "moonshotai/kimi-k2.6"),

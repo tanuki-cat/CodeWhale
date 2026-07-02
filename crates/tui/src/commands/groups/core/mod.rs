@@ -13,12 +13,15 @@ mod clear;
 mod core;
 mod exit;
 mod feedback;
+mod fleet;
 mod help;
 mod hf;
 mod home;
 mod hooks;
+mod hotbar;
 mod links;
 mod model;
+mod modeldb;
 mod models;
 mod profile;
 mod provider;
@@ -26,7 +29,6 @@ mod queue;
 mod rlm;
 mod stash;
 mod subagents;
-mod swarm;
 mod translate;
 pub mod util;
 pub mod voice;
@@ -67,6 +69,10 @@ impl CommandGroup for CoreCommands {
                 models::ModelsCmd::execute,
             )),
             Box::new(FunctionCommand::new(
+                modeldb::ModelDbCmd::info(),
+                modeldb::ModelDbCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
                 provider::ProviderCmd::info(),
                 provider::ProviderCmd::execute,
             )),
@@ -87,12 +93,16 @@ impl CommandGroup for CoreCommands {
                 subagents::SubagentsCmd::execute,
             )),
             Box::new(FunctionCommand::new(
-                agent::AgentCmd::info(),
-                agent::AgentCmd::execute,
+                fleet::FleetCmd::info(),
+                fleet::FleetCmd::execute,
             )),
             Box::new(FunctionCommand::new(
-                swarm::SwarmCmd::info(),
-                swarm::SwarmCmd::execute,
+                hotbar::HotbarCmd::info(),
+                hotbar::HotbarCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                agent::AgentCmd::info(),
+                agent::AgentCmd::execute,
             )),
             Box::new(FunctionCommand::new(
                 links::LinksCmd::info(),

@@ -158,6 +158,12 @@ codewhale doctor --json
 | `config_path` | string | Resolved config file path |
 | `config_present` | bool | Whether the config file exists |
 | `workspace` | string | Default workspace directory |
+| `legacy_state.primary_root` | string | Primary CodeWhale state root inspected for known state paths |
+| `legacy_state.legacy_root` | string | Legacy `.deepseek` state root inspected for known state paths |
+| `legacy_state.needs_attention` | bool | Whether known `~/.deepseek` state paths are unmigrated or also present beside `~/.codewhale` |
+| `legacy_state.legacy_only_count` | number | Count of known state paths present only under the legacy root |
+| `legacy_state.dual_present_count` | number | Count of known state paths present under both primary and legacy roots |
+| `legacy_state.entries` | array | Per-path migration status: `{name, primary_present, legacy_present, status}` |
 | `api_key.source` | string | `env`, `config`, or `missing` |
 | `base_url` | string | API base URL |
 | `default_text_model` | string | Default model |

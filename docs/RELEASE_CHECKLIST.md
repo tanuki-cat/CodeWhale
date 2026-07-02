@@ -1,8 +1,8 @@
 # Release Checklist
 
 A pre-tag checklist that the v0.8.21/v0.8.22 CHANGELOG gap proved we needed.
-Step through this in order from a clean worktree on the release branch
-(`work/vX.Y.Z-...`). Treat any unchecked box as a release blocker.
+Step through this in order from a clean worktree on the final release source.
+Treat any unchecked box as a release blocker.
 
 For deeper context on the underlying tools (preflight scripts, npm smoke,
 publish-crates), see [`RELEASE_RUNBOOK.md`](RELEASE_RUNBOOK.md).
@@ -10,6 +10,29 @@ For larger milestone releases, add any version-specific acceptance matrix to
 the release branch before tagging; use it for provider routes, feature gates,
 GUI/runtime smoke, remote-workbench decisions, and credit hygiene that the
 generic checklist does not enumerate.
+
+## 0. Release source is frozen
+
+- [ ] The live milestone and PR queue no longer contain work intended for this
+      version:
+      ```
+      gh issue list --repo Hmbown/CodeWhale --milestone "vX.Y.Z" --state open
+      gh pr list --repo Hmbown/CodeWhale --state open --limit 100
+      ```
+- [ ] Any remaining same-theme work is explicitly retargeted to a later
+      version or called out as a known issue. Do not bump/tag while still
+      planning to merge more same-version fixes.
+- [ ] The release tag does not already point at an older source SHA, or the
+      maintainer has deliberately chosen to publish exactly that older SHA:
+      ```
+      git ls-remote origin refs/heads/main refs/tags/vX.Y.Z
+      gh release view vX.Y.Z --repo Hmbown/CodeWhale
+      ./scripts/release/check-published.sh X.Y.Z
+      ```
+- [ ] If `vX.Y.Z` exists with no GitHub Release/packages and `main` has moved
+      on, stop. Choose one of: publish the existing tag as-is, bump the later
+      work to the next patch version, or explicitly approve deleting/recreating
+      the unpublished tag. Do not silently move tags during PR cleanup.
 
 ## 1. CHANGELOG entry exists for the version
 
@@ -77,6 +100,9 @@ Run, in order, from the repo root:
 
 - [ ] Branch is pushed: `git push -u origin work/vX.Y.Z-...`
 - [ ] PR opened with `gh pr create --base main --title "chore(release): prepare vX.Y.Z"`
+- [ ] The PR targets `main` and will be merged before any `vX.Y.Z` tag is
+      pushed. Do not tag a release-only branch; GitHub will not process
+      `Closes #N` keywords until those commits reach the default branch.
 - [ ] PR body includes:
   - one-paragraph summary of the release theme
   - a punch list of the new commits since the last release
@@ -137,10 +163,24 @@ release anxiety: contributors cannot tell whether their work merged.
 
 ## 7. Tag and release (after review)
 
-- [ ] `git tag -s vX.Y.Z -m "vX.Y.Z"`
-- [ ] `git push origin vX.Y.Z`
+- [ ] Release PR is merged into `main`, then local `main` is fast-forwarded:
+      `git switch main && git fetch origin main && git merge --ff-only origin/main`
+- [ ] The release source is reachable from `main`:
+      `./scripts/release/ensure-release-on-main.sh HEAD`
+- [ ] Create `vX.Y.Z` from the final `main` SHA using the **Create release tag**
+      workflow, or create and push a signed local tag:
+      `git tag -s vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`
 - [ ] The `release.yml` workflow has built and uploaded artifacts to the
       GitHub release for this tag.
+- [ ] The public GitHub Release assets are proven to match the tag commit
+      before publishing Cargo or npm:
+      ```
+      ./scripts/release/verify-release-assets.sh X.Y.Z
+      ```
+      This checks the local tag, remote tag, successful Release workflow SHA,
+      npm-facing assets, and `codewhale-artifacts-sha256.txt` manifest. If it
+      fails, rerun or repair the GitHub Release workflow before touching any
+      registry.
 - [ ] The live GitHub Release body has its own `## Contributors` or
       `## Credits` section; do not rely on "see CHANGELOG" alone. Verify with:
       ```
@@ -154,6 +194,10 @@ release anxiety: contributors cannot tell whether their work merged.
 - [ ] `crates.io` has the new version (or the `publish-crates.sh` job has
       pushed it).
 - [ ] `ghcr.io/hmbown/codewhale:vX.Y.Z` and `:latest` are updated.
+- [ ] The final registry verification passes:
+      ```
+      ./scripts/release/check-published.sh X.Y.Z
+      ```
 
 ## 8. Post-tag
 

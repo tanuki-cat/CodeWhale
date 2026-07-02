@@ -16,11 +16,11 @@
 # `--provider volcengine`, `--provider openrouter`, `--provider xiaomi-mimo`,
 # `--provider fireworks`, `--provider siliconflow`, `--provider siliconflow-CN`,
 # `/provider arcee`, `/provider moonshot`, `/provider qianfan`, `/provider sglang`, `/provider vllm`,
-# `/provider ollama`, `/provider huggingface`, `/provider stepfun`) toggle without having to re-enter keys. Top-level
+# `/provider ollama`, `/provider huggingface`, `/provider stepfun`, `/provider openmodel`) toggle without having to re-enter keys. Top-level
 # `api_key` / `base_url` are
 # still read as DeepSeek defaults when `[providers.deepseek]` is absent
 # (backward compatibility).
-provider = "deepseek" # deepseek | deepseek-cn | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | qianfan | openai-codex | anthropic | deepinfra
+provider = "deepseek" # deepseek | deepseek-cn | deepseek-anthropic | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | qianfan | openai-codex | anthropic | openmodel | deepinfra | sakana
 api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty
 base_url = "https://api.deepseek.com/beta"
 # provider = "deepseek-cn"                       # legacy alias (official host is still https://api.deepseek.com)
@@ -181,20 +181,63 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
 # prompt_suggestion = true  # opt-in: show ghost-text follow-up question in composer after each turn
 
 # Typed permission rules live in a sibling `permissions.toml` file, not in
-# config.toml. This shape is ask-only and feeds the execution policy engine;
-# allow/deny records, glob expansion, and UI persistence are intentionally out
-# of scope here.
+# config.toml. Each `[[rules]]` entry accepts `tool`, optional `command`
+# or `path`, and an `action` field: `"deny"`, `"ask"` (default), or `"allow"`.
+# Deny always wins over ask, which wins over allow.  Globs, broad directory
+# rules, and a rule editor/deleter UI are future work.
+#
+# In supported approval cards, press `S` to approve once and save exact rules
+# (currently saved as ask-only; deny/allow UI save is future work):
+#   exec_shell  -> exact approved command string
+#   write_file  -> exact workspace-relative target path
+#   edit_file   -> exact workspace-relative target path
+#   apply_patch -> one exact workspace-relative path per validated touched file
+# `read_file` rules can be written manually, but the approval UI does not save
+# them.
 #
 # Example ~/.codewhale/permissions.toml:
 #
 # [[rules]]
 # tool = "exec_shell"
 # command = "cargo test"
+# action = "ask"
+#
+# # Block dangerous commands
+# [[rules]]
+# tool = "exec_shell"
+# command = "sed"
+# action = "deny"
+#
+# [[rules]]
+# tool = "exec_shell"
+# command = "awk"
+# action = "deny"
+#
+# # Allow trusted commands without asking
+# [[rules]]
+# tool = "exec_shell"
+# command = "git status"
+# action = "allow"
+#
+# # Path-based deny
+# [[rules]]
+# tool = "write_file"
+# path = "src/main.rs"
+# action = "deny"
+#
+# [[rules]]
+# tool = "edit_file"
+# path = "src/lib.rs"
+# action = "ask"
+#
+# [[rules]]
+# tool = "apply_patch"
+# path = "src/patch-target.rs"
 #
 # [[rules]]
 # tool = "read_file"
 # path = "secrets/api_key.txt"
-
+# action = "deny"
 # ─────────────────────────────────────────────────────────────────────────────────
 # External Sandbox Backend (pluggable remote execution)
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -276,6 +319,7 @@ max_subagents = 10 # optional (1-20)
 # `--provider siliconflow` / `/provider arcee` / `/provider moonshot`
 # switches between them without having to re-enter keys. Env vars override anything set here:
 #   DeepSeek: DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
+#   DeepSeek Anthropic-compatible: DEEPSEEK_API_KEY, DEEPSEEK_ANTHROPIC_BASE_URL
 #   NIM:      NVIDIA_API_KEY (or NVIDIA_NIM_API_KEY), NIM_BASE_URL
 #             (or NVIDIA_NIM_BASE_URL / NVIDIA_BASE_URL), NVIDIA_NIM_MODEL
 #   OpenAI-compatible: OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
@@ -319,6 +363,13 @@ max_subagents = 10 # optional (1-20)
 # model = "deepseek-ai/DeepSeek-V4-Pro"
 # http_headers = { "X-Model-Provider-Id" = "your-model-provider" } # optional custom request headers
 # path_suffix = "/chat/completions" # override the API path; skips /v1 versioning when set
+# reasoning_stream_style = "inline_tags" # route <think>...</think> content into Thinking cells
+
+# DeepSeek Anthropic-compatible Messages route (opt-in)
+# [providers.deepseek_anthropic]
+# api_key = "YOUR_DEEPSEEK_API_KEY"
+# base_url = "https://api.deepseek.com/anthropic"
+# model = "deepseek-v4-pro"
 # [providers.deepseek.auth] # provider-scoped auth source metadata; command execution lands in a follow-up slice
 # source = "command"
 # command = ["secret-tool", "lookup", "service", "codewhale-deepseek"]
@@ -345,6 +396,7 @@ max_subagents = 10 # optional (1-20)
 # Alibaba Bailian / Model Studio DashScope OpenAI-compatible example:
 # base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 # model = "qwen-plus"
+# context_window = 1000000 # set the gateway/model's real total context window
 # insecure_skip_tls_verify = true # last resort for private gateways; prefer SSL_CERT_FILE
 
 # AtlasCloud OpenAI-compatible endpoint (https://www.atlascloud.ai/docs/models/llm)
@@ -375,7 +427,7 @@ max_subagents = 10 # optional (1-20)
 # base_url = "https://openrouter-compatible.example/v1"
 # model = "deepseek/deepseek-v4-pro"
 # Recent large model IDs also accepted here include arcee-ai/trinity-large-thinking,
-# minimax/minimax-m3, minimax/minimax-2.7, xiaomi/mimo-v2.5-pro, qwen/qwen3.6-flash,
+# minimax/minimax-m3, minimax/minimax-m2.7, xiaomi/mimo-v2.5-pro, qwen/qwen3.6-flash,
 # qwen/qwen3.6-35b-a3b, qwen/qwen3.6-max-preview, qwen/qwen3.6-27b, qwen/qwen3.6-plus,
 # qwen/qwen3.7-max, google/gemma-4-31b-it, z-ai/glm-5.1, z-ai/glm-5.2,
 # moonshotai/kimi-k2.6,
@@ -493,6 +545,15 @@ max_subagents = 10 # optional (1-20)
 # model = "deepseek-ai/DeepSeek-V4-Pro"     # or deepseek-ai/DeepSeek-V4-Flash
 
 # ─────────────────────────────────────────────────────────────────────────────────
+# Sakana AI Fugu Provider (https://api.sakana.ai)
+# Provider aliases: sakana, sakana-ai, sakana_ai, fugu
+# Env var aliases: FUGU_API_KEY, SAKANA_API_KEY
+[providers.sakana]
+# api_key = "YOUR_FUGU_API_KEY"
+# base_url = "https://api.sakana.ai/v1"
+# model = "fugu"                            # or fugu-ultra-20260615
+
+# ─────────────────────────────────────────────────────────────────────────────────
 # Together AI Provider (https://www.together.ai/)
 # Env var aliases: TOGETHER_API_KEY, TOGETHER_BASE_URL, TOGETHER_MODEL
 [providers.together]
@@ -533,6 +594,15 @@ max_subagents = 10 # optional (1-20)
 # api_key = "sk-ant-..."
 # base_url = "https://api.anthropic.com"
 # model = "claude-sonnet-4-6"
+
+# OpenModel Provider (Anthropic-compatible Messages API)
+# Talks to https://api.openmodel.ai/v1/messages with Bearer auth. OpenModel
+# routes DeepSeek, DashScope, Xiaomi, Claude, and other models by model id.
+# Env vars: OPENMODEL_API_KEY, OPENMODEL_BASE_URL, OPENMODEL_MODEL.
+[providers.openmodel]
+# api_key = "om-..."
+# base_url = "https://api.openmodel.ai"
+# model = "deepseek-v4-flash"
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Web Search Provider
@@ -596,6 +666,17 @@ max_subagents = 10 # optional (1-20)
 # allow = ["api.deepseek.com", "github.com", ".githubusercontent.com"]
 # deny = []
 # audit = true            # one line per call to ~/.codewhale/audit.log
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Verifier preview (#2093)
+# ─────────────────────────────────────────────────────────────────────────────────
+# Enables automatic claim-of-done verifier preview once the runtime trigger is
+# active. Manual `run_verifiers` remains available even when this is false.
+# The shipped policy maps pass/partial/fail to hunted/wounded/escaped.
+#
+# [verifier]
+# enabled = false
+# verdict_policy = "hunt"
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Skills (#140)
@@ -867,6 +948,7 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 #   python     → pyright-langserver --stdio
 #   typescript → typescript-language-server --stdio
 #   java       → jdtls
+#   php        → intelephense --stdio
 #   vue        → vue-language-server --stdio
 #   c, cpp     → clangd
 #
@@ -874,6 +956,23 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # not required, and installing IntelliJ IDEA alone does not install `jdtls`.
 #
 # Override the defaults via the `servers` table below.
+#
+# For languages not in the built-in list (Ruby, C#, Swift, etc.), use
+# `[lsp.custom.<ext>]` to register a language server:
+#
+# [lsp.custom.rb]
+# command = "ruby-lsp"
+# args = ["--stdio"]
+# language_id = "ruby"
+#
+# [lsp.custom.cs]
+# command = "csharp-ls"
+# args = []
+# language_id = "csharp"
+#
+# [lsp.custom.swift]
+# command = "sourcekit-lsp"
+# language_id = "swift"
 [lsp]
 # enabled = true
 # poll_after_edit_ms = 5000
@@ -883,6 +982,7 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # rust = ["rust-analyzer"]
 # go = ["gopls", "serve"]
 # java = ["jdtls"]
+# php = ["intelephense", "--stdio"]
 # vue = ["vue-language-server", "--stdio"]
 
 # ─────────────────────────────────────────────────────────────────────────────────

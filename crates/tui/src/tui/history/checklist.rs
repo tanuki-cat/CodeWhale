@@ -126,7 +126,7 @@ pub(super) fn parse_update_prefix(output: &str) -> Option<ChecklistChange> {
 /// Render a compact one-line state-change card for `todo_update` /
 /// `checklist_update` calls (#403). Shows the changed item's marker,
 /// title, and old -> new status, with a `M/N · pct%` progress summary
-/// in the header. The full list is still available via Alt+V on the
+/// in the header. The full list is still available through the tool
 /// detail record.
 pub(super) fn render_checklist_change_card(
     name: &str,
@@ -196,9 +196,10 @@ pub(super) fn render_checklist_change_card(
     lines.push(render_card_detail_line_single(
         None,
         &format!(
-            "{} item{} (Alt+V for full list)",
+            "{} item{}; {}",
             snapshot.total,
-            if snapshot.total == 1 { "" } else { "s" }
+            if snapshot.total == 1 { "" } else { "s" },
+            crate::tui::key_shortcuts::tool_details_shortcut_action_hint("full list")
         ),
         Style::default().fg(palette::TEXT_MUTED),
     ));
@@ -283,7 +284,10 @@ pub(super) fn render_checklist_card(
     if omitted > 0 {
         lines.push(render_card_detail_line_single(
             None,
-            &format!("+{omitted} more (Alt+V for full list)"),
+            &format!(
+                "+{omitted} more; {}",
+                crate::tui::key_shortcuts::tool_details_shortcut_action_hint("full list")
+            ),
             Style::default().fg(palette::TEXT_DIM),
         ));
     }
