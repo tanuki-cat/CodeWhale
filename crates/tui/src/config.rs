@@ -1,7 +1,6 @@
 //! Configuration loading and defaults for codewhale.
 
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::fs;
 #[cfg(unix)]
 use std::io::Write as _;
@@ -71,6 +70,7 @@ pub enum ApiProvider {
     Minimax,
     Deepinfra,
     Sakana,
+    LongCat,
     /// User-defined OpenAI-compatible endpoint (#1519).
     ///
     /// Selected when `provider = "<name>"` names a `[providers.<name>]
@@ -204,6 +204,7 @@ impl ApiProvider {
             Self::Minimax => "https://platform.minimax.io/docs/guides/quickstart-preparation",
             Self::Deepinfra => "https://deepinfra.com/dash/api_keys",
             Self::Sakana => "https://api.sakana.ai/",
+            Self::LongCat => "https://longcat.chat/platform",
             Self::OpenaiCodex | Self::Sglang | Self::Vllm | Self::Ollama => return None,
             // Custom endpoints have no canonical credential page; the user
             // supplies the key via their own `api_key_env`.
@@ -219,7 +220,7 @@ impl ApiProvider {
 
     /// `ApiProvider` discriminant → `ProviderKind` lookup.
     /// Index 1 is `None` for the legacy `DeepseekCN` variant.
-    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 31] = [
+    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 32] = [
         Some(codewhale_config::ProviderKind::Deepseek),
         None, // DeepseekCN
         Some(codewhale_config::ProviderKind::DeepseekAnthropic),
@@ -250,11 +251,12 @@ impl ApiProvider {
         Some(codewhale_config::ProviderKind::Minimax),
         Some(codewhale_config::ProviderKind::Deepinfra),
         Some(codewhale_config::ProviderKind::Sakana),
+        Some(codewhale_config::ProviderKind::LongCat),
         Some(codewhale_config::ProviderKind::Custom),
     ];
 
     /// `ProviderKind` discriminant → `ApiProvider` lookup.
-    const FROM_KIND_LOOKUP: [Self; 30] = [
+    const FROM_KIND_LOOKUP: [Self; 31] = [
         Self::Deepseek,
         Self::DeepseekAnthropic,
         Self::NvidiaNim,
@@ -284,6 +286,7 @@ impl ApiProvider {
         Self::Minimax,
         Self::Deepinfra,
         Self::Sakana,
+        Self::LongCat,
         Self::Custom,
     ];
 
@@ -372,6 +375,10 @@ fn subagent_provider_key_matches(key: &str, provider: ApiProvider) -> bool {
                 | "bigmodel"
                 | "big_model"
                 | "zhipu_glm"
+        ),
+        ApiProvider::LongCat => matches!(
+            normalized.as_str(),
+            "longcat" | "long_cat" | "meituan_longcat" | "meituan"
         ),
         _ => false,
     }
@@ -686,7 +693,6 @@ pub fn requested_model_for_provider(provider: ApiProvider, model: &str) -> Optio
 ///
 /// Returns `Ok(())` for any tuple we cannot confidently reject (the provider
 /// API remains the final authority for those).
-#[cfg(test)]
 pub fn validate_route(provider: ApiProvider, model: &str) -> Result<(), String> {
     let trimmed = model.trim();
     if trimmed.is_empty() {
@@ -1095,6 +1101,14 @@ pub fn wire_model_for_provider(provider: ApiProvider, model: &str) -> String {
     normalize_model_name_for_provider(provider, trimmed).unwrap_or_else(|| trimmed.to_string())
 }
 
+/// Hardcoded per-provider model id list used **only as a compatibility
+/// fallback** (#4188).
+///
+/// Preferred sources are the live Models.dev catalog and the offline bundled
+/// snapshot via [`crate::provider_lake`]. Call this directly only for
+/// CodeWhale-only / local providers Models.dev does not represent, or when
+/// probing the fallback table in tests. Picker, inventory, and subagent
+/// surfaces must go through the provider lake.
 #[must_use]
 pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'static str> {
     match provider {
@@ -1157,6 +1171,7 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
             MINIMAX_M2_MODEL,
         ],
         ApiProvider::Sakana => vec![DEFAULT_SAKANA_MODEL, SAKANA_FUGU_ULTRA_MODEL],
+        ApiProvider::LongCat => vec![DEFAULT_LONGCAT_MODEL],
         // Custom endpoints expose no built-in completion names; the user
         // supplies their own model id (#1519).
         ApiProvider::Custom => Vec::new(),
@@ -1205,7 +1220,7 @@ pub struct TuiConfig {
     /// Timeout for startup terminal mode/probe calls in milliseconds.
     /// Defaults to 500ms when omitted.
     pub terminal_probe_timeout_ms: Option<u64>,
-    /// Per-SSE-chunk idle timeout in seconds. Defaults to 300 seconds when
+    /// Per-SSE-chunk idle timeout in seconds. Defaults to 900 seconds when
     /// omitted. `0` maps to the default; values clamp to `1..=3600`.
     pub stream_chunk_timeout_secs: Option<u64>,
     /// Ordered list of footer items the user wants visible. `None` (the field
@@ -1293,6 +1308,22 @@ pub enum CompletionSound {
     File,
 }
 
+/// Controls when per-subagent completion notifications fire during fleet /
+/// workflow runs. Turn-completion notifications are unaffected.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubagentCompletionNotification {
+    /// Notify on every subagent completion.
+    Always,
+    /// Notify only when the last subagent in a batch finishes — no other
+    /// subagents running and no workflow run in progress. Default: stays quiet
+    /// mid-run and fires once when the fleet drains.
+    #[default]
+    FinalOnly,
+    /// Never fire a subagent-completion notification.
+    Off,
+}
+
 /// Desktop-notification configuration (OSC 9 / BEL on turn completion).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct NotificationsConfig {
@@ -1312,6 +1343,13 @@ pub struct NotificationsConfig {
     /// Default: `false`.
     #[serde(default)]
     pub include_summary: bool,
+
+    /// When to fire per-subagent completion notifications during fleet /
+    /// workflow runs: `always` | `final-only` | `off`. Default: `final-only`
+    /// (quiet mid-run, one notification when the batch drains). Set `off` to
+    /// silence subagent notifications entirely.
+    #[serde(default)]
+    pub subagent_completion: SubagentCompletionNotification,
 
     /// Completion sound: `"off"` | `"beep"` | `"bell"` | `"file"`. Default: `"beep"`.
     /// Plays a sound when every turn finishes (alongside the ✅ marker).
@@ -1848,9 +1886,8 @@ pub struct Config {
     /// DeepSeek reasoning-effort tier: `"off" | "low" | "medium" | "high" | "max"`.
     /// Defaults to `"max"` at runtime if unset.
     pub reasoning_effort: Option<String>,
-    pub tools_file: Option<String>,
-    /// Native tool catalog controls. `tools_file` is the legacy external
-    /// schema path; this table controls built-in tool loading policy.
+    /// Native tool catalog controls. This table controls built-in
+    /// tool loading policy.
     #[serde(default)]
     pub tools: Option<ToolsConfig>,
     pub skills_dir: Option<String>,
@@ -2572,6 +2609,13 @@ pub struct ProvidersConfig {
     pub minimax: ProviderConfig,
     #[serde(default, alias = "sakana-ai", alias = "sakana_ai", alias = "fugu")]
     pub sakana: ProviderConfig,
+    #[serde(
+        default,
+        alias = "long-cat",
+        alias = "meituan-longcat",
+        alias = "meituan"
+    )]
+    pub longcat: ProviderConfig,
     /// Arbitrary user-named custom providers (#1519).
     ///
     /// Captures every `[providers.<name>]` table whose key is not one of the
@@ -2807,6 +2851,11 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if let Some(provider) = self.provider.as_deref()
             && ApiProvider::parse(provider).is_none()
+            && self
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.custom_provider_config(provider))
+                .is_none()
         {
             anyhow::bail!(
                 "Invalid provider '{provider}': expected {}.",
@@ -2956,6 +3005,7 @@ impl Config {
             ApiProvider::Stepfun => &providers.stepfun,
             ApiProvider::Minimax => &providers.minimax,
             ApiProvider::Sakana => &providers.sakana,
+            ApiProvider::LongCat => &providers.longcat,
             // Handled by the name-keyed early return above (#1519).
             ApiProvider::Custom => unreachable!("custom provider resolved by name above"),
         })
@@ -3016,6 +3066,7 @@ impl Config {
             ApiProvider::Stepfun => &mut providers.stepfun,
             ApiProvider::Minimax => &mut providers.minimax,
             ApiProvider::Sakana => &mut providers.sakana,
+            ApiProvider::LongCat => &mut providers.longcat,
             // Handled by the name-keyed early return above (#1519).
             ApiProvider::Custom => unreachable!("custom provider resolved by name above"),
         }
@@ -3208,6 +3259,7 @@ impl Config {
             ApiProvider::Anthropic => DEFAULT_ANTHROPIC_MODEL,
             ApiProvider::Minimax => DEFAULT_MINIMAX_MODEL,
             ApiProvider::Sakana => DEFAULT_SAKANA_MODEL,
+            ApiProvider::LongCat => DEFAULT_LONGCAT_MODEL,
             // Custom endpoints have no built-in default model; pass through the
             // descriptor placeholder when nothing is configured (#1519).
             ApiProvider::Custom => codewhale_config::ProviderKind::Custom
@@ -3261,6 +3313,7 @@ impl Config {
             | ApiProvider::Stepfun
             | ApiProvider::Minimax
             | ApiProvider::Sakana
+            | ApiProvider::LongCat
             // Custom reads its base_url from the named `[providers.<name>]`
             // table (via provider_base), never from the legacy root field.
             | ApiProvider::Custom => None,
@@ -3321,6 +3374,7 @@ impl Config {
                         ApiProvider::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
                         ApiProvider::Minimax => DEFAULT_MINIMAX_BASE_URL,
                         ApiProvider::Sakana => DEFAULT_SAKANA_BASE_URL,
+                        ApiProvider::LongCat => DEFAULT_LONGCAT_BASE_URL,
                         // No built-in endpoint; descriptor placeholder keeps the
                         // fallback total. A real custom route configures
                         // `[providers.<name>] base_url` which wins above (#1519).
@@ -3483,16 +3537,7 @@ impl Config {
             ApiProvider::Anthropic | ApiProvider::Openmodel => {
                 anyhow::bail!("{}", missing_provider_api_key_message(provider)?)
             }
-            ApiProvider::OpenaiCodex => anyhow::bail!(
-                "OpenAI Codex OAuth credentials not found.\n\
-                 \n\
-                 CodeWhale uses your existing ChatGPT/Codex login.\n\
-                 1. Run: codex login      (or use the Codex CLI to authenticate)\n\
-                 2. CodeWhale will read credentials from ~/.codex/auth.json\n\
-                 \n\
-                 Env overrides:\n\
-                   OPENAI_CODEX_ACCESS_TOKEN  or  CODEX_ACCESS_TOKEN"
-            ),
+            ApiProvider::OpenaiCodex => anyhow::bail!("{}", crate::oauth::missing_auth_message()),
             // Self-hosted deployments commonly run without auth on localhost.
             // Return an empty key and let the client omit the Authorization header.
             ApiProvider::Sglang | ApiProvider::Vllm | ApiProvider::Ollama => Ok(String::new()),
@@ -3904,7 +3949,7 @@ impl Config {
     ///
     /// Reads `[tui].stream_chunk_timeout_secs`, falling back to the legacy
     /// `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` env var when the config key is
-    /// omitted. `None` or `0` resolve to the default 300 seconds; explicit
+    /// omitted. `None` or `0` resolve to the default 900 seconds; explicit
     /// values are clamped to `1..=3600`.
     #[must_use]
     pub fn stream_chunk_timeout_secs(&self) -> u64 {
@@ -3959,6 +4004,13 @@ impl Config {
         }
 
         overrides
+    }
+
+    /// Parsed `[fleet]` table, or defaults when the table is absent
+    /// (#fleet-roster cutover (v0.8.67)).
+    #[must_use]
+    pub fn fleet_config(&self) -> codewhale_config::FleetConfigToml {
+        self.fleet.clone().unwrap_or_default()
     }
 
     /// Return the configured DeepSeek reasoning-effort tier, if any.
@@ -4128,35 +4180,15 @@ pub(crate) fn save_workspace_trust(workspace: &Path) -> Result<PathBuf> {
         .context("Failed to resolve config path: home directory not found.")?;
     ensure_parent_dir(&config_path)?;
 
-    let mut doc = if config_path.exists() {
-        let raw = fs::read_to_string(&config_path)?;
-        toml::from_str::<toml::Value>(&raw)
-            .with_context(|| format!("Failed to parse config at {}", config_path.display()))?
-    } else {
-        toml::Value::Table(toml::value::Table::new())
-    };
-
-    let root = doc
-        .as_table_mut()
-        .context("Config root must be a TOML table.")?;
-    let projects = root
-        .entry("projects".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
-        .as_table_mut()
-        .context("`projects` must be a table.")?;
-    let project = projects
-        .entry(workspace_config_key(workspace))
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
-        .as_table_mut()
-        .context("Project entry must be a table.")?;
-    project.insert(
-        "trust_level".to_string(),
-        toml::Value::String("trusted".to_string()),
-    );
-
-    let serialized = toml::to_string_pretty(&doc).context("failed to serialize updated config")?;
-    write_config_file_secure(&config_path, &serialized)
-        .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
+    let project_key = workspace_config_key(workspace);
+    crate::config_persistence::mutate_config_document(&config_path, |doc| {
+        crate::config_persistence::set_document_value(
+            doc,
+            &["projects", project_key.as_str(), "trust_level"],
+            "trusted",
+        )
+    })
+    .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
     Ok(config_path)
 }
 
@@ -4474,6 +4506,13 @@ fn apply_env_overrides(config: &mut Config) {
                     .sakana
                     .base_url = Some(value);
             }
+            ApiProvider::LongCat => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .longcat
+                    .base_url = Some(value);
+            }
             // Custom resolves to the named `[providers.<name>]` table; route the
             // override through the name-keyed mutable accessor (#1519).
             ApiProvider::Custom => {
@@ -4702,6 +4741,7 @@ fn apply_env_overrides(config: &mut Config) {
             ApiProvider::Stepfun => &mut providers.stepfun,
             ApiProvider::Minimax => &mut providers.minimax,
             ApiProvider::Sakana => &mut providers.sakana,
+            ApiProvider::LongCat => &mut providers.longcat,
             ApiProvider::Custom => providers
                 .custom
                 .entry(custom_key.expect("custom key captured for custom provider"))
@@ -4924,6 +4964,7 @@ fn apply_env_overrides(config: &mut Config) {
                 ApiProvider::Stepfun => &mut providers.stepfun,
                 ApiProvider::Minimax => &mut providers.minimax,
                 ApiProvider::Sakana => &mut providers.sakana,
+                ApiProvider::LongCat => &mut providers.longcat,
             };
             entry.model = Some(value);
         }
@@ -5476,7 +5517,6 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         default_text_model: override_cfg.default_text_model.or(base.default_text_model),
         auth_mode: override_cfg.auth_mode.or(base.auth_mode),
         reasoning_effort: override_cfg.reasoning_effort.or(base.reasoning_effort),
-        tools_file: override_cfg.tools_file.or(base.tools_file),
         tools: override_cfg.tools.or(base.tools),
         skills_dir: override_cfg.skills_dir.or(base.skills_dir),
         mcp_config_path: override_cfg.mcp_config_path.or(base.mcp_config_path),
@@ -5695,6 +5735,7 @@ fn merge_providers(
             stepfun: merge_provider_config(base.stepfun, override_cfg.stepfun),
             minimax: merge_provider_config(base.minimax, override_cfg.minimax),
             sakana: merge_provider_config(base.sakana, override_cfg.sakana),
+            longcat: merge_provider_config(base.longcat, override_cfg.longcat),
             custom: merge_custom_providers(base.custom, override_cfg.custom),
         }),
     }
@@ -6018,47 +6059,28 @@ pub fn save_api_key(api_key: &str) -> Result<SavedCredential> {
 
 /// Write the `api_key` slot directly to `config.toml`.
 fn save_api_key_to_config_file(api_key: &str) -> Result<PathBuf> {
-    fn is_api_key_assignment(line: &str) -> bool {
-        let trimmed = line.trim_start();
-        trimmed
-            .strip_prefix("api_key")
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-    }
-
     let config_path = default_config_path()
         .context("Failed to resolve config path: home directory not found.")?;
 
     ensure_parent_dir(&config_path)?;
 
-    let key_to_write = api_key.to_string();
-
-    let content = if config_path.exists() {
-        // Read existing config and update the api_key line
-        let existing = fs::read_to_string(&config_path)?;
-        if existing.contains("api_key") {
-            // Replace existing api_key line
-            let mut result = String::new();
-            for line in existing.lines() {
-                if is_api_key_assignment(line) {
-                    let _ = writeln!(result, "api_key = \"{key_to_write}\"");
-                } else {
-                    result.push_str(line);
-                    result.push('\n');
-                }
-            }
-            result
-        } else {
-            // Prepend api_key to existing config
-            format!("api_key = \"{key_to_write}\"\n{existing}")
-        }
+    if config_path.exists() {
+        // TOML-aware upsert. The old line scan keyed off
+        // `existing.contains("api_key")`, so a comment that merely mentioned
+        // api_key made it skip the insert entirely; editing the document
+        // replaces or inserts the real key and keeps user comments.
+        crate::config_persistence::mutate_config_document(&config_path, |doc| {
+            crate::config_persistence::set_document_value(doc, &["api_key"], api_key)
+        })
+        .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
     } else {
         // Create new minimal config
-        format!(
+        let content = format!(
             r#"# codewhale Configuration
-# Get your API key from https://platform.deepseek.com
-# Or set DEEPSEEK_API_KEY environment variable
+# Set provider credentials in this file or via environment variables.
+# See /links in the TUI for provider-specific credential pages.
 
-api_key = "{key_to_write}"
+api_key = "{api_key}"
 
 # Base URL (default: https://api.deepseek.com/beta)
 # Set https://api.deepseek.com to opt out of beta features.
@@ -6072,11 +6094,11 @@ default_text_model = "{DEFAULT_TEXT_MODEL}"
 # Shift+Tab in the TUI cycles between off / high / max.
 reasoning_effort = "max"
 "#
-        )
-    };
+        );
+        crate::config_persistence::write_config_toml_atomic(&config_path, &content)
+            .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
+    }
 
-    write_config_file_secure(&config_path, &content)
-        .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
     log_sensitive_event(
         "credential.save",
         json!({
@@ -6302,6 +6324,11 @@ fn provider_config_is_explicit(entry: &ProviderConfig) -> bool {
 /// `[providers.<name>] api_key = "..."` to `~/.codewhale/config.toml`.
 /// Returns the config file path.
 pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf> {
+    if provider == ApiProvider::OpenaiCodex {
+        anyhow::bail!(
+            "OpenAI Codex uses OAuth. Run `codex login` or set OPENAI_CODEX_ACCESS_TOKEN; CodeWhale does not store an API key for this provider."
+        );
+    }
     if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
         return match save_api_key(api_key)? {
             SavedCredential::KeyringAndConfigFile { path, .. }
@@ -6314,39 +6341,16 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
     ensure_parent_dir(&config_path)?;
 
     let key_inside = provider_config_key(provider).context("provider api key table")?;
-    let table_name = format!("providers.{key_inside}");
-
-    // Parse existing TOML (or start fresh) so we can edit the right table
-    // without disturbing other sections.
-    let mut doc: toml::Value = if config_path.exists() {
-        let raw = fs::read_to_string(&config_path)?;
-        toml::from_str(&raw)
-            .with_context(|| format!("Failed to parse config at {}", config_path.display()))?
-    } else {
-        toml::Value::Table(toml::value::Table::new())
-    };
-
-    let table = doc
-        .as_table_mut()
-        .context("Config root must be a TOML table.")?;
-    let providers = table
-        .entry("providers".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
-        .as_table_mut()
-        .context("`providers` must be a table.")?;
-    let entry = providers
-        .entry(key_inside.to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
-        .as_table_mut()
-        .with_context(|| format!("`{table_name}` must be a table."))?;
-    entry.insert(
-        "api_key".to_string(),
-        toml::Value::String(api_key.to_string()),
-    );
-
-    let serialized = toml::to_string_pretty(&doc).context("failed to serialize updated config")?;
-    write_config_file_secure(&config_path, &serialized)
-        .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
+    // Edit the `[providers.<name>]` table in place so unrelated sections,
+    // comments, and formatting survive the write.
+    crate::config_persistence::mutate_config_document(&config_path, |doc| {
+        crate::config_persistence::set_document_value(
+            doc,
+            &["providers", key_inside, "api_key"],
+            api_key,
+        )
+    })
+    .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
     log_sensitive_event(
         "credential.save",
         json!({
@@ -6628,9 +6632,10 @@ pub fn kimi_cli_credentials_present() -> bool {
 /// Clear the API key from config-file storage.
 ///
 /// `/logout` calls this to wipe credentials so the next request can't
-/// silently use a stale config key (#343). The function strips the legacy
-/// root `api_key = ...` line *and* every `api_key` line nested in a
-/// `[providers.<name>]` table.
+/// silently use a stale config key (#343). The function removes the legacy
+/// root `api_key` entry *and* every `api_key` entry nested in a
+/// `[providers.<name>]` table, leaving keys like `api_key_env`, comments,
+/// and formatting untouched.
 ///
 /// Environment variables (`DEEPSEEK_API_KEY`, etc.) are intentionally
 /// **not** unset — they are managed by the user's shell and outside the
@@ -6638,9 +6643,9 @@ pub fn kimi_cli_credentials_present() -> bool {
 /// (Path 0) ensures a freshly-entered key still wins over a stale env
 /// var that lingers from a previous session.
 pub fn clear_api_key() -> Result<()> {
-    // Strip api_key lines from config.toml, including provider-scoped nested
-    // entries. Clearing a config file must not trigger platform credential
-    // prompts.
+    // Strip api_key entries from config.toml, including provider-scoped
+    // nested entries. Clearing a config file must not trigger platform
+    // credential prompts.
     let config_path = default_config_path()
         .context("Failed to resolve config path: home directory not found.")?;
 
@@ -6648,25 +6653,11 @@ pub fn clear_api_key() -> Result<()> {
         return Ok(());
     }
 
-    let existing = fs::read_to_string(&config_path)?;
-    let mut result = String::new();
-
-    for line in existing.lines() {
-        // Match `api_key`, `api_key =`, `  api_key=`, etc. — anywhere it
-        // appears as the leading non-whitespace token.
-        let trimmed = line.trim_start();
-        if trimmed.strip_prefix("api_key").is_some_and(|rest| {
-            let rest = rest.trim_start();
-            rest.is_empty() || rest.starts_with('=')
-        }) {
-            continue;
-        }
-        result.push_str(line);
-        result.push('\n');
-    }
-
-    write_config_file_secure(&config_path, &result)
-        .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
+    crate::config_persistence::mutate_config_document(&config_path, |doc| {
+        crate::config_persistence::remove_document_key_recursive(doc.as_table_mut(), "api_key");
+        Ok(())
+    })
+    .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
     log_sensitive_event(
         "credential.clear",
         json!({
@@ -6680,8 +6671,9 @@ pub fn clear_api_key() -> Result<()> {
 }
 
 /// Clear only the active provider's API key from the config file.
-/// Unlike `clear_api_key()` which strips ALL api_key lines, this
-/// removes only the key for the specified provider section.
+/// Unlike `clear_api_key()` which strips ALL api_key entries, this
+/// removes only the key for the specified provider section (plus the
+/// legacy root `api_key` when the provider is DeepSeek).
 pub fn clear_active_provider_api_key(provider: &str) -> Result<()> {
     let config_path = default_config_path()
         .context("Failed to resolve config path: home directory not found.")?;
@@ -6690,46 +6682,15 @@ pub fn clear_active_provider_api_key(provider: &str) -> Result<()> {
         return Ok(());
     }
 
-    let existing = fs::read_to_string(&config_path)?;
-    let mut result = String::new();
-    let target_section = format!("[providers.{provider}]");
-    let mut in_target_section = false;
-
-    for line in existing.lines() {
-        let trimmed = line.trim();
-
-        // Track which [providers.X] section we're in.
-        if trimmed.starts_with("[providers.") {
-            in_target_section = trimmed == target_section;
-        } else if trimmed.starts_with('[') {
-            in_target_section = false;
+    crate::config_persistence::mutate_config_document(&config_path, |doc| {
+        // The root-level api_key is the legacy DeepSeek slot.
+        if provider == "deepseek" {
+            crate::config_persistence::unset_document_value(doc, &["api_key"])?;
         }
-
-        // For the root section (before any [headers]), clear api_key
-        // only if the provider is "deepseek" (root-level key).
-        let is_root_key = !in_target_section
-            && provider == "deepseek"
-            && trimmed.strip_prefix("api_key").is_some_and(|rest| {
-                let rest = rest.trim_start();
-                rest.is_empty() || rest.starts_with('=')
-            });
-
-        // For a provider section, clear api_key if we're in the target section.
-        let is_provider_key = in_target_section
-            && trimmed.strip_prefix("api_key").is_some_and(|rest| {
-                let rest = rest.trim_start();
-                rest.is_empty() || rest.starts_with('=')
-            });
-
-        if is_root_key || is_provider_key {
-            continue;
-        }
-        result.push_str(line);
-        result.push('\n');
-    }
-
-    write_config_file_secure(&config_path, &result)
-        .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
+        crate::config_persistence::unset_document_value(doc, &["providers", provider, "api_key"])?;
+        Ok(())
+    })
+    .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
     log_sensitive_event(
         "credential.clear",
         json!({

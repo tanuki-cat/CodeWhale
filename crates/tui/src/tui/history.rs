@@ -34,9 +34,9 @@ use checklist::{
 #[cfg(test)]
 use checklist::{ChecklistChange, ChecklistItemSnapshot, ChecklistSnapshot};
 use constants::{
-    ASSISTANT_GLYPH, TOOL_CARD_SUMMARY_LINES, TOOL_COMMAND_LINE_LIMIT, TOOL_DONE_SYMBOL,
-    TOOL_FAILED_SYMBOL, TOOL_HEADER_SUMMARY_LIMIT, TOOL_OUTPUT_LINE_LIMIT, TRANSCRIPT_RAIL,
-    USER_GLYPH,
+    ASSISTANT_GLYPH, FOREGROUND_SHELL_WAIT_HINT, TOOL_CARD_SUMMARY_LINES, TOOL_COMMAND_LINE_LIMIT,
+    TOOL_DONE_SYMBOL, TOOL_FAILED_SYMBOL, TOOL_HEADER_SUMMARY_LIMIT, TOOL_OUTPUT_LINE_LIMIT,
+    TRANSCRIPT_RAIL, USER_GLYPH,
 };
 #[cfg(test)]
 use constants::{TOOL_RUNNING_SYMBOLS, TOOL_STATUS_SYMBOL_MS};
@@ -55,7 +55,9 @@ pub use plan::PlanUpdateCell;
 use thinking::extract_reasoning_summary;
 #[cfg(test)]
 use tool_run::ToolRunActivitySummary;
-pub use tool_run::{ToolRun, detect_tool_runs, detect_tool_runs_from_slices, tool_run_summary};
+#[cfg(test)]
+pub use tool_run::detect_tool_runs;
+pub use tool_run::{ToolRun, detect_tool_runs_from_slices, tool_run_summary};
 
 #[cfg(test)]
 use thinking::{REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL};
@@ -656,6 +658,13 @@ impl ExecCell {
         self.render(width, low_motion, RenderMode::Live)
     }
 
+    /// Foreground `exec_shell` blocking the turn — eligible for Ctrl+B detach.
+    fn is_foreground_shell_wait(&self) -> bool {
+        self.status == ToolStatus::Running
+            && self.source == ExecSource::Assistant
+            && self.interaction.is_none()
+    }
+
     pub(super) fn render(
         &self,
         width: u16,
@@ -664,10 +673,14 @@ impl ExecCell {
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let command_summary = command_header_summary(&self.command);
-        let header_summary = self
-            .interaction
-            .as_deref()
-            .or(Some(command_summary.as_str()));
+        let compact_foreground_wait = self.is_foreground_shell_wait();
+        let header_summary = if compact_foreground_wait {
+            Some(FOREGROUND_SHELL_WAIT_HINT)
+        } else {
+            self.interaction
+                .as_deref()
+                .or(Some(command_summary.as_str()))
+        };
         lines.push(render_tool_header_with_summary(
             "Shell",
             header_summary,
@@ -676,6 +689,14 @@ impl ExecCell {
             self.started_at,
             low_motion,
         ));
+
+        // Foreground shell waits block the turn but do not need a verbose
+        // transcript card — spinner + running badge + Ctrl+B hint only.
+        // Command, live output, and artifact paths belong in the Activity sidebar
+        // and `/jobs` detail surfaces.
+        if compact_foreground_wait {
+            return wrap_card_rail(lines);
+        }
 
         // A successful shell call is rarely worth its full body — collapse it
         // to the single header line in live mode. The bottom shell strip owns
@@ -738,7 +759,7 @@ impl ExecCell {
                 ));
             } else if self.status == ToolStatus::Running && self.source == ExecSource::Assistant {
                 lines.extend(wrap_plain_line(
-                    "  Ctrl+B backgrounds this command.",
+                    "  Ctrl+B moves this shell wait to /jobs.",
                     Style::default().fg(palette::TEXT_MUTED),
                     width,
                 ));
@@ -806,14 +827,23 @@ impl ExploringCell {
             ToolStatus::Running
         };
         let header_summary = exploring_header_summary(&self.entries);
-        lines.push(render_tool_header_with_summary(
-            "Workspace",
+        let multi_entry = self.entries.len() > 1;
+        let header_state = if multi_entry {
+            ""
+        } else if all_done {
+            tool_status_label(status)
+        } else {
+            "running"
+        };
+        // Search-only exploration cards read with the `find` verb so a
+        // completed grep renders `find done · Searching for …` instead of the
+        // incoherent `read done · Searching …` (#4145). Read/list or mixed
+        // cards keep the neutral `read` verb the Workspace card has always used.
+        let family = exploring_card_family(&self.entries);
+        lines.push(render_tool_header_with_family_and_summary(
+            family,
             header_summary.as_deref(),
-            if all_done {
-                tool_status_label(status)
-            } else {
-                "running"
-            },
+            header_state,
             status,
             None,
             low_motion,
@@ -849,23 +879,32 @@ impl ExploringCell {
             );
             lines.push(Line::styled(
                 format!("  {dots}  {counts}"),
-                Style::default().fg(palette::DEEPSEEK_SKY),
+                Style::default().fg(palette::WHALE_INFO),
             ));
         }
 
         for entry in &self.entries {
-            let prefix = match entry.status {
-                ToolStatus::Running => "live",
-                ToolStatus::Success => "done",
-                ToolStatus::Hydrated => "loaded",
-                ToolStatus::Failed => "issue",
-            };
-            lines.extend(render_compact_kv(
-                prefix,
-                &entry.label,
-                tool_value_style(),
-                width,
-            ));
+            if multi_entry {
+                lines.extend(render_card_detail_line(
+                    None,
+                    &entry.label,
+                    tool_value_style(),
+                    width,
+                ));
+            } else {
+                let prefix = match entry.status {
+                    ToolStatus::Running => "live",
+                    ToolStatus::Success => "done",
+                    ToolStatus::Hydrated => "loaded",
+                    ToolStatus::Failed => "issue",
+                };
+                lines.extend(render_compact_kv(
+                    prefix,
+                    &entry.label,
+                    tool_value_style(),
+                    width,
+                ));
+            }
         }
         lines
     }
@@ -1272,15 +1311,44 @@ impl GenericToolCell {
             return lines;
         }
 
+        // #4038: give the `workflow` tool a purpose-built run card (run_id,
+        // status, goal, children, progress, schema errors) instead of
+        // collapsing to a one-line generic header or dumping raw JSON.
+        if let Some(lines) = self.try_render_as_workflow(width, low_motion) {
+            return lines;
+        }
+
         // Sub-agent launch already gets a dedicated `DelegateCard`
-        // that owns the live action tree, status, and final summary. The
-        // generic tool block for the same call duplicates that signal at
-        // 3-4 lines per spawn — N parallel spawns multiply the noise. In
-        // live mode, render one compact summary line and let the
-        // DelegateCard be the source of truth. Transcript mode keeps the
-        // full block so session replay remains complete.
-        if matches!(mode, RenderMode::Live) && self.name == "agent" {
-            return agent_activity::render_agent_compact(self, low_motion);
+        // that owns the live action tree, status, and final summary (#4133).
+        // Spawns therefore render nothing here in either mode — one visible
+        // artifact per delegated unit. Inspection/join calls (peek/status/
+        // wait) stay as a single compact line (#4112 dogfood A5).
+        if self.name == "agent" {
+            if agent_activity::is_agent_inspection(self) {
+                return agent_activity::render_agent_compact(self, low_motion);
+            }
+            // Spawn / start / run: suppress the generic tool card entirely.
+            return Vec::new();
+        }
+
+        // A call to a tool that doesn't exist carries exactly one useful
+        // fact: the catalog error. The full name:/args:/result: block turns
+        // each model slip into a four-line card (dogfood A5) — collapse it
+        // to a single header line in both render modes.
+        if self.status == ToolStatus::Failed
+            && let Some(output) = self.output.as_deref()
+            && output.contains("is not available in the current tool catalog")
+        {
+            let family = crate::tui::widgets::tool_card::tool_family_for_name(&self.name);
+            let summary = truncate_text(output.trim(), 200);
+            return wrap_card_rail(vec![render_tool_header_with_family_and_summary(
+                family,
+                Some(summary.as_str()),
+                tool_status_label(self.status),
+                self.status,
+                None,
+                low_motion,
+            )]);
         }
 
         // Live mode stays calm: successful tool calls collapse to one header
@@ -1449,6 +1517,156 @@ impl GenericToolCell {
             mode,
         ))
     }
+
+    /// Render the `workflow` tool as a compact run card rather than the
+    /// generic one-line header (live) or a large JSON dump (transcript).
+    /// Fields are parsed defensively from the tool's JSON output, which is
+    /// either a single `WorkflowRunRecord` or a `{action:"status",
+    /// runs:[...]}` list; anything that does not parse falls back to the
+    /// generic renderer. The header owns the lifecycle label (Wave 5c #7);
+    /// the body deliberately carries no `status:` KV. Full live overlay
+    /// (#4038) is future work.
+    fn try_render_as_workflow(&self, width: u16, low_motion: bool) -> Option<Vec<Line<'static>>> {
+        if self.name != "workflow" {
+            return None;
+        }
+        let output = self.output.as_ref()?;
+        let value: serde_json::Value = serde_json::from_str(output).ok()?;
+        let is_status_list =
+            value.get("action").and_then(serde_json::Value::as_str) == Some("status");
+        if value.get("run_id").is_none() && !is_status_list {
+            return None;
+        }
+        let family = crate::tui::widgets::tool_card::tool_family_for_name("workflow");
+        let mut lines = Vec::new();
+
+        if is_status_list {
+            let runs = value.get("runs").and_then(serde_json::Value::as_array);
+            let count = value
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| runs.map(|r| r.len() as u64).unwrap_or(0));
+            let header = format!("{count} run(s)");
+            lines.push(render_tool_header_with_family_and_summary(
+                family,
+                Some(header.as_str()),
+                tool_status_label(self.status),
+                self.status,
+                None,
+                low_motion,
+            ));
+            if let Some(runs) = runs {
+                for run in runs {
+                    let run_id = run
+                        .get("run_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    let status = run
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    let children = run
+                        .get("child_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .or_else(|| {
+                            run.get("child_ids")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|a| a.len() as u64)
+                        })
+                        .unwrap_or(0);
+                    lines.extend(render_card_detail_line(
+                        None,
+                        &format!("{run_id} · {status} · {children} child(ren)"),
+                        tool_value_style(),
+                        width,
+                    ));
+                }
+            }
+            return Some(wrap_card_rail(lines));
+        }
+
+        let run_id = value
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("workflow");
+        lines.push(render_tool_header_with_family_and_summary(
+            family,
+            Some(run_id),
+            tool_status_label(self.status),
+            self.status,
+            None,
+            low_motion,
+        ));
+        if let Some(goal) = value
+            .get("workflow_goal")
+            .and_then(serde_json::Value::as_str)
+            && !goal.trim().is_empty()
+        {
+            lines.extend(render_card_detail_line(
+                Some("goal"),
+                &truncate_text(goal.trim(), 200),
+                tool_value_style(),
+                width,
+            ));
+        }
+        let child_count = value
+            .get("child_ids")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0);
+        lines.extend(render_compact_kv(
+            "children",
+            &child_count.to_string(),
+            tool_value_style(),
+            width,
+        ));
+        if let Some(progress) = value.get("progress").and_then(serde_json::Value::as_array)
+            && let Some(last) = progress.last().and_then(serde_json::Value::as_str)
+        {
+            lines.extend(render_card_detail_line(
+                Some("progress"),
+                &format!("{} ({} events)", truncate_text(last, 160), progress.len()),
+                tool_value_style(),
+                width,
+            ));
+        }
+        if let Some(verification) = value.get("verification")
+            && let Some(summary) = verification
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+        {
+            lines.extend(render_card_detail_line(
+                Some("verification"),
+                &truncate_text(summary, 200),
+                tool_value_style(),
+                width,
+            ));
+        }
+        let schema_error_count = value
+            .get("schema_errors")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0);
+        if schema_error_count > 0 {
+            lines.extend(render_card_detail_line(
+                Some("schema errors"),
+                &schema_error_count.to_string(),
+                tool_value_style(),
+                width,
+            ));
+        }
+        if let Some(error) = value.get("error").and_then(serde_json::Value::as_str)
+            && !error.trim().is_empty()
+        {
+            lines.extend(render_card_detail_line(
+                Some("error"),
+                &truncate_text(error.trim(), 200),
+                tool_value_style(),
+                width,
+            ));
+        }
+        Some(wrap_card_rail(lines))
+    }
 }
 
 /// Render the inline annotation for a tool cell whose full output was
@@ -1516,6 +1734,24 @@ fn exploring_header_summary(entries: &[ExploringEntry]) -> Option<String> {
         [] => None,
         [entry] => Some(entry.label.clone()),
         entries => Some(format!("{} items", entries.len())),
+    }
+}
+
+/// Choose the verb family for an exploring card's header. A card whose entries
+/// are all searches reads with the `find` verb so the completed action agrees
+/// with its `Searching for …` labels (#4145); every other exploration mix keeps
+/// the neutral `read` verb the Workspace card uses. The search signal is the
+/// English label prefix produced by `exploring_label` in `tool_routing`.
+fn exploring_card_family(entries: &[ExploringEntry]) -> crate::tui::widgets::tool_card::ToolFamily {
+    use crate::tui::widgets::tool_card::ToolFamily;
+    let all_search = !entries.is_empty()
+        && entries
+            .iter()
+            .all(|entry| entry.label.starts_with("Searching"));
+    if all_search {
+        ToolFamily::Find
+    } else {
+        ToolFamily::Read
     }
 }
 
@@ -1744,7 +1980,14 @@ fn render_tool_header_with_family_and_summary(
         Span::styled(state_owned, tool_status_style(status)),
     ];
 
-    if let Some(summary) = summary.and_then(normalize_header_summary) {
+    // #4148: don't let the summary echo the verb it sits next to — an
+    // identity/summary that resolves to the family word itself would render a
+    // duplicate like "delegate · delegate". When the summary collapses to the
+    // verb, the verb already carries the signal, so drop the redundant tail.
+    if let Some(summary) = summary
+        .and_then(normalize_header_summary)
+        .filter(|summary| !summary.eq_ignore_ascii_case(verb))
+    {
         spans.push(Span::styled(" · ", Style::default().fg(palette::TEXT_DIM)));
         spans.push(Span::styled(
             truncate_text(&summary, TOOL_HEADER_SUMMARY_LIMIT),

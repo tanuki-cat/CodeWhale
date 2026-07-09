@@ -11,18 +11,26 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Widget},
 };
 
-use crate::config::{ApiProvider, Config, model_completion_names_for_provider};
+use codewhale_config::catalog::CatalogSource;
+use codewhale_config::model_reference::ModelReferenceCard;
+use codewhale_config::pricing::OfferingPricing;
+
+use crate::config::{ApiProvider, Config};
 use crate::model_registry;
+use crate::models_dev_live::{self, ModelsDevFreshness};
 use crate::palette;
+use crate::provider_lake::{
+    all_catalog_models_for_provider, catalog_offering_for_model, configured_providers,
+};
 use crate::tui::app::{App, ReasoningEffort};
 use crate::tui::views::{
-    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
+    ActionHint, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
     render_modal_footer, render_modal_surface,
 };
 
@@ -41,6 +49,81 @@ const CODEX_PICKER_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::Max,
 ];
 const AUTO_MODEL_PICKER_EFFORTS: &[ReasoningEffort] = &[ReasoningEffort::Auto];
+
+/// `/model` catalog views (#4115).
+///
+/// Configured stays the conservative default. Discoverability views (Recent /
+/// Coding / Cheap / Long context) never auto-select a surprising route — the
+/// active model remains the selection until the operator moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelListView {
+    Configured,
+    Catalog,
+    Recent,
+    Coding,
+    Cheap,
+    LongContext,
+}
+
+impl ModelListView {
+    const ALL: [Self; 6] = [
+        Self::Configured,
+        Self::Catalog,
+        Self::Recent,
+        Self::Coding,
+        Self::Cheap,
+        Self::LongContext,
+    ];
+
+    fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    fn from_memory_name(name: &str) -> Option<Self> {
+        match name {
+            "configured" => Some(Self::Configured),
+            "catalog" => Some(Self::Catalog),
+            "recent" => Some(Self::Recent),
+            "coding" => Some(Self::Coding),
+            "cheap" => Some(Self::Cheap),
+            "long_context" => Some(Self::LongContext),
+            _ => None,
+        }
+    }
+
+    fn memory_name(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Catalog => "catalog",
+            Self::Recent => "recent",
+            Self::Coding => "coding",
+            Self::Cheap => "cheap",
+            Self::LongContext => "long_context",
+        }
+    }
+
+    /// Short chrome / action label for this view.
+    fn title_label(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Catalog => "catalog",
+            Self::Recent => "recent",
+            Self::Coding => "coding",
+            Self::Cheap => "cheap",
+            Self::LongContext => "long ctx",
+        }
+    }
+
+    /// Views that browse beyond the conservative configured-provider set.
+    fn is_discoverability(self) -> bool {
+        !matches!(self, Self::Configured)
+    }
+
+    fn browses_all_providers(self) -> bool {
+        self.is_discoverability()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -63,6 +146,7 @@ pub struct ModelPickerView {
     /// so the picker doesn't quietly forget the user's chosen IDs.
     show_custom_model_row: bool,
     model_rows: Vec<ModelPickerRow>,
+    view: ModelListView,
     /// Other providers considered "configured" (#3830), shown by default
     /// alongside `initial_provider`'s own rows without requiring the user to
     /// type a search query first. Uses the same definition as the
@@ -91,23 +175,28 @@ impl ModelPickerView {
             app.model.clone()
         };
         let model_rows = picker_model_rows_for_app(app);
-        let configured_providers = configured_providers_for(config, app.api_provider);
-        let mut selected_model_idx = model_rows.iter().position(|row| {
+        let configured_providers: Vec<_> = configured_providers(config, app.api_provider)
+            .into_iter()
+            .filter(|provider| *provider != app.api_provider)
+            .collect();
+        let default_visible_rows: Vec<_> = model_rows
+            .iter()
+            .filter(|row| {
+                model_row_visible_in_view(
+                    row,
+                    app.api_provider,
+                    &configured_providers,
+                    ModelListView::Configured,
+                )
+            })
+            .collect();
+        let mut selected_model_idx = default_visible_rows.iter().position(|row| {
             row.id == initial_model
                 && (row.provider.is_none() || row.provider == Some(app.api_provider))
         });
         let show_custom_model_row = selected_model_idx.is_none();
         if show_custom_model_row {
-            // The custom row is conceptually appended right after every row
-            // the default (empty-query) view shows, so its index must match
-            // that count, not just the active-provider-scoped one (#3830) —
-            // `resolved_model`/`model_row_count` treat any selection at or
-            // past `visible_model_rows().len()` as "the custom row."
-            selected_model_idx = Some(default_visible_model_row_count(
-                &model_rows,
-                app.api_provider,
-                &configured_providers,
-            ));
+            selected_model_idx = Some(default_visible_rows.len());
         }
         let selected_model_idx = selected_model_idx.unwrap_or(0);
 
@@ -119,7 +208,7 @@ impl ModelPickerView {
             .position(|e| *e == normalized)
             .unwrap_or_else(|| default_picker_effort_idx(app.api_provider, app.auto_model));
 
-        Self {
+        let mut view = Self {
             initial_model,
             initial_provider: app.api_provider,
             initial_effort,
@@ -130,8 +219,40 @@ impl ModelPickerView {
             focus: Pane::Model,
             show_custom_model_row,
             model_rows,
+            view: ModelListView::Configured,
             configured_providers,
+        };
+        view.restore_memory(app.model_picker_memory.as_ref());
+        view
+    }
+
+    /// Restore the browsing context from the last dismissed picker (#4109):
+    /// the named catalog view and, when the remembered row still exists in
+    /// that view, the highlighted row. The active model remains the selection
+    /// when nothing was remembered or the row is gone.
+    fn restore_memory(&mut self, memory: Option<&crate::tui::app::ModelPickerMemory>) {
+        let Some(memory) = memory else {
+            return;
+        };
+        if let Some(view_name) = memory.view.as_deref() {
+            if let Some(view) = ModelListView::from_memory_name(view_name) {
+                self.view = view;
+            }
+        } else if memory.catalog_view {
+            self.view = ModelListView::Catalog;
         }
+        if let Some(remembered_id) = memory.selected_row_id.as_deref() {
+            let position = self
+                .visible_model_rows()
+                .iter()
+                .position(|row| row.id == remembered_id);
+            if let Some(position) = position {
+                let effort = self.resolved_effort();
+                self.selected_model_idx = position;
+                self.select_effort_for_current_model(effort);
+            }
+        }
+        self.clamp_model_selection();
     }
 
     #[cfg(test)]
@@ -144,20 +265,30 @@ impl ModelPickerView {
 
     fn visible_model_rows(&self) -> Vec<&ModelPickerRow> {
         let query = self.query.trim();
-        self.model_rows
+        let mut rows: Vec<&ModelPickerRow> = self
+            .model_rows
             .iter()
             .filter(|row| {
                 if query.is_empty() {
-                    model_row_visible_by_default(
-                        row.provider,
+                    // Empty query: view scope only (Configured stays conservative).
+                    model_row_visible_in_view(
+                        row,
                         self.initial_provider,
                         &self.configured_providers,
+                        self.view,
                     )
                 } else {
+                    // Typed filter searches the full lake so cross-provider
+                    // routes remain discoverable without leaving Configured.
                     model_row_matches_query(row, query, self.initial_provider)
                 }
             })
-            .collect()
+            .collect();
+        // Only re-rank when not filtering by text — keep match order stable while typing.
+        if query.is_empty() {
+            sort_model_rows_for_view(&mut rows, self.view);
+        }
+        rows
     }
 
     fn model_row_count(&self) -> usize {
@@ -218,6 +349,17 @@ impl ModelPickerView {
                 .show_custom_model_row
                 .then(|| (self.initial_model.clone(), self.initial_provider));
         }
+        if let Some((provider, model)) = self.provider_qualified_custom_query(query) {
+            if visible_rows.iter().any(|row| {
+                row.provider == Some(provider) && row.id.eq_ignore_ascii_case(model.trim())
+            }) {
+                return None;
+            }
+            if self.provider_accepts_custom_model(provider, &model) {
+                return Some((model, provider));
+            }
+            return None;
+        }
         if !self.active_accepts_custom_model_ids {
             return None;
         }
@@ -227,6 +369,31 @@ impl ModelPickerView {
             return None;
         }
         Some((query.to_string(), self.initial_provider))
+    }
+
+    fn provider_qualified_custom_query(&self, query: &str) -> Option<(ApiProvider, String)> {
+        for (provider_key, model) in provider_query_splits(query) {
+            let Some(provider) = ApiProvider::parse(provider_key) else {
+                continue;
+            };
+            if provider != self.initial_provider
+                && !self.view.browses_all_providers()
+                && !self.configured_providers.contains(&provider)
+            {
+                continue;
+            }
+            let model = model.trim();
+            if model.is_empty() {
+                continue;
+            }
+            return Some((provider, model.to_string()));
+        }
+        None
+    }
+
+    fn provider_accepts_custom_model(&self, provider: ApiProvider, model: &str) -> bool {
+        (provider == self.initial_provider && self.active_accepts_custom_model_ids)
+            || crate::config::normalize_model_name_for_provider(provider, model).is_some()
     }
 
     fn clamp_model_selection(&mut self) {
@@ -305,6 +472,14 @@ impl ModelPickerView {
         };
     }
 
+    fn toggle_view(&mut self) {
+        self.view = self.view.next();
+        let effort = self.resolved_effort();
+        self.selected_model_idx = 0;
+        self.clamp_model_selection();
+        self.select_effort_for_current_model(effort);
+    }
+
     fn build_event(&self) -> ViewEvent {
         let provider = self
             .resolved_provider()
@@ -328,14 +503,21 @@ impl ModelPickerView {
         focused: bool,
     ) {
         let border_style = if focused {
-            Style::default().fg(palette::DEEPSEEK_SKY)
+            Style::default().fg(palette::WHALE_INFO)
         } else {
             Style::default().fg(palette::BORDER_COLOR)
         };
         let visible_height = usize::from(area.height.saturating_sub(2));
         let (start, end) = visible_row_window(selected, rows.len(), visible_height);
         let title = if rows.len() > visible_height && visible_height > 0 {
-            format!(" {title} {}-{}/{} ", start + 1, end, rows.len())
+            if start + 1 == end {
+                // A scrollable pane whose visible window spans exactly one row
+                // renders a single position (`Model 2/3`), not a degenerate
+                // `2-2/3` range (#3995).
+                format!(" {title} {}/{} ", end, rows.len())
+            } else {
+                format!(" {title} {}-{}/{} ", start + 1, end, rows.len())
+            }
         } else {
             format!(" {title} ")
         };
@@ -378,6 +560,19 @@ impl ModelPickerView {
                 hint_style,
             );
             lines.push(Line::from(spans));
+        }
+        if rows.is_empty() {
+            // A search that matches nothing must say so, not render a bare
+            // empty box (#3757 UX review).
+            let message = if self.query.is_empty() {
+                "No models available.".to_string()
+            } else {
+                format!("No models match \"{}\" — Backspace to clear.", self.query)
+            };
+            lines.push(Line::from(Span::styled(
+                message,
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
         }
         Paragraph::new(lines).render(inner, buf);
     }
@@ -460,10 +655,10 @@ fn fit_text(text: &str, width: usize) -> String {
 }
 
 #[cfg(test)]
-fn picker_model_ids_for_provider(provider: ApiProvider) -> Vec<&'static str> {
-    let mut models = vec!["auto"];
-    for id in model_completion_names_for_provider(provider) {
-        if id != "auto" && !models.contains(&id) {
+fn picker_model_ids_for_provider(provider: ApiProvider) -> Vec<String> {
+    let mut models = vec!["auto".to_string()];
+    for id in all_catalog_models_for_provider(provider) {
+        if id != "auto" && !models.iter().any(|m| m.eq_ignore_ascii_case(&id)) {
             models.push(id);
         }
     }
@@ -512,9 +707,9 @@ fn push_provider_model_rows(
 ) {
     for id in model_ids {
         if id == "auto" {
-            push_model_row(rows, id, None, picker_model_hint("auto"));
+            push_model_row(rows, id, None, picker_model_hint("auto", None));
         } else {
-            let mut hint = picker_model_hint(&id);
+            let mut hint = picker_model_hint(&id, Some(provider));
             if provider != active_provider {
                 hint = format!("switch route · {hint}");
             }
@@ -524,13 +719,7 @@ fn push_provider_model_rows(
 }
 
 fn provider_catalog_model_ids(provider: ApiProvider) -> Vec<String> {
-    let mut models = Vec::new();
-    for id in model_completion_names_for_provider(provider) {
-        if id != "auto" {
-            push_model_id(&mut models, id);
-        }
-    }
-    models
+    all_catalog_models_for_provider(provider)
 }
 
 fn provider_scoped_model_ids_for_app(app: &App, include_current_model: bool) -> Vec<String> {
@@ -538,8 +727,8 @@ fn provider_scoped_model_ids_for_app(app: &App, include_current_model: bool) -> 
     // separate custom/current-model row.
     let mut models = Vec::new();
     push_model_id(&mut models, "auto");
-    for id in model_completion_names_for_provider(app.api_provider) {
-        push_model_id(&mut models, id);
+    for id in all_catalog_models_for_provider(app.api_provider) {
+        push_model_id(&mut models, &id);
     }
 
     if let Some(model) = app
@@ -571,6 +760,19 @@ fn push_model_id(models: &mut Vec<String>, model: &str) {
     }
 }
 
+fn provider_query_splits(query: &str) -> Vec<(&str, &str)> {
+    let trimmed = query.trim();
+    let mut splits = Vec::new();
+    if let Some((provider, model)) = trimmed.split_once(':') {
+        splits.push((provider.trim(), model.trim()));
+    }
+    if let Some(idx) = trimmed.find(char::is_whitespace) {
+        let (provider, model) = trimmed.split_at(idx);
+        splits.push((provider.trim(), model.trim()));
+    }
+    splits
+}
+
 fn push_model_row(
     rows: &mut Vec<ModelPickerRow>,
     id: String,
@@ -586,6 +788,25 @@ fn push_model_row(
     rows.push(ModelPickerRow { id, provider, hint });
 }
 
+/// Compact Models.dev freshness chip for the picker chrome (#4139).
+///
+/// Fresh/live rows stay unmarked; stale and failed caches get an explicit
+/// suffix so users know the live layer is still visible but not current.
+fn catalog_freshness_title_suffix() -> &'static str {
+    match models_dev_live::status().freshness {
+        ModelsDevFreshness::Stale => " · stale",
+        ModelsDevFreshness::Failed => " · cache failed",
+        ModelsDevFreshness::Bundled | ModelsDevFreshness::Live => "",
+    }
+}
+
+/// Cross-field search (#4141): match a query against the provider name
+/// (provider key + display name), the display model name, and the wire model
+/// id, mirroring `ProviderDashboardRow::matches_query` so the two pickers behave
+/// consistently. `row.id` is both the model's display name and the id it is
+/// sent to the provider as, so matching it covers the display model name and
+/// the wire model id. The compact hint is only searched for the active
+/// provider / `auto` rows, preserving the existing cross-provider behavior.
 fn model_row_matches_query(
     row: &ModelPickerRow,
     query: &str,
@@ -596,7 +817,7 @@ fn model_row_matches_query(
         return true;
     }
     let provider_matches = row.provider.is_some_and(|provider| {
-        provider.as_str().contains(&query)
+        provider.as_str().to_ascii_lowercase().contains(&query)
             || provider
                 .display_name()
                 .to_ascii_lowercase()
@@ -617,6 +838,29 @@ fn model_row_label(row: &ModelPickerRow, initial_provider: ApiProvider) -> Strin
     }
 }
 
+/// Whether a model row shows in the active catalog view (#3830 / #4115).
+fn model_row_visible_in_view(
+    row: &ModelPickerRow,
+    initial_provider: ApiProvider,
+    configured_providers: &[ApiProvider],
+    view: ModelListView,
+) -> bool {
+    match view {
+        ModelListView::Configured => {
+            model_row_visible_by_default(row.provider, initial_provider, configured_providers)
+        }
+        ModelListView::Catalog => true,
+        ModelListView::Recent
+        | ModelListView::Coding
+        | ModelListView::Cheap
+        | ModelListView::LongContext => {
+            // Discoverability views browse the full lake but hide the synthetic
+            // `auto` row — it is not a catalog offering.
+            row.provider.is_some() || row.id != "auto"
+        }
+    }
+}
+
 /// Whether a model row shows up without the user typing a search query
 /// (#3830): `auto`, the active provider's own rows, and any other
 /// provider's rows once that provider is "configured" — same definition the
@@ -632,59 +876,181 @@ fn model_row_visible_by_default(
     }
 }
 
-/// Count of rows the default (empty-query) view shows — i.e. how many
-/// `model_rows` entries satisfy [`model_row_visible_by_default`]. Used to
-/// position the custom-model row right after them (#3830).
-fn default_visible_model_row_count(
-    rows: &[ModelPickerRow],
-    initial_provider: ApiProvider,
-    configured_providers: &[ApiProvider],
-) -> usize {
-    rows.iter()
-        .filter(|row| {
-            model_row_visible_by_default(row.provider, initial_provider, configured_providers)
-        })
-        .count()
+fn sort_model_rows_for_view(rows: &mut [&ModelPickerRow], view: ModelListView) {
+    match view {
+        ModelListView::Configured | ModelListView::Catalog => {}
+        ModelListView::Recent => rows.sort_by(|left, right| {
+            offering_fetched_at(right)
+                .cmp(&offering_fetched_at(left))
+                .then_with(|| left.id.cmp(&right.id))
+        }),
+        ModelListView::Coding => rows.sort_by(|left, right| {
+            coding_score(right)
+                .cmp(&coding_score(left))
+                .then_with(|| left.id.cmp(&right.id))
+        }),
+        ModelListView::Cheap => rows.sort_by(|left, right| {
+            match (
+                input_price_per_million(left),
+                input_price_per_million(right),
+            ) {
+                (Some(l), Some(r)) => l
+                    .partial_cmp(&r)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.id.cmp(&right.id)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => left.id.cmp(&right.id),
+            }
+        }),
+        ModelListView::LongContext => rows.sort_by(|left, right| {
+            context_tokens(right)
+                .cmp(&context_tokens(left))
+                .then_with(|| left.id.cmp(&right.id))
+        }),
+    }
 }
 
-/// Providers other than `active` that should be treated as "configured" for
-/// the `/model` picker's default view (#3830). Reuses the same predicate the
-/// `/provider` manager applies so the two pickers never disagree about what
-/// "configured" means.
-fn configured_providers_for(config: &Config, active: ApiProvider) -> Vec<ApiProvider> {
-    ApiProvider::sorted_for_display()
-        .into_iter()
-        .filter(|provider| {
-            *provider != active
-                && crate::config::provider_is_configured_for_active(config, *provider, active)
-        })
-        .collect()
+fn offering_for_row(row: &ModelPickerRow) -> Option<codewhale_config::catalog::CatalogOffering> {
+    let provider = row.provider?;
+    catalog_offering_for_model(provider, &row.id)
 }
 
-fn picker_model_hint(id: &str) -> String {
+fn offering_fetched_at(row: &ModelPickerRow) -> u64 {
+    match offering_for_row(row).map(|o| o.source) {
+        Some(CatalogSource::Live { fetched_at, .. }) => fetched_at,
+        _ => 0,
+    }
+}
+
+fn context_tokens(row: &ModelPickerRow) -> u64 {
+    if let Some(ctx) = offering_for_row(row)
+        .and_then(|offering| offering.limit)
+        .and_then(|limit| limit.context)
+    {
+        return ctx;
+    }
+    model_registry::lookup(&row.id)
+        .and_then(|meta| meta.context_window)
+        .map(u64::from)
+        .unwrap_or(0)
+}
+
+fn input_price_per_million(row: &ModelPickerRow) -> Option<f64> {
+    offering_for_row(row)
+        .and_then(|offering| OfferingPricing::from_catalog_offering(&offering))
+        .and_then(|pricing| pricing.input_per_million)
+}
+
+fn coding_score(row: &ModelPickerRow) -> u32 {
+    let mut score = 0_u32;
+    if let Some(offering) = offering_for_row(row) {
+        let text_ok = offering.modalities.as_ref().is_none_or(|modalities| {
+            modalities.output.is_empty()
+                || modalities
+                    .output
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case("text"))
+        });
+        if text_ok {
+            score += 40;
+        }
+        if offering.tool_call == Some(true) {
+            score += 40;
+        }
+        if offering.reasoning == Some(true) {
+            score += 10;
+        }
+        if offering
+            .limit
+            .as_ref()
+            .and_then(|limit| limit.context)
+            .unwrap_or(0)
+            >= 100_000
+        {
+            score += 10;
+        }
+    } else if model_registry::lookup(&row.id).is_some_and(|meta| meta.supports_reasoning) {
+        score += 20;
+    }
+    score
+}
+
+fn picker_model_hint(id: &str, provider: Option<ApiProvider>) -> String {
     if id == "auto" {
         return "select per turn".to_string();
     }
-    let Some(metadata) = model_registry::lookup(id) else {
-        return "provider model".to_string();
-    };
+
+    let offering = provider.and_then(|p| catalog_offering_for_model(p, id));
+    let registry = model_registry::lookup(id);
+    let card = offering.as_ref().map(ModelReferenceCard::from_offering);
 
     let mut parts = Vec::new();
-    if let Some(context_window) = metadata.context_window {
+
+    let context = card
+        .as_ref()
+        .and_then(|c| c.context_window)
+        .map(|tokens| tokens.min(u64::from(u32::MAX)) as u32)
+        .or_else(|| registry.as_ref().and_then(|meta| meta.context_window));
+    if let Some(context_window) = context {
         parts.push(format!(
             "{} ctx",
             format_picker_context_window(context_window)
         ));
     }
-    if metadata.supports_reasoning {
+
+    let max_output = card
+        .as_ref()
+        .and_then(|c| c.max_output)
+        .map(|tokens| tokens.min(u64::from(u32::MAX)) as u32)
+        .or_else(|| registry.as_ref().and_then(|meta| meta.max_output));
+    if let Some(max_output) = max_output {
+        parts.push(format!("{} out", format_picker_context_window(max_output)));
+    }
+
+    match offering.as_ref().and_then(|o| o.tool_call) {
+        Some(true) => parts.push("tools".to_string()),
+        Some(false) => parts.push("no tools".to_string()),
+        None => {}
+    }
+
+    let reasoning = offering
+        .as_ref()
+        .and_then(|o| o.reasoning)
+        .unwrap_or_else(|| {
+            registry
+                .as_ref()
+                .is_some_and(|meta| meta.supports_reasoning)
+        });
+    if reasoning {
         parts.push("reasoning".to_string());
     }
-    parts.push(if crate::pricing::has_pricing_for_model(id) {
-        "priced".to_string()
+
+    if let Some(card) = card.as_ref() {
+        let price = card.price_label();
+        if price != "unknown" {
+            parts.push(price);
+        } else {
+            parts.push("price unknown".to_string());
+        }
+        match &card.source {
+            CatalogSource::Live { .. } => parts.push("live".to_string()),
+            CatalogSource::Bundled => parts.push("bundled".to_string()),
+            CatalogSource::UserOverride => parts.push("override".to_string()),
+        }
     } else {
-        "price unknown".to_string()
-    });
-    parts.join(" · ")
+        parts.push(if crate::pricing::has_pricing_for_model(id) {
+            "priced".to_string()
+        } else {
+            "price unknown".to_string()
+        });
+    }
+
+    if parts.is_empty() {
+        "provider model".to_string()
+    } else {
+        parts.join(" · ")
+    }
 }
 
 fn format_picker_context_window(tokens: u32) -> String {
@@ -715,9 +1081,28 @@ impl ModalView for ModelPickerView {
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         match key.code {
-            KeyCode::Esc => ViewAction::Close,
+            // Esc carries the browsing context out so the next open can
+            // restore it (#4109 picker memory).
+            KeyCode::Esc => ViewAction::EmitAndClose(ViewEvent::ModelPickerDismissed {
+                catalog_view: self.view.browses_all_providers(),
+                view: self.view.memory_name().to_string(),
+                selected_row_id: {
+                    let rows = self.visible_model_rows();
+                    rows.get(self.selected_model_idx).map(|row| row.id.clone())
+                },
+            }),
             KeyCode::Enter if self.model_row_count() == 0 => ViewAction::None,
             KeyCode::Enter => ViewAction::EmitAndClose(self.build_event()),
+            // Cycle catalog views (#4115). Handled before the query-typing arm
+            // so `a`/`A` always advances the view instead of filtering.
+            KeyCode::Char(c)
+                if key.modifiers.is_empty()
+                    && self.query.is_empty()
+                    && c.eq_ignore_ascii_case(&'a') =>
+            {
+                self.toggle_view();
+                ViewAction::None
+            }
             KeyCode::Char(ch)
                 if self.focus == Pane::Model
                     && !key
@@ -819,17 +1204,28 @@ impl ModelPickerView {
         // wraps instead of clipping at narrow widths (#3732).
         let outer = Block::default()
             .title(Line::from(Span::styled(
-                " Model & thinking ",
+                format!(
+                    " Model & thinking · {}{} ",
+                    self.view.title_label(),
+                    catalog_freshness_title_suffix()
+                ),
                 Style::default()
-                    .fg(palette::DEEPSEEK_SKY)
+                    .fg(palette::WHALE_INFO)
                     .add_modifier(Modifier::BOLD),
             )))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::DEEPSEEK_INK));
+            .style(Style::default().bg(palette::WHALE_BG));
         let inner = outer.inner(popup_area);
         outer.render(popup_area, buf);
 
+        // Keep the long-standing "browse all" label on Configured so footer
+        // discoverability tests and muscle memory stay intact; other views
+        // preview the next named view (#4115).
+        let view_action = match self.view {
+            ModelListView::Configured => "browse all",
+            other => other.next().title_label(),
+        };
         let content = render_modal_footer(
             inner,
             buf,
@@ -838,14 +1234,12 @@ impl ModelPickerView {
                 ActionHint::new("Tab", "switch"),
                 ActionHint::new("Type", "filter"),
                 ActionHint::new("Enter", "apply"),
+                ActionHint::new("A", view_action),
                 ActionHint::new("Esc", "cancel"),
             ],
         );
 
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-            .split(content);
+        let layout = ListDetailLayout::split(content, 24);
 
         let mut model_rows: Vec<(String, String)> = self
             .visible_model_rows()
@@ -871,12 +1265,12 @@ impl ModelPickerView {
             model_rows.push((label, hint));
         }
         let model_title = if self.query.trim().is_empty() {
-            "Model".to_string()
+            format!("Model · {}", self.view.title_label())
         } else {
             format!("Model: {}", self.query.trim())
         };
         self.render_pane(
-            columns[0],
+            layout.list,
             buf,
             &model_title,
             model_rows,
@@ -913,7 +1307,7 @@ impl ModelPickerView {
             })
             .collect();
         self.render_pane(
-            columns[1],
+            layout.detail,
             buf,
             "Thinking",
             effort_rows,
@@ -1055,7 +1449,7 @@ mod tests {
 
     #[test]
     fn model_picker_hint_uses_model_registry_metadata() {
-        let hint = picker_model_hint("minimax/minimax-m3");
+        let hint = picker_model_hint("minimax/minimax-m3", None);
         assert!(
             hint.contains("1M ctx"),
             "hint should include registry context window: {hint}"
@@ -1065,8 +1459,27 @@ mod tests {
             "hint should include registry reasoning support: {hint}"
         );
         assert!(
-            hint.contains("priced"),
+            hint.contains("priced") || hint.contains("per Mtok") || hint.contains("$"),
             "hint should include pricing availability: {hint}"
+        );
+    }
+
+    #[test]
+    fn provider_query_splits_support_colon_and_space_forms() {
+        assert_eq!(
+            provider_query_splits("openrouter:anthropic/claude-sonnet-4"),
+            vec![("openrouter", "anthropic/claude-sonnet-4")]
+        );
+        assert_eq!(
+            provider_query_splits("openrouter anthropic/claude-sonnet-4"),
+            vec![("openrouter", "anthropic/claude-sonnet-4")]
+        );
+        assert_eq!(
+            provider_query_splits("openrouter anthropic/foo:bar"),
+            vec![
+                ("openrouter anthropic/foo", "bar"),
+                ("openrouter", "anthropic/foo:bar")
+            ]
         );
     }
 
@@ -1420,6 +1833,47 @@ mod tests {
     }
 
     #[test]
+    fn picker_query_provider_qualified_custom_row_targets_configured_provider() {
+        let (mut app, _default_config, _lock) = create_test_app();
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.model_ids_passthrough = false;
+        app.model = "deepseek-v4-pro".to_string();
+        app.auto_model = false;
+        let config = Config {
+            providers: Some(crate::config::ProvidersConfig {
+                openrouter: crate::config::ProviderConfig {
+                    api_key: Some("test-openrouter-key".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+
+        let mut view = ModelPickerView::new(&app, &config);
+        type_model_query(&mut view, "openrouter:anthropic/custom-sonnet");
+
+        assert_eq!(view.resolved_model(), "anthropic/custom-sonnet");
+        assert_eq!(
+            view.resolved_provider(),
+            Some(crate::config::ApiProvider::Openrouter)
+        );
+        let action = view.handle_key(KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ModelPickerApplied {
+                model, provider, ..
+            }) => {
+                assert_eq!(model, "anthropic/custom-sonnet");
+                assert_eq!(provider, Some(crate::config::ApiProvider::Openrouter));
+            }
+            other => panic!("expected ModelPickerApplied EmitAndClose, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn picker_query_no_match_strict_provider_enter_is_noop() {
         let (mut app, config, _lock) = create_test_app();
         app.api_provider = crate::config::ApiProvider::Deepseek;
@@ -1514,6 +1968,103 @@ mod tests {
         );
     }
 
+    /// A cross-provider row used by the #4141 cross-field search tests: an
+    /// active DeepSeek session browsing Z.ai's `z-ai/glm-5.2` route.
+    fn cross_provider_row() -> ModelPickerRow {
+        ModelPickerRow {
+            id: "z-ai/glm-5.2".to_string(),
+            provider: Some(ApiProvider::Zai),
+            hint: "switch route · reasoning".to_string(),
+        }
+    }
+
+    #[test]
+    fn model_row_query_matches_provider_name() {
+        let row = cross_provider_row();
+        // Provider key (`zai`) and human display name (`Zhipu AI / Z.ai`) both
+        // match, even though neither is a substring of the wire model id.
+        assert!(model_row_matches_query(&row, "zai", ApiProvider::Deepseek));
+        assert!(model_row_matches_query(
+            &row,
+            "zhipu",
+            ApiProvider::Deepseek
+        ));
+        // Case-insensitive, matching the provider picker.
+        assert!(model_row_matches_query(
+            &row,
+            "ZHIPU",
+            ApiProvider::Deepseek
+        ));
+    }
+
+    #[test]
+    fn model_row_query_matches_display_model_name() {
+        let row = cross_provider_row();
+        // `row.id` is what the picker renders as the model's display name.
+        assert!(model_row_matches_query(
+            &row,
+            "glm-5.2",
+            ApiProvider::Deepseek
+        ));
+        assert!(model_row_matches_query(&row, "GLM", ApiProvider::Deepseek));
+    }
+
+    #[test]
+    fn model_row_query_matches_wire_model_id() {
+        let row = cross_provider_row();
+        // The full wire id (as sent to the provider) is searchable too, mirroring
+        // the provider picker's route wire-model match (#4141).
+        assert!(model_row_matches_query(
+            &row,
+            "z-ai/glm-5.2",
+            ApiProvider::Deepseek
+        ));
+        assert!(model_row_matches_query(
+            &row,
+            "z-ai/",
+            ApiProvider::Deepseek
+        ));
+    }
+
+    #[test]
+    fn model_row_query_no_field_match_returns_false() {
+        let row = cross_provider_row();
+        // `openai` is in neither the provider name/key, the display model name,
+        // nor the wire id, and the hint is not searched for cross-provider rows,
+        // so the row must not match.
+        assert!(!model_row_matches_query(
+            &row,
+            "openai",
+            ApiProvider::Deepseek
+        ));
+    }
+
+    #[test]
+    fn picker_query_by_wire_id_surfaces_cross_provider_row_and_hides_others() {
+        let (mut app, config, _lock) = create_test_app();
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.model = "deepseek-v4-pro".to_string();
+        app.auto_model = false;
+
+        let mut view = ModelPickerView::new(&app, &config);
+        // A GLM model id belongs to Z.ai; searching it surfaces that route while
+        // a query that matches no provider/model/wire field yields no rows.
+        type_model_query(&mut view, "glm");
+        assert!(
+            view.visible_model_rows()
+                .iter()
+                .any(|row| row.provider == Some(crate::config::ApiProvider::Zai)),
+            "searching a model name must surface the provider that serves it"
+        );
+
+        view.update_query(String::new());
+        type_model_query(&mut view, "zzz-no-such-provider-or-model");
+        assert!(
+            view.visible_model_rows().is_empty(),
+            "a query matching no provider/model/wire field must return no rows"
+        );
+    }
+
     #[test]
     fn picker_preserves_unknown_model_via_custom_row() {
         let (mut app, config, _lock) = create_test_app();
@@ -1525,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn picker_lists_openrouter_large_models() {
+    fn picker_lists_openrouter_catalog_models() {
         let (mut app, config, _lock) = create_test_app();
         app.api_provider = crate::config::ApiProvider::Openrouter;
         app.model_ids_passthrough = true;
@@ -1535,17 +2086,17 @@ mod tests {
         let view = ModelPickerView::new(&app, &config);
         let model_ids = view.visible_model_ids();
 
-        assert!(model_ids.contains(&"arcee-ai/trinity-large-thinking"));
-        assert!(model_ids.contains(&"xiaomi/mimo-v2.5-pro"));
-        assert!(model_ids.contains(&"minimax/minimax-m3"));
-        assert!(model_ids.contains(&"z-ai/glm-5.2"));
-        assert!(
-            model_ids
-                .iter()
-                .take(6)
-                .any(|id| *id == "minimax/minimax-m3"),
-            "MiniMax M3 should be visible in the first picker window on normal terminals"
-        );
+        for expected in [
+            "deepseek/deepseek-v4-pro",
+            "deepseek/deepseek-v4-flash",
+            "qwen/qwen3.6-flash",
+            "minimax/minimax-m3",
+        ] {
+            assert!(
+                model_ids.contains(&expected),
+                "missing {expected}: {model_ids:?}"
+            );
+        }
         assert!(!view.show_custom_model_row);
         assert_eq!(view.resolved_model(), "minimax/minimax-m3");
     }
@@ -1560,7 +2111,7 @@ mod tests {
         let view = ModelPickerView::new(&app, &config);
         let model_ids = view.visible_model_ids();
 
-        for expected in ["mimo-v2.5-pro", "mimo-v2.5-pro-ultraspeed", "mimo-v2.5"] {
+        for expected in ["mimo-v2.5-pro", "mimo-v2.5"] {
             assert!(model_ids.contains(&expected), "missing {expected}");
         }
         for deprecated in ["mimo-v2-pro", "mimo-v2-omni", "mimo-v2-flash"] {
@@ -2001,7 +2552,10 @@ mod tests {
             KeyCode::Esc,
             crossterm::event::KeyModifiers::NONE,
         ));
-        assert!(matches!(action, ViewAction::Close));
+        assert!(matches!(
+            action,
+            ViewAction::EmitAndClose(ViewEvent::ModelPickerDismissed { .. })
+        ));
     }
 
     #[test]
@@ -2019,12 +2573,123 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         ));
 
-        assert!(matches!(action, ViewAction::Close));
+        assert!(matches!(
+            action,
+            ViewAction::EmitAndClose(ViewEvent::ModelPickerDismissed { .. })
+        ));
+    }
+
+    #[test]
+    fn esc_reports_browsing_context_and_reopen_restores_it() {
+        let (mut app, config, _lock) = create_test_app();
+        let mut view = ModelPickerView::new(&app, &config);
+
+        // Browse: switch to the full catalog and move the highlight down two.
+        view.handle_key(KeyEvent::new(
+            KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        view.handle_key(KeyEvent::new(
+            KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        view.handle_key(KeyEvent::new(
+            KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let browsed_id = view.resolved_model();
+
+        let action = view.handle_key(KeyEvent::new(
+            KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let ViewAction::EmitAndClose(ViewEvent::ModelPickerDismissed {
+            catalog_view,
+            view,
+            selected_row_id,
+        }) = action
+        else {
+            panic!("expected ModelPickerDismissed, got something else");
+        };
+        assert!(catalog_view, "catalog view should be remembered");
+        assert_eq!(view, "catalog");
+        assert_eq!(selected_row_id.as_deref(), Some(browsed_id.as_str()));
+
+        // Reopen with the memory applied — same view, same highlighted row.
+        app.model_picker_memory = Some(crate::tui::app::ModelPickerMemory {
+            catalog_view,
+            view: Some(view),
+            selected_row_id,
+        });
+        let reopened = ModelPickerView::new(&app, &config);
+        assert_eq!(reopened.view, ModelListView::Catalog);
+        assert_eq!(reopened.resolved_model(), browsed_id);
+    }
+
+    #[test]
+    fn reopen_with_stale_memory_falls_back_to_active_model() {
+        let (mut app, config, _lock) = create_test_app();
+        app.model_picker_memory = Some(crate::tui::app::ModelPickerMemory {
+            catalog_view: false,
+            view: Some("configured".to_string()),
+            selected_row_id: Some("model-that-no-longer-exists".to_string()),
+        });
+        let view = ModelPickerView::new(&app, &config);
+        // The remembered row is gone; the picker must still open on a valid
+        // selection (the active model path from the default constructor).
+        assert!(view.selected_model_idx <= view.model_row_count());
     }
 
     /// The four terminal sizes the v0.8.66 modal blocker (#3732) requires every
     /// overlay to remain readable and fully operable at.
     const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
+
+    #[test]
+    fn toggle_view_cycles_six_catalog_views() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (app, config, _lock) = create_test_app();
+        let mut view = ModelPickerView::new(&app, &config);
+        let configured_count = view.visible_model_rows().len();
+        assert_eq!(view.view, ModelListView::Configured);
+
+        view.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+        assert_eq!(view.view, ModelListView::Catalog);
+        assert!(view.visible_model_rows().len() > configured_count);
+
+        let expected = [
+            ModelListView::Recent,
+            ModelListView::Coding,
+            ModelListView::Cheap,
+            ModelListView::LongContext,
+            ModelListView::Configured,
+        ];
+        for expected_view in expected {
+            view.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+            assert_eq!(view.view, expected_view);
+        }
+        assert_eq!(view.visible_model_rows().len(), configured_count);
+    }
+
+    #[test]
+    fn discoverability_views_do_not_auto_select_newest() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (app, config, _lock) = create_test_app();
+        let mut view = ModelPickerView::new(&app, &config);
+        let active = view.resolved_model();
+        // Cycle to Recent — highlight resets to index 0, but apply still requires Enter.
+        for _ in 0..2 {
+            view.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+        }
+        assert_eq!(view.view, ModelListView::Recent);
+        assert_eq!(view.selected_model_idx, 0);
+        // Esc dismisses without applying a surprising newest route.
+        let action = view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(matches!(
+            action,
+            ViewAction::EmitAndClose(ViewEvent::ModelPickerDismissed { .. })
+        ));
+        assert_eq!(active, app.model);
+    }
 
     #[test]
     fn model_picker_is_usable_and_opaque_at_blocker_sizes() {
@@ -2057,8 +2722,13 @@ mod tests {
             let text = rows.join("\n");
 
             // Footer keeps every action (it wraps instead of clipping).
-            for label in ["move", "switch", "filter", "apply", "cancel"] {
+            for label in ["move", "switch", "filter", "apply", "browse all", "cancel"] {
                 assert!(text.contains(label), "{w}x{h}: missing '{label}' hint");
+            }
+            // The shared list/detail layout keeps both picker panes visible;
+            // narrow blocker sizes stack them instead of squeezing columns.
+            for label in ["Model", "Thinking"] {
+                assert!(text.contains(label), "{w}x{h}: missing '{label}' pane");
             }
             // Composited frame is fully opaque: no sentinel survives and the
             // center cell carries the modal ink background.
@@ -2068,7 +2738,7 @@ mod tests {
             );
             assert_eq!(
                 buf[(w / 2, h / 2)].bg,
-                palette::DEEPSEEK_INK,
+                palette::WHALE_BG,
                 "{w}x{h}: modal interior must be opaque"
             );
             // No row exceeds the frame width (no horizontal overflow).
@@ -2089,5 +2759,53 @@ mod tests {
                 .map(|effort| effort.short_label())
                 .collect();
         assert_eq!(labels, vec!["auto", "off", "high", "max"]);
+    }
+
+    #[test]
+    fn single_visible_row_pane_title_shows_single_position_not_degenerate_range() {
+        let (app, config, _lock) = create_test_app();
+        let view = ModelPickerView::new(&app, &config);
+
+        // Three rows in a pane only tall enough to show one inner row (height 3
+        // leaves 1 row after the top/bottom border). The scrollable-title branch
+        // must render a single position (`Model 2/3`), not a degenerate `2-2/3`
+        // range (#3995).
+        let rows: Vec<(String, String)> = (1..=3)
+            .map(|n| (format!("model-{n}"), String::new()))
+            .collect();
+        let area = Rect::new(0, 0, 40, 3);
+        let mut buf = Buffer::empty(area);
+        view.render_pane(area, &mut buf, "Model", rows, 1, false);
+
+        let title = buffer_row_text(&buf, area, area.y);
+        assert!(
+            title.contains("Model 2/3"),
+            "single visible row should show a single position: {title:?}"
+        );
+        assert!(
+            !title.contains("2-2/3"),
+            "single visible row must not render a degenerate range: {title:?}"
+        );
+    }
+
+    #[test]
+    fn multi_visible_row_pane_title_keeps_real_range() {
+        let (app, config, _lock) = create_test_app();
+        let view = ModelPickerView::new(&app, &config);
+
+        // Four rows in a pane tall enough for two inner rows (height 4). The
+        // visible window spans two rows, so the title keeps a real range.
+        let rows: Vec<(String, String)> = (1..=4)
+            .map(|n| (format!("model-{n}"), String::new()))
+            .collect();
+        let area = Rect::new(0, 0, 40, 4);
+        let mut buf = Buffer::empty(area);
+        view.render_pane(area, &mut buf, "Thinking", rows, 2, false);
+
+        let title = buffer_row_text(&buf, area, area.y);
+        assert!(
+            title.contains("Thinking 2-3/4"),
+            "multi visible row should render a real range: {title:?}"
+        );
     }
 }

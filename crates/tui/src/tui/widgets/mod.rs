@@ -29,16 +29,17 @@ use std::time::Duration;
 use crate::commands;
 #[cfg(test)]
 use crate::config::ApiProvider;
-#[cfg(test)]
-use crate::config::model_completion_names_for_provider;
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
+#[cfg(test)]
+use crate::provider_lake::all_catalog_models_for_provider;
 use crate::tui::app::{App, AppMode, ComposerDensity, VimMode};
 use crate::tui::approval::{
     ApprovalRequest, ApprovalView, ElevationOption, ElevationRequest, RiskLevel, ToolCategory,
 };
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus};
 use crate::tui::scrolling::TranscriptLineMeta;
+use crate::tui::ui_text::{char_display_width, text_display_width};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -618,10 +619,9 @@ impl<'a> ComposerWidget<'a> {
 
     fn mode_color(&self) -> Color {
         match self.app.mode {
-            AppMode::Agent => palette::MODE_AGENT,
-            AppMode::Auto => palette::MODE_AGENT,
-            AppMode::Yolo => palette::MODE_YOLO,
+            AppMode::Agent | AppMode::Auto | AppMode::Yolo => palette::MODE_AGENT,
             AppMode::Plan => palette::MODE_PLAN,
+            AppMode::Operate => palette::MODE_OPERATE,
         }
     }
 
@@ -652,8 +652,16 @@ impl Renderable for ComposerWidget<'_> {
         let input_rows_budget =
             composer_input_rows_budget(inner_area.height, menu_lines_for_budget);
         let content_width = usize::from(inner_area.width.max(1));
-        let (visible_lines, _cursor_row, _cursor_col, scroll_offset) =
-            layout_input_with_scroll(input_text, input_cursor, content_width, input_rows_budget);
+
+        // Use the extended version that also returns character indices to avoid
+        // redundant wrapping when rendering text selections (issue #3909).
+        let (visible_lines, _cursor_row, _cursor_col, _scroll_offset, visible_char_indices) =
+            layout_input_with_scroll_and_char_indices(
+                input_text,
+                input_cursor,
+                content_width,
+                input_rows_budget,
+            );
         let is_draft_mode = input_text.contains('\n') || visible_lines.len() > 1;
         if has_panel {
             let border_color = if input_text.trim().is_empty() {
@@ -703,7 +711,7 @@ impl Renderable for ComposerWidget<'_> {
                         if queue_count > 0 {
                             (
                                 Some(format!("↵ send ({queue_count} queued)")),
-                                palette::DEEPSEEK_SKY,
+                                palette::WHALE_INFO,
                             )
                         } else {
                             (None, palette::TEXT_MUTED)
@@ -714,20 +722,22 @@ impl Renderable for ComposerWidget<'_> {
                             (Some("↵ offline queue".to_string()), palette::STATUS_WARNING)
                         } else {
                             let label = if queue_count > 0 {
-                                format!("↵ queue ({} waiting)", queue_count.saturating_add(1))
+                                format!(
+                                    "↵ queue ({} waiting, double-↵ to steer)",
+                                    queue_count.saturating_add(1)
+                                )
                             } else {
-                                "↵ queue for next turn".to_string()
+                                "↵ queue (double-↵ to steer)".to_string()
                             };
                             (Some(label), palette::TEXT_MUTED)
                         }
                     }
-                    // Steer and QueueFollowUp are now only reached via Ctrl+Enter override.
-                    SubmitDisposition::Steer => (
-                        Some("↵ steering (Ctrl+Enter)".to_string()),
-                        palette::DEEPSEEK_SKY,
-                    ),
+                    // Steer reached via double-tap Enter or Ctrl+Enter override.
+                    SubmitDisposition::Steer => {
+                        (Some("↵ steering".to_string()), palette::WHALE_INFO)
+                    }
                     SubmitDisposition::QueueFollowUp => (
-                        Some("↵ queued (Ctrl+Enter to steer)".to_string()),
+                        Some("↵ queued (double-↵ to steer)".to_string()),
                         palette::TEXT_MUTED,
                     ),
                 };
@@ -794,13 +804,12 @@ impl Renderable for ComposerWidget<'_> {
                 input_lines.push(Line::from(Span::styled(placeholder, style)));
             }
         } else if let Some((sel_start, sel_end)) = self.app.selection_range() {
-            let line_ranges: Vec<(usize, usize)> =
-                wrap_input_lines_for_mouse(&self.app.input, content_width)
-                    .into_iter()
-                    .skip(scroll_offset)
-                    .take(visible_lines.len())
-                    .map(|(start, text)| (start, start + text.chars().count()))
-                    .collect();
+            // Use the character indices we already computed during layout
+            // to avoid redundant wrapping (issue #3909).
+            let line_ranges: Vec<(usize, usize)> = visible_char_indices
+                .iter()
+                .map(|(start, text)| (*start, *start + text.chars().count()))
+                .collect();
             for (line_text, (line_start, line_end)) in visible_lines.iter().zip(line_ranges.iter())
             {
                 let spans = line_spans_with_selection(
@@ -1013,7 +1022,7 @@ impl Renderable for ComposerWidget<'_> {
 
                 // Name column
                 let name_style = if entry.is_skill && !is_selected {
-                    Style::default().fg(palette::DEEPSEEK_SKY)
+                    Style::default().fg(palette::WHALE_INFO)
                 } else {
                     sel_style
                 };
@@ -1185,17 +1194,19 @@ impl<'a> ApprovalWidget<'a> {
     /// dimmed backdrop region always agree.
     fn build_inline_content(&self, area: Rect) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
         let risk = self.request.risk;
+        let stakes = self.request.stakes();
         let locale = self.view.locale();
-        let palette_colors = approval_palette(risk);
+        let palette_colors = approval_palette(stakes);
+        let critical = matches!(stakes, crate::tui::approval::ApprovalStakes::Critical);
 
         let mut body: Vec<Line<'static>> = Vec::with_capacity(16);
         // Header: stakes badge + tool identifier.
         body.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!(" {} ", risk_badge_text(risk, locale)),
+                format!(" {} ", stakes_badge_text(stakes, locale)),
                 Style::default()
-                    .fg(palette::DEEPSEEK_INK)
+                    .fg(palette::WHALE_BG)
                     .bg(palette_colors.accent)
                     .add_modifier(Modifier::BOLD),
             ),
@@ -1203,7 +1214,7 @@ impl<'a> ApprovalWidget<'a> {
             Span::styled(
                 self.request.tool_name.clone(),
                 Style::default()
-                    .fg(palette::DEEPSEEK_SKY)
+                    .fg(palette::WHALE_INFO)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
@@ -1287,40 +1298,50 @@ impl<'a> ApprovalWidget<'a> {
             }
         }
 
-        // Destructive policy / cancel semantics.
-        if matches!(risk, RiskLevel::Destructive) {
+        // Destructive policy / cancel semantics — critical stakes only. For
+        // routine and elevated work the controls speak for themselves; the
+        // extra policy prose was noise that made every edit read like an
+        // emergency.
+        if critical {
             push_destructive_approval_semantics(&mut body, locale, false);
         }
 
-        // Secondary context: what it is and what it touches.
-        body.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(label_about(locale), Style::default().fg(palette::TEXT_HINT)),
-            Span::styled(
-                self.request.description_for_locale(locale),
-                Style::default().fg(palette::TEXT_BODY),
-            ),
-        ]));
-        for impact in self.request.impacts_for_locale(locale).into_iter().take(4) {
+        // Secondary context: what it is and what it touches. Only critical
+        // prompts carry the full about/impact/category dossier by default —
+        // everything stays one `v` away in the details pager. Keep a single
+        // About line as fallback context when nothing else was rendered.
+        if critical || details.is_empty() {
             body.push(Line::from(vec![
                 Span::raw("  "),
+                Span::styled(label_about(locale), Style::default().fg(palette::TEXT_HINT)),
                 Span::styled(
-                    label_impact(locale),
-                    Style::default().fg(palette::TEXT_HINT),
+                    self.request.description_for_locale(locale),
+                    Style::default().fg(palette::TEXT_BODY),
                 ),
-                Span::styled(impact, Style::default().fg(palette::TEXT_BODY)),
             ]));
         }
-        // Category line — localized risk category.
-        let (cat_label, cat_color) = category_label_for(self.request.category, locale);
-        body.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(label_type(locale), Style::default().fg(palette::TEXT_HINT)),
-            Span::styled(
-                cat_label,
-                Style::default().fg(cat_color).add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        if critical {
+            for impact in self.request.impacts_for_locale(locale).into_iter().take(4) {
+                body.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        label_impact(locale),
+                        Style::default().fg(palette::TEXT_HINT),
+                    ),
+                    Span::styled(impact, Style::default().fg(palette::TEXT_BODY)),
+                ]));
+            }
+            // Category line — localized risk category.
+            let (cat_label, cat_color) = category_label_for(self.request.category, locale);
+            body.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(label_type(locale), Style::default().fg(palette::TEXT_HINT)),
+                Span::styled(
+                    cat_label,
+                    Style::default().fg(cat_color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
 
         // Preview of the persistent ask-rule the `[s]` shortcut would save
         // (#3766). Informational, so it lives in the (scrollable) body.
@@ -1378,17 +1399,17 @@ impl Renderable for ApprovalWidget<'_> {
             let bar_area = Rect::new(area.x, bar_y, area.width, 1);
             Clear.render(bar_area, buf);
 
-            let risk = self.request.risk;
-            let palette_colors = approval_palette(risk);
+            let stakes = self.request.stakes();
+            let palette_colors = approval_palette(stakes);
             let summary = format!(
                 " {} — {}  [Tab to expand] ",
                 self.request.tool_name,
-                risk_badge_text(risk, self.view.locale()),
+                stakes_badge_text(stakes, self.view.locale()),
             );
             let line = Line::from(Span::styled(
                 summary,
                 Style::default()
-                    .fg(palette::DEEPSEEK_INK)
+                    .fg(palette::WHALE_BG)
                     .bg(palette_colors.accent)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -1396,8 +1417,11 @@ impl Renderable for ApprovalWidget<'_> {
             return;
         }
 
-        let risk = self.request.risk;
-        let palette_colors = approval_palette(risk);
+        // Compute stakes once for this render pass (it runs command_safety
+        // analysis on shell commands); reuse it for the palette and the
+        // left-rail gate instead of re-deriving per band.
+        let stakes = self.request.stakes();
+        let palette_colors = approval_palette(stakes);
         let (body, controls) = self.build_inline_content(area);
         let region = inline_region_for(area, &body, &controls);
         if region.width == 0 || region.height == 0 {
@@ -1409,7 +1433,7 @@ impl Renderable for ApprovalWidget<'_> {
         // approval is no longer a full-screen takeover (#3799).
         Clear.render(region, buf);
         Block::default()
-            .style(Style::default().bg(palette::DEEPSEEK_INK))
+            .style(Style::default().bg(palette::WHALE_BG))
             .render(region, buf);
 
         // Top separator rule, risk-tinted, so the prompt reads as a distinct
@@ -1476,7 +1500,7 @@ impl Renderable for ApprovalWidget<'_> {
             .wrap(Wrap { trim: false })
             .render(control_rect, buf);
 
-        if matches!(risk, RiskLevel::Destructive) {
+        if matches!(stakes, crate::tui::approval::ApprovalStakes::Critical) {
             paint_left_rail(region, buf, palette_colors.accent);
         }
     }
@@ -1486,10 +1510,6 @@ impl Renderable for ApprovalWidget<'_> {
     }
 }
 
-/// Compute the card rect inside `area`. Always centered; pad on every
-/// side so the takeover reads as a takeover but a small terminal still
-/// stays inside the buffer. Very small terminals may truncate the card
-/// content, but rendering must never address cells outside `area`.
 /// Bottom-anchored band the inline approval prompt occupies within `area`.
 /// Sized to the measured content but never taller than the frame, and always
 /// tall enough to show the reserved controls (#3799).
@@ -1586,16 +1606,8 @@ fn build_approval_controls(
     controls.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            selection_hint_prefix(locale),
-            Style::default().fg(palette::TEXT_HINT),
-        ),
-        Span::styled(
-            selection_hint_value(locale),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
             footer_controls(locale),
-            Style::default().fg(palette::TEXT_HINT),
+            Style::default().fg(palette::TEXT_MUTED),
         ),
         if request.can_save_ask_rule() {
             Span::styled(save_ask_rule_hint(locale), Style::default().fg(shortcut))
@@ -1638,7 +1650,7 @@ fn paint_left_rail(card: Rect, buf: &mut Buffer, color: Color) {
         }
         let cell = &mut buf[(rail_x, y)];
         cell.set_char('\u{2503}'); // ┃ — heavy bar so the warning reads at a glance
-        cell.set_style(Style::default().fg(color).bg(palette::DEEPSEEK_INK));
+        cell.set_style(Style::default().fg(color).bg(palette::WHALE_BG));
     }
 }
 
@@ -1649,16 +1661,23 @@ struct ApprovalColors {
     shortcut: Color,
 }
 
-fn approval_palette(risk: RiskLevel) -> ApprovalColors {
-    match risk {
-        RiskLevel::Benign => ApprovalColors {
+fn approval_palette(stakes: crate::tui::approval::ApprovalStakes) -> ApprovalColors {
+    use crate::tui::approval::ApprovalStakes;
+    match stakes {
+        ApprovalStakes::Routine => ApprovalColors {
             border: palette::BORDER_COLOR,
-            accent: palette::DEEPSEEK_SKY,
-            shortcut: palette::DEEPSEEK_SKY,
+            accent: palette::WHALE_INFO,
+            shortcut: palette::WHALE_INFO,
         },
-        RiskLevel::Destructive => ApprovalColors {
-            border: palette::DEEPSEEK_RED,
-            accent: palette::DEEPSEEK_RED,
+        // Ordinary state-touching work: a calm ask, not an alarm.
+        ApprovalStakes::Elevated => ApprovalColors {
+            border: palette::BORDER_COLOR,
+            accent: palette::STATUS_WARNING,
+            shortcut: palette::WHALE_INFO,
+        },
+        ApprovalStakes::Critical => ApprovalColors {
+            border: palette::WHALE_ERROR,
+            accent: palette::WHALE_ERROR,
             shortcut: palette::STATUS_WARNING,
         },
     }
@@ -1679,10 +1698,15 @@ fn approval_option_style(is_selected: bool, color: Color) -> Style {
     }
 }
 
-fn risk_badge_text(risk: RiskLevel, locale: Locale) -> Cow<'static, str> {
-    match risk {
-        RiskLevel::Benign => tr(locale, MessageId::ApprovalRiskReview),
-        RiskLevel::Destructive => tr(locale, MessageId::ApprovalRiskDestructive),
+fn stakes_badge_text(
+    stakes: crate::tui::approval::ApprovalStakes,
+    locale: Locale,
+) -> Cow<'static, str> {
+    use crate::tui::approval::ApprovalStakes;
+    match stakes {
+        ApprovalStakes::Routine => tr(locale, MessageId::ApprovalRiskReview),
+        ApprovalStakes::Elevated => tr(locale, MessageId::ApprovalRiskElevated),
+        ApprovalStakes::Critical => tr(locale, MessageId::ApprovalRiskDestructive),
     }
 }
 
@@ -1694,6 +1718,7 @@ fn category_label_for(category: ToolCategory, locale: Locale) -> (Cow<'static, s
         ToolCategory::Network => tr(locale, MessageId::ApprovalCategoryNetwork),
         ToolCategory::McpRead => tr(locale, MessageId::ApprovalCategoryMcpRead),
         ToolCategory::McpAction => tr(locale, MessageId::ApprovalCategoryMcpAction),
+        ToolCategory::Agent => tr(locale, MessageId::ApprovalCategoryAgent),
         ToolCategory::Unknown => tr(locale, MessageId::ApprovalCategoryUnknown),
     };
     let color = match category {
@@ -1701,8 +1726,9 @@ fn category_label_for(category: ToolCategory, locale: Locale) -> (Cow<'static, s
         ToolCategory::FileWrite => palette::STATUS_WARNING,
         ToolCategory::Shell => palette::STATUS_ERROR,
         ToolCategory::Network => palette::STATUS_WARNING,
-        ToolCategory::McpRead => palette::DEEPSEEK_SKY,
+        ToolCategory::McpRead => palette::WHALE_INFO,
         ToolCategory::McpAction => palette::STATUS_WARNING,
+        ToolCategory::Agent => palette::WHALE_INFO,
         ToolCategory::Unknown => palette::STATUS_ERROR,
     };
     (label, color)
@@ -1730,7 +1756,7 @@ fn push_detail_line(lines: &mut Vec<Line<'static>>, label: &str, value: &str) {
         Span::styled(
             format!("{label:<7} "),
             Style::default()
-                .fg(palette::DEEPSEEK_SKY)
+                .fg(palette::WHALE_INFO)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(value.to_string(), Style::default().fg(palette::TEXT_BODY)),
@@ -1805,7 +1831,7 @@ fn push_shell_command_lines(
         Span::styled(
             format!("{label}:"),
             Style::default()
-                .fg(palette::DEEPSEEK_SKY)
+                .fg(palette::WHALE_INFO)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -1906,14 +1932,6 @@ fn save_ask_rule_hint(locale: Locale) -> &'static str {
     }
 }
 
-fn selection_hint_prefix(locale: Locale) -> Cow<'static, str> {
-    tr(locale, MessageId::ApprovalChooseHint)
-}
-
-fn selection_hint_value(locale: Locale) -> Cow<'static, str> {
-    tr(locale, MessageId::ApprovalChooseAction)
-}
-
 struct ApprovalOptionRow {
     label: Cow<'static, str>,
     key_hint: &'static str,
@@ -2008,7 +2026,7 @@ impl Renderable for ElevationWidget<'_> {
                 Span::styled(
                     &self.request.tool_name,
                     Style::default()
-                        .fg(palette::DEEPSEEK_SKY)
+                        .fg(palette::WHALE_INFO)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
@@ -2130,7 +2148,7 @@ impl Renderable for ElevationWidget<'_> {
             .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::DEEPSEEK_INK))
+            .style(Style::default().bg(palette::WHALE_BG))
             .padding(Padding::uniform(1));
 
         let paragraph = Paragraph::new(lines)
@@ -2312,21 +2330,6 @@ fn apply_selection_to_line(
     result
 }
 
-fn text_display_width(text: &str) -> usize {
-    text.chars().map(char_display_width).sum()
-}
-
-fn char_display_width(ch: char) -> usize {
-    if ch == '\t' {
-        4
-    } else {
-        // `None` (control/unassigned) defaults to one column; `Some(0)` (combining
-        // marks, ZWJ, zero-width spaces) must stay 0 so width math matches what the
-        // terminal renders. Mirrors `ui_text::char_display_width`.
-        UnicodeWidthChar::width(ch).unwrap_or(1)
-    }
-}
-
 fn truncate_display_width(text: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
@@ -2356,7 +2359,7 @@ fn truncate_display_width(text: &str, max_width: usize) -> String {
 fn vim_mode_style(mode: VimMode) -> Style {
     let color = match mode {
         VimMode::Normal => palette::TEXT_MUTED,
-        VimMode::Insert => palette::DEEPSEEK_SKY,
+        VimMode::Insert => palette::WHALE_INFO,
         VimMode::Visual => palette::MODE_PLAN,
     };
     Style::default().fg(color).bold()
@@ -2625,10 +2628,7 @@ pub(crate) fn slash_completion_hints(
     workspace: Option<&std::path::Path>,
     api_provider: ApiProvider,
 ) -> Vec<SlashMenuEntry> {
-    let model_candidates = model_completion_names_for_provider(api_provider)
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let model_candidates = all_catalog_models_for_provider(api_provider);
     slash_completion_hints_with_model_candidates(
         input,
         limit,
@@ -3035,13 +3035,21 @@ fn push_command_entry(
         } else {
             None
         };
-        let desc = if info.aliases.is_empty() {
+        // Omit aliases already shown in the label (`/clear or /qingping`) so
+        // the description does not repeat them (#3990).
+        let remaining_aliases: Vec<&str> = info
+            .aliases
+            .iter()
+            .copied()
+            .filter(|alias| hint.as_deref() != Some(*alias))
+            .collect();
+        let desc = if remaining_aliases.is_empty() {
             info.description_for(locale).to_string()
         } else {
             format!(
                 "{}  (aliases: {})",
                 info.description_for(locale),
-                info.aliases
+                remaining_aliases
                     .iter()
                     .map(|a| format!("/{a}"))
                     .collect::<Vec<_>>()
@@ -3106,6 +3114,56 @@ pub fn layout_input_with_scroll(
     )
 }
 
+/// Extended version of `layout_input_with_scroll` that also returns character
+/// indices for each wrapped line. Used by ComposerWidget to avoid redundant
+/// wrapping when rendering text selections.
+fn layout_input_with_scroll_and_char_indices(
+    input: &str,
+    cursor: usize,
+    width: usize,
+    max_height: usize,
+) -> (Vec<String>, usize, usize, usize, Vec<(usize, String)>) {
+    let (all_lines, all_with_indices) = wrap_input_lines_internal(input, width);
+
+    let lines = if all_lines.is_empty() {
+        vec![String::new()]
+    } else {
+        all_lines
+    };
+
+    let (cursor_row, cursor_col) = cursor_row_col(input, cursor, width.max(1));
+
+    let max_height = max_height.max(1);
+    let mut start = 0usize;
+    if cursor_row >= max_height {
+        start = cursor_row + 1 - max_height;
+    }
+    if start + max_height > lines.len() {
+        start = lines.len().saturating_sub(max_height);
+    }
+    let visible = lines
+        .into_iter()
+        .skip(start)
+        .take(max_height)
+        .collect::<Vec<_>>();
+    let visible_cursor_row = cursor_row.saturating_sub(start);
+
+    // Also slice the char indices to match visible lines
+    let visible_with_indices = all_with_indices
+        .into_iter()
+        .skip(start)
+        .take(max_height)
+        .collect();
+
+    (
+        visible,
+        visible_cursor_row,
+        cursor_col.min(width.saturating_sub(1)),
+        start,
+        visible_with_indices,
+    )
+}
+
 fn cursor_row_col(input: &str, cursor: usize, width: usize) -> (usize, usize) {
     let mut row = 0usize;
     let mut col = 0usize;
@@ -3148,24 +3206,53 @@ fn cursor_row_col(input: &str, cursor: usize, width: usize) -> (usize, usize) {
     (row, col)
 }
 
-fn wrap_input_lines(input: &str, width: usize) -> Vec<String> {
+/// Internal helper that returns both wrapped lines and character indices.
+/// Used by `wrap_input_lines`, `wrap_input_lines_for_mouse`, and
+/// `layout_input_with_scroll` to avoid redundant wrapping computations.
+fn wrap_input_lines_internal(input: &str, width: usize) -> (Vec<String>, Vec<(usize, String)>) {
     let mut lines = Vec::new();
+    let mut lines_with_indices = Vec::new();
+    let mut char_idx = 0usize;
+
     if input.is_empty() {
-        return lines;
+        lines_with_indices.push((0, String::new()));
+        return (lines, lines_with_indices);
     }
 
-    for raw in input.split('\n') {
-        let wrapped = wrap_text(raw, width);
+    for raw_line in input.split('\n') {
+        if raw_line.is_empty() {
+            lines.push(String::new());
+            if width != 0 {
+                lines_with_indices.push((char_idx, String::new()));
+            }
+            char_idx += 1; // the '\n'
+            continue;
+        }
+
+        let wrapped = wrap_text(raw_line, width);
         if wrapped.is_empty() {
             lines.push(String::new());
+            if width != 0 {
+                lines_with_indices.push((char_idx, String::new()));
+            }
         } else {
-            lines.extend(wrapped);
+            for wrapped_line in &wrapped {
+                let line_char_len: usize = wrapped_line.chars().count();
+                lines.push(wrapped_line.clone());
+                if width != 0 {
+                    lines_with_indices.push((char_idx, wrapped_line.clone()));
+                }
+                char_idx += line_char_len;
+            }
         }
+        char_idx += 1; // the '\n'
     }
 
-    // Note: No need for ends_with('\n') check - split('\n') already includes
-    // the trailing empty string for inputs ending with newline.
+    (lines, lines_with_indices)
+}
 
+fn wrap_input_lines(input: &str, width: usize) -> Vec<String> {
+    let (lines, _) = wrap_input_lines_internal(input, width);
     lines
 }
 
@@ -3176,25 +3263,8 @@ pub fn wrap_input_lines_for_mouse(input: &str, width: usize) -> Vec<(usize, Stri
         return vec![(0, String::new())];
     }
 
-    let mut result = Vec::new();
-    let mut char_idx = 0usize;
-
-    for raw_line in input.split('\n') {
-        if raw_line.is_empty() {
-            result.push((char_idx, String::new()));
-            char_idx += 1; // the '\n'
-            continue;
-        }
-        let wrapped = wrap_text(raw_line, width);
-        for wrapped_line in &wrapped {
-            let line_char_len: usize = wrapped_line.chars().count();
-            result.push((char_idx, wrapped_line.clone()));
-            char_idx += line_char_len;
-        }
-        char_idx += 1; // the '\n'
-    }
-
-    result
+    let (_, lines_with_indices) = wrap_input_lines_internal(input, width);
+    lines_with_indices
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -3296,7 +3366,8 @@ mod tests {
         apply_send_flash, build_empty_state_lines, composer_height, composer_max_height,
         composer_min_input_rows, composer_top_padding, cursor_row_col, empty_composer_visual_rows,
         layout_input, pad_lines_to_bottom, placeholder_visual_lines, push_command_entry,
-        should_render_empty_state, slash_completion_hints, wrap_input_lines, wrap_text,
+        should_render_empty_state, slash_completion_hints, wrap_input_lines,
+        wrap_input_lines_for_mouse, wrap_text,
     };
     use crate::config::{ApiProvider, Config};
     use crate::localization::Locale;
@@ -3667,6 +3738,18 @@ mod tests {
     }
 
     #[test]
+    fn wrap_input_lines_for_mouse_empty_input() {
+        // Empty input should return a single empty line at position 0.
+        // This ensures empty composer mouse selection works correctly (issue #3909).
+        let result = wrap_input_lines_for_mouse("", 10);
+        assert_eq!(result, vec![(0, String::new())]);
+
+        // Also verify with width=0 edge case
+        let result_zero = wrap_input_lines_for_mouse("", 0);
+        assert_eq!(result_zero, vec![(0, String::new())]);
+    }
+
+    #[test]
     fn cursor_and_wrap_consistency() {
         // Ensure cursor_row_col is consistent with wrap_text
         // for various inputs
@@ -3720,6 +3803,33 @@ mod tests {
     }
 
     #[test]
+    fn slash_completion_does_not_repeat_alias_already_in_label() {
+        // Typing `/p` matches `/clear` via alias `qingping`, so the label
+        // shows `/clear or /qingping`. The description must not also append
+        // `(aliases: /qingping)` (#3990).
+        let hints = slash_completion_hints("/p", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        let clear = hints
+            .iter()
+            .find(|h| h.name == "/clear")
+            .expect("/clear should appear for /p via qingping");
+        assert_eq!(
+            clear.alias_hint.as_deref(),
+            Some("qingping"),
+            "label should surface the matching alias"
+        );
+        assert!(
+            !clear.description.contains("(aliases:"),
+            "description should omit alias list when the only alias is already in the label: {}",
+            clear.description
+        );
+        assert!(
+            !clear.description.contains("/qingping"),
+            "description must not repeat /qingping: {}",
+            clear.description
+        );
+    }
+
+    #[test]
     fn slash_completion_hints_keep_prefix_match_alphabetical_within_tier() {
         // Within the same rank tier (no exact-alias match), entries fall
         // back to alphabetical name order, same as the prior behavior.
@@ -3759,6 +3869,7 @@ mod tests {
         assert!(!root.iter().any(|hint| hint.name == "/rlm"));
         assert!(!root.iter().any(|hint| hint.name == "/modeldb"));
         assert!(!root.iter().any(|hint| hint.name == "/models"));
+        assert!(!root.iter().any(|hint| hint.name == "/plugin"));
         assert!(!root.iter().any(|hint| hint.name == "/subagents"));
 
         let rlm = slash_completion_hints("/rl", 128, &[], Locale::En, None, ApiProvider::Deepseek);
@@ -3767,6 +3878,10 @@ mod tests {
         let modeldb =
             slash_completion_hints("/modeld", 128, &[], Locale::En, None, ApiProvider::Deepseek);
         assert!(modeldb.iter().any(|hint| hint.name == "/modeldb"));
+
+        let plugin =
+            slash_completion_hints("/pl", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        assert!(plugin.iter().any(|hint| hint.name == "/plugin"));
 
         let subagents =
             slash_completion_hints("/sub", 128, &[], Locale::En, None, ApiProvider::Deepseek);
@@ -5369,7 +5484,7 @@ diff --git a/src/b.rs b/src/b.rs\n\
         let request = crate::tui::approval::ApprovalRequest::new_with_intent(
             "approval-1",
             "exec_shell",
-            "Auto-review policy requires approval: destructive background/headless actions cannot auto-approve",
+            "Built-in safety gate requires approval: destructive background/headless actions cannot auto-approve",
             &serde_json::json!({
                 "command": "cd /Volumes/VIXinSSD/codewhale; cargo clippy -p codewhale-tui --all-targets --locked -- -D warnings 2>&1 | tee /tmp/codewhale-clippy.log",
                 "cwd": "/Volumes/VIXinSSD/codewhale",
@@ -5387,7 +5502,7 @@ diff --git a/src/b.rs b/src/b.rs\n\
         let rendered = buffer_text(&buf, area);
 
         assert!(
-            !rendered.contains("Auto-review policy requires approval"),
+            !rendered.contains("Built-in safety gate requires approval"),
             "policy internals should not be the modal summary:\n{rendered}"
         );
         assert!(

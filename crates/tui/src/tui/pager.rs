@@ -44,6 +44,10 @@ pub struct PagerView {
     /// keys (Ctrl+D/U, Ctrl+F/B, Space, etc.) to compute scroll deltas
     /// without access to the render area.
     last_visible_height: Cell<usize>,
+    /// Optional compact Markdown artifact surfaced by the `e` key. Set for the
+    /// Turn Inspector pager (#4108) so `e` copies a pasteable turn handoff;
+    /// `None` for every other pager, where `e` stays inert.
+    export_markdown: Option<String>,
 }
 
 impl PagerView {
@@ -60,7 +64,16 @@ impl PagerView {
             search_mode: false,
             pending_g: false,
             last_visible_height: Cell::new(0),
+            export_markdown: None,
         }
+    }
+
+    /// Attach a compact Markdown export (e.g. the #4108 turn handoff) that the
+    /// `e` key copies to the clipboard. Only the Turn Inspector pager sets this;
+    /// other pagers leave `e` inert.
+    pub fn with_export_markdown(mut self, markdown: impl Into<String>) -> Self {
+        self.export_markdown = Some(markdown.into());
+        self
     }
 
     pub fn from_text(title: impl Into<String>, text: &str, width: u16) -> Self {
@@ -100,6 +113,13 @@ impl PagerView {
     /// the modal (#1354).
     pub fn body_text(&self) -> String {
         self.plain_lines.join("\n")
+    }
+
+    /// The pager's title bar text. Used by tests to assert the raw-detail
+    /// pager is framed at leaf scope (#4105).
+    #[cfg(test)]
+    pub(crate) fn title(&self) -> &str {
+        &self.title
     }
 
     /// Return the page height (in lines) used for paging keys.
@@ -352,6 +372,17 @@ impl ModalView for PagerView {
                     label: "Pager content".to_string(),
                 })
             }
+            // `e` exports the compact turn handoff (#4108) when this pager
+            // carries one — the Turn Inspector. Elsewhere the guard fails and
+            // `e` falls through to the inert arm below.
+            KeyCode::Char('e') | KeyCode::Char('E') if self.export_markdown.is_some() => {
+                self.pending_g = false;
+                let text = self.export_markdown.clone().unwrap_or_default();
+                ViewAction::Emit(ViewEvent::CopyToClipboard {
+                    text,
+                    label: "Turn handoff".to_string(),
+                })
+            }
             _ => ViewAction::None,
         }
     }
@@ -388,26 +419,26 @@ impl ModalView for PagerView {
             .title(self.title.clone())
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::DEEPSEEK_INK))
+            .style(Style::default().bg(palette::WHALE_BG))
             .padding(Padding::uniform(1));
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
         // The wrapping action footer is anchored to the bottom of the inner
         // area; the body fills the rows above it.
-        let content = render_modal_footer(
-            inner,
-            buf,
-            &[
-                ActionHint::new("q/Esc", "close"),
-                ActionHint::new("j/k", "scroll"),
-                ActionHint::new("Space", "page"),
-                ActionHint::new("Ctrl+D/U", "half"),
-                ActionHint::new("g/G", "top/bottom"),
-                ActionHint::new("/", "search"),
-                ActionHint::new("c", "copy"),
-            ],
-        );
+        let mut hints = vec![
+            ActionHint::new("q/Esc", "close"),
+            ActionHint::new("j/k", "scroll"),
+            ActionHint::new("Space", "page"),
+            ActionHint::new("Ctrl+D/U", "half"),
+            ActionHint::new("g/G", "top/bottom"),
+            ActionHint::new("/", "search"),
+            ActionHint::new("c", "copy"),
+        ];
+        if self.export_markdown.is_some() {
+            hints.push(ActionHint::new("e", "copy handoff"));
+        }
+        let content = render_modal_footer(inner, buf, &hints);
 
         // `content` already excludes the border, padding, and footer rows.
         let mut visible_height = content.height as usize;
@@ -471,7 +502,7 @@ impl ModalView for PagerView {
             visible_lines.push(Line::from(Span::styled(
                 prompt,
                 Style::default()
-                    .fg(palette::DEEPSEEK_SKY)
+                    .fg(palette::WHALE_INFO)
                     .add_modifier(Modifier::BOLD),
             )));
         } else if !self.search_matches.is_empty() {
@@ -826,6 +857,32 @@ mod tests {
     }
 
     #[test]
+    fn e_exports_turn_handoff_when_attached() {
+        // #4108: the Turn Inspector pager carries a compact Markdown handoff;
+        // `e` copies that artifact (not the visible inspector body) to the
+        // clipboard via the host dispatcher.
+        let mut p = make_pager(3).with_export_markdown("# Turn handoff\n\n## Intent\ndo the thing");
+        let action = p.handle_key(key(KeyCode::Char('e')));
+        match action {
+            ViewAction::Emit(ViewEvent::CopyToClipboard { text, label }) => {
+                assert!(text.contains("# Turn handoff"), "handoff text: {text}");
+                assert_eq!(label, "Turn handoff");
+            }
+            other => panic!("expected CopyToClipboard emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn e_is_inert_without_an_attached_handoff() {
+        // Every other pager leaves `e` unbound so it never surprises the user.
+        let mut p = make_pager(3);
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Char('e'))),
+            ViewAction::None
+        ));
+    }
+
+    #[test]
     fn copy_keys_inert_in_search_mode() {
         // Within `/`-search mode `c` and `y` must be treated as search
         // characters, not as a copy trigger — otherwise users typing a
@@ -1068,7 +1125,7 @@ mod tests {
             assert!(!text.contains('X'), "{w}x{h}: background bleed-through");
             assert_eq!(
                 buf[(w / 2, h / 2)].bg,
-                palette::DEEPSEEK_INK,
+                palette::WHALE_BG,
                 "{w}x{h}: modal interior must be opaque"
             );
 

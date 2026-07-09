@@ -17,7 +17,7 @@ Rust 製の TUI と CLI、25 のプロバイダ。DeepSeek、OpenRouter、Huggin
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.66
+codewhale --version   # 0.8.67
 ```
 
 npm wrapper（Node 18+）は GitHub Releases から SHA-256 検証済みのバイナリをダウンロードし、`codewhale`、`codew`、`codewhale-tui` をインストールします。ソースからビルドしたい場合は cargo（Rust 1.88+）で:
@@ -44,15 +44,15 @@ nix run github:Hmbown/CodeWhale
 scoop install codewhale        # または GitHub Releases の NSIS インストーラ
 
 # GitHub に安定して到達できない場合の CNB ミラー
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-cli --locked --force
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-tui --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.67 codewhale-cli --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.67 codewhale-tui --locked --force
 
 # 旧 Homebrew 互換。formula の改名が完了するまで deepseek-tui 名のままです
 brew tap Hmbown/deepseek-tui
 brew install deepseek-tui
 ```
 
-Linux riscv64 を含む全プラットフォーム向けのビルド済みアーカイブは [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases) に添付されています。チェックサム、中国ミラー、Windows 固有の手順、トラブルシューティングは [docs/INSTALL.md](docs/INSTALL.md) を見てください。
+Linux x64/arm64、macOS x64/arm64、Windows x64 向けのビルド済みアーカイブは [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases) に添付されています。Linux riscv64 の prebuilt は upstream QuickJS bindings の対応待ちで一時停止しています。チェックサム、中国ミラー、Windows 固有の手順、トラブルシューティングは [docs/INSTALL.md](docs/INSTALL.md) を見てください。
 
 ## 最初の起動
 
@@ -117,18 +117,19 @@ DeepSeek API は広めに、サブスクリプション型や rate-limit のあ�
 
 多くのコーディングエージェントは、力を足すところから始めます。もっと多くのツール、もっと長いコンテキスト、もっと強い自律性。CodeWhale は責任を割り当てるところから始めます。
 
-（これはこのバージョンで形にしているデザインミッションです。memory や cost、remote orchestration の具体的な形はまだイテレーション中です — 下の v0.9.0 Track を参照。）
+（これはこのバージョンで形にしているデザインミッションです。memory や cost、remote orchestration の具体的な形はまだイテレーション中です — 下の今後のトラックを参照。）
 
 リポジトリを編集するエージェントには住所があるべきです — このターミナル、このユーザー、このブランチ、このセッション。人格ではなく、返送先の住所です。何かが壊れたとき、「モデルがやった」は答えになりません。「このインスタンスが、このセッションで、この承認のあとに」なら答えになります。
 
 次に必要なのは法です。実際の作業セッションは衝突の積み重ねです: 現在のリクエスト、リポジトリの指示、新しい Shell 出力、古い記憶、前のエージェントの引き継ぎが、同じターンの中で競合します。**CodeWhale Constitution** は権威の順序を固定します:
 
 1. **ユーザーの意図が主権を持つ。** 現在のリクエストは、古いリポジトリの指示、記憶、過去の引き継ぎ、人格オーバーレイより上位です。
-2. **リポジトリの法は明示する。** `.codewhale/constitution.json` を追加して、プロジェクトの持続的な権威を宣言します: 保護すべき不変条件、ブランチポリシー、検証ルール。
-3. **証拠は語りより上。** ツール出力は、自信たっぷりの推測に勝ちます。失敗した `cargo test` は失敗した `cargo test` として報告され、楽観へ要約されることはありません。検証はタスクの一部であり、後日談ではありません。
-4. **記憶は最後。** 有用ですが、決して権威にはなりません。
+2. **ユーザーグローバル constitution は `/constitution` で管理する。** 通常のセットアップは構造化された個人の常設法を `$CODEWHALE_HOME/constitution.json` に保存し、モデル向けの prose block としてレンダリングします。生の prompt エディタではありません。
+3. **リポジトリの法は明示する。** `.codewhale/constitution.json` を追加して、プロジェクトの持続的な権威を宣言します: 保護すべき不変条件、ブランチポリシー、検証ルール。
+4. **証拠は語りより上。** ツール出力は、自信たっぷりの推測に勝ちます。失敗した `cargo test` は失敗した `cargo test` として報告され、楽観へ要約されることはありません。検証はタスクの一部であり、後日談ではありません。
+5. **記憶は最後。** 有用ですが、決して権威にはなりません。
 
-重要なポリシーはプロンプトではなくコードで強制されます: 承認ゲート、サンドボックス、スナップショット、ロールバック、ツールスキーマは、モデルが口先で回避できないランタイムの仕組みです。
+重要なポリシーはプロンプトではなくコードで強制されます: 承認ゲート、サンドボックス、スナップショット、ロールバック、ツールスキーマは、モデルが口先で回避できないランタイムの仕組みです。Constitution は好みを表現できますが、承認、サンドボックス、ネットワーク、信頼、MCP 権限を黙って変更しません。
 
 そして、この法はどれもモデルの中には住んでいません — だからこそモデルは交換可能なのです。ハーネスが Constitution を担い、モデルは推論を提供します。DeepSeek とオープンウェイトの世界は第一級市民であり、LAN 上で vLLM や Ollama を動かす一台のマシンも完全に対等な存在です。そして手元にあるのが Claude や OpenAI のキーなら、CodeWhale はそれらの API にもネイティブ対応します。
 
@@ -140,7 +141,7 @@ README は考え方と最初の経路だけを持ちます。詳細はドキュ�
 
 - [User guide](docs/GUIDE.md) — CodeWhale との最初の 1 時間。
 - [Install guide](docs/INSTALL.md) — すべてのパッケージ経路とトラブルシューティング。
-- [Configuration](docs/CONFIGURATION.md) — 設定ファイル、リポジトリ constitution、プロバイダ設定。
+- [Configuration](docs/CONFIGURATION.md) — `/constitution`、ユーザーグローバル constitution、リポジトリ constitution、プロバイダ設定。
 - [Provider registry](docs/PROVIDERS.md) — モデルルート、認証情報、base URL、能力の境界。
 - [Sub-agents](docs/SUBAGENTS.md) — 役割、ライフサイクル、出力コントラクト、復旧挙動。
 - [MCP](docs/MCP.md) — 外部ツールサーバーへの接続と、CodeWhale 自身を MCP サーバーとして動かす方法。
@@ -148,14 +149,14 @@ README は考え方と最初の経路だけを持ちます。詳細はドキュ�
 - [Model Lab](docs/MODEL_LAB.md) — オープンモデルの発見と評価のロードマップ。
 - [Architecture](docs/ARCHITECTURE.md) — クレート構成、ランタイムフロー、ツールシステム、拡張ポイント、セキュリティモデル。
 
-## v0.9.0 トラック
+## 今後のトラック
 
-v0.9.0 は現在の統合レーンです。そこに集まりつつある作業:
+現在のリリースは 0.8.67（Fleet/Workflow の使いやすさ向上）です。以下は今後の作業であり、今回のリリースには含まれません:
 
 - セッションとエージェント間の relay / 引き継ぎ面の強化
 - 密集したツール実行でも落ち着いて読めるトランスクリプト
 - VS Code と GUI クライアント向けの Runtime API
-- WhaleFlow によるブランチ/リーフのワークフローオーケストレーション
+- Workflow によるブランチ/リーフのワークフローオーケストレーション
 
 リリースごとの詳細は [CHANGELOG.md](CHANGELOG.md) にあります。
 

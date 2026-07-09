@@ -64,6 +64,8 @@ enum ProviderArg {
     Deepinfra,
     #[value(alias = "fugu", alias = "sakana-ai", alias = "sakana_ai")]
     Sakana,
+    #[value(alias = "long-cat", alias = "meituan-longcat", alias = "meituan")]
+    LongCat,
 }
 
 impl From<ProviderArg> for ProviderKind {
@@ -96,6 +98,7 @@ impl From<ProviderArg> for ProviderKind {
             ProviderArg::Minimax => ProviderKind::Minimax,
             ProviderArg::Deepinfra => ProviderKind::Deepinfra,
             ProviderArg::Sakana => ProviderKind::Sakana,
+            ProviderArg::LongCat => ProviderKind::LongCat,
         }
     }
 }
@@ -1146,6 +1149,42 @@ fn auth_status_all_providers(store: &ConfigStore, secrets: &Secrets) -> Vec<Stri
     lines
 }
 
+fn auth_list_lines(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("provider     config store env  active".to_string());
+    for provider in ProviderKind::ALL {
+        let slot = provider_slot(provider);
+        let file = provider_config_set(store, provider);
+        let keyring = (!file).then(|| provider_keyring_set(secrets, provider));
+        let env = provider_env_set(provider);
+        let oauth_file = provider_oauth_file_path(provider).is_some_and(|p| p.exists());
+        let active = if provider == ProviderKind::OpenaiCodex {
+            if env {
+                "env"
+            } else if oauth_file {
+                "oauth"
+            } else {
+                "missing"
+            }
+        } else if file {
+            "config"
+        } else if keyring == Some(true) {
+            "store"
+        } else if env {
+            "env"
+        } else {
+            "missing"
+        };
+        lines.push(format!(
+            "{slot:<12}  {}     {}      {}   {active}",
+            yes_no(file),
+            keyring_status_short(keyring),
+            yes_no(env)
+        ));
+    }
+    lines
+}
+
 fn auth_status_lines_for_provider(
     store: &ConfigStore,
     secrets: &Secrets,
@@ -1352,27 +1391,8 @@ fn run_auth_command_with_secrets(
             Ok(())
         }
         AuthCommand::List => {
-            println!("provider     config store env  active");
-            for provider in ProviderKind::ALL {
-                let slot = provider_slot(provider);
-                let file = provider_config_set(store, provider);
-                let keyring = (!file).then(|| provider_keyring_set(secrets, provider));
-                let env = provider_env_set(provider);
-                let active = if file {
-                    "config"
-                } else if keyring == Some(true) {
-                    "store"
-                } else if env {
-                    "env"
-                } else {
-                    "missing"
-                };
-                println!(
-                    "{slot:<12}  {}     {}      {}   {active}",
-                    yes_no(file),
-                    keyring_status_short(keyring),
-                    yes_no(env)
-                );
+            for line in auth_list_lines(store, secrets) {
+                println!("{line}");
             }
             Ok(())
         }
@@ -2242,11 +2262,29 @@ fn build_tui_command(
     Ok(cmd)
 }
 
-fn exit_with_tui_status(status: std::process::ExitStatus) -> Result<()> {
-    match status.code() {
-        Some(code) => std::process::exit(code),
-        None => bail!("codewhale-tui terminated by signal"),
+fn tui_child_exit_code(status: std::process::ExitStatus) -> Option<i32> {
+    if let Some(code) = status.code() {
+        return Some(code);
     }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        status.signal().map(|signal| 128 + signal)
+    }
+
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn exit_with_tui_status(status: std::process::ExitStatus) -> Result<()> {
+    if let Some(code) = tui_child_exit_code(status) {
+        std::process::exit(code);
+    }
+    bail!("codewhale-tui terminated without an exit code")
 }
 
 fn delegate_simple_tui(args: Vec<String>) -> Result<()> {
@@ -2255,10 +2293,7 @@ fn delegate_simple_tui(args: Vec<String>) -> Result<()> {
         .args(args)
         .status()
         .map_err(|err| anyhow!("{}", tui_spawn_error(&tui, &err)))?;
-    match status.code() {
-        Some(code) => std::process::exit(code),
-        None => bail!("codewhale-tui terminated by signal"),
-    }
+    exit_with_tui_status(status)
 }
 
 fn tui_spawn_error(tui: &Path, err: &io::Error) -> String {
@@ -3625,6 +3660,36 @@ mod tests {
     }
 
     #[test]
+    fn auth_list_treats_openai_codex_oauth_file_as_active() {
+        use codewhale_secrets::InMemoryKeyringStore;
+        use std::sync::Arc;
+
+        let _lock = env_lock();
+        let _access_token = ScopedEnvVar::set("OPENAI_CODEX_ACCESS_TOKEN", "");
+        let _codex_token = ScopedEnvVar::set("CODEX_ACCESS_TOKEN", "");
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(&auth_path, r#"{"tokens":{"access_token":"secret-token"}}"#)
+            .expect("write auth file");
+        let auth_path_str = auth_path.to_string_lossy().into_owned();
+        let _auth_file = ScopedEnvVar::set("OPENAI_CODEX_AUTH_FILE", &auth_path_str);
+
+        let mut store = ConfigStore::load(Some(config_path)).expect("store should load");
+        store.config.provider = ProviderKind::OpenaiCodex;
+        let secrets = Secrets::new(Arc::new(InMemoryKeyringStore::new()));
+
+        let output = auth_list_lines(&store, &secrets).join("\n");
+        let row = output
+            .lines()
+            .find(|line| line.starts_with("openai-codex"))
+            .unwrap_or_else(|| panic!("missing openai-codex row:\n{output}"));
+        assert!(row.ends_with("oauth"), "{row}");
+        assert!(!output.contains("secret-token"));
+    }
+
+    #[test]
     fn auth_status_scoped_provider_shows_detailed_info() {
         use codewhale_secrets::InMemoryKeyringStore;
         use std::sync::Arc;
@@ -4650,6 +4715,16 @@ mod tests {
         assert!(message.contains("access is denied"));
         assert!(message.contains("where codewhale"));
         assert!(message.contains("DEEPSEEK_TUI_BIN"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_child_exit_code_maps_unix_signal_to_shell_status() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(libc::SIGPIPE);
+
+        assert_eq!(tui_child_exit_code(status), Some(141));
     }
 
     /// Windows-only fallback: the user from #247 manually renamed the

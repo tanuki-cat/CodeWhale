@@ -52,6 +52,7 @@ fn saved_session_with_blocks(blocks: Vec<crate::models::ContentBlock>) -> SavedS
             message_count: 1,
             total_tokens: 0,
             model: "test-model".to_string(),
+            model_provider: "deepseek".to_string(),
             workspace: PathBuf::from("."),
             mode: None,
             cost: Default::default(),
@@ -540,7 +541,6 @@ async fn spawn_test_server_with_root_token_mobile_workspace_subagents_and_config
             default_mode: "agent".to_string(),
             allow_shell: false,
             trust_mode: false,
-            max_subagents: 2,
         },
         Arc::new(MockExecutor),
     )
@@ -3734,6 +3734,9 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
 #[test]
 fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let _env_lock = crate::test_support::lock_test_env();
+    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
     let workspace_root = tmp.path().join("workspace");
     let escape_target = tmp.path().join("escape_target");
     fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -3763,6 +3766,9 @@ fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
 #[test]
 fn resolve_skills_dir_rejects_codewhale_only_symlink_escaping_workspace() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let _env_lock = crate::test_support::lock_test_env();
+    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
     let workspace_root = tmp.path().join("workspace");
     let escape_target = tmp.path().join("escape_target");
     fs::create_dir_all(&workspace_root).expect("create workspace");

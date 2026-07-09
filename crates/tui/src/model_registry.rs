@@ -73,24 +73,6 @@ pub enum ModelProvider {
     Other,
 }
 
-/// Default concrete provider that can serve a registry provider family.
-#[must_use]
-pub fn serving_provider(provider: ModelProvider) -> crate::config::ApiProvider {
-    match provider {
-        ModelProvider::DeepSeek => crate::config::ApiProvider::Deepseek,
-        ModelProvider::Anthropic => crate::config::ApiProvider::Anthropic,
-        ModelProvider::OpenAi => crate::config::ApiProvider::Openai,
-        ModelProvider::OpenAiCodex => crate::config::ApiProvider::OpenaiCodex,
-        ModelProvider::Moonshot => crate::config::ApiProvider::Moonshot,
-        ModelProvider::Zai => crate::config::ApiProvider::Zai,
-        ModelProvider::Minimax => crate::config::ApiProvider::Minimax,
-        ModelProvider::Qwen => crate::config::ApiProvider::Openrouter,
-        ModelProvider::Arcee => crate::config::ApiProvider::Arcee,
-        ModelProvider::XiaomiMimo => crate::config::ApiProvider::XiaomiMimo,
-        ModelProvider::Other => crate::config::ApiProvider::Openrouter,
-    }
-}
-
 /// One row of model facts, looked up in [`lookup`].
 ///
 /// All numeric fields are seeded from `crate::models` so they stay in lockstep
@@ -178,6 +160,11 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     ("trinity-large-thinking", ModelProvider::Arcee),
     ("arcee-ai/trinity-large-thinking", ModelProvider::Arcee),
     ("trinity-mini", ModelProvider::Arcee),
+    // --- Sakana / Fugu (config DEFAULT_SAKANA_MODEL) ---
+    ("fugu-ultra-20260615", ModelProvider::Other),
+    ("fugu-ultra", ModelProvider::Other),
+    // --- StepFun (config DEFAULT_STEPFUN_MODEL) ---
+    ("step-3.7-flash", ModelProvider::Other),
     // --- Xiaomi MiMo (config DEFAULT_XIAOMI_MIMO_MODEL) ---
     ("mimo-v2.5-pro", ModelProvider::XiaomiMimo),
     ("mimo-v2.5-pro-ultraspeed", ModelProvider::XiaomiMimo),
@@ -237,13 +224,6 @@ pub fn lookup(model: &str) -> Option<ModelMetadata> {
         max_output,
         supports_reasoning,
     })
-}
-
-/// All pre-seeded model ids, for callers that want to enumerate the canonical
-/// catalog (e.g. a future provider-aware model picker, #3075).
-#[must_use]
-pub fn seeded_model_ids() -> Vec<&'static str> {
-    registry().keys().copied().collect()
 }
 
 #[cfg(test)]
@@ -320,47 +300,6 @@ mod tests {
     }
 
     #[test]
-    fn serving_provider_maps_each_family() {
-        use crate::config::ApiProvider;
-
-        assert_eq!(
-            serving_provider(ModelProvider::DeepSeek),
-            ApiProvider::Deepseek
-        );
-        assert_eq!(
-            serving_provider(ModelProvider::Anthropic),
-            ApiProvider::Anthropic
-        );
-        assert_eq!(serving_provider(ModelProvider::OpenAi), ApiProvider::Openai);
-        assert_eq!(
-            serving_provider(ModelProvider::OpenAiCodex),
-            ApiProvider::OpenaiCodex
-        );
-        assert_eq!(
-            serving_provider(ModelProvider::Moonshot),
-            ApiProvider::Moonshot
-        );
-        assert_eq!(serving_provider(ModelProvider::Zai), ApiProvider::Zai);
-        assert_eq!(
-            serving_provider(ModelProvider::Minimax),
-            ApiProvider::Minimax
-        );
-        assert_eq!(
-            serving_provider(ModelProvider::Qwen),
-            ApiProvider::Openrouter
-        );
-        assert_eq!(serving_provider(ModelProvider::Arcee), ApiProvider::Arcee);
-        assert_eq!(
-            serving_provider(ModelProvider::XiaomiMimo),
-            ApiProvider::XiaomiMimo
-        );
-        assert_eq!(
-            serving_provider(ModelProvider::Other),
-            ApiProvider::Openrouter
-        );
-    }
-
-    #[test]
     fn deepseek_models_are_classified_as_deepseek() {
         // Branding / first-class DeepSeek support guard: the default DeepSeek
         // models must be present and classified as DeepSeek.
@@ -401,15 +340,5 @@ mod tests {
     #[test]
     fn lookup_returns_none_for_completely_unknown_model() {
         assert!(lookup("totally-made-up-model-xyz").is_none());
-    }
-
-    #[test]
-    fn seeded_model_ids_are_non_empty_and_unique() {
-        let ids = seeded_model_ids();
-        assert!(!ids.is_empty());
-        let mut sorted = ids.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), ids.len(), "seed ids must be unique");
     }
 }

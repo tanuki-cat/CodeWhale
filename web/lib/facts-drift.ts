@@ -84,7 +84,7 @@ function deriveProvidersFromConfig(cfg: string): ProviderFact[] {
     WanjieArk: { id: "wanjie-ark", label: "Wanjie Ark", env: "WANJIE_ARK_API_KEY / WANJIE_API_KEY / WANJIE_MAAS_API_KEY" },
     Volcengine: { id: "volcengine", label: "Volcengine Ark", env: "VOLCENGINE_API_KEY / VOLCENGINE_ARK_API_KEY / ARK_API_KEY" },
     Openrouter: { id: "openrouter", label: "OpenRouter", env: "OPENROUTER_API_KEY" },
-    XiaomiMimo: { id: "xiaomi-mimo", label: "Xiaomi MiMo", env: "XIAOMI_MIMO_API_KEY / XIAOMI_API_KEY / MIMO_API_KEY" },
+    XiaomiMimo: { id: "xiaomi-mimo", label: "Xiaomi MiMo", env: "XIAOMI_MIMO_TOKEN_PLAN_API_KEY / MIMO_TOKEN_PLAN_API_KEY / XIAOMI_MIMO_API_KEY / XIAOMI_API_KEY / MIMO_API_KEY" },
     Novita: { id: "novita", label: "Novita AI", env: "NOVITA_API_KEY" },
     Fireworks: { id: "fireworks", label: "Fireworks AI", env: "FIREWORKS_API_KEY" },
     Siliconflow: { id: "siliconflow", label: "SiliconFlow", env: "SILICONFLOW_API_KEY" },
@@ -105,6 +105,7 @@ function deriveProvidersFromConfig(cfg: string): ProviderFact[] {
     Minimax: { id: "minimax", label: "MiniMax", env: "MINIMAX_API_KEY" },
     Openmodel: { id: "openmodel", label: "OpenModel", env: "OPENMODEL_API_KEY" },
     Sakana: { id: "sakana", label: "Sakana AI", env: "FUGU_API_KEY / SAKANA_API_KEY" },
+    LongCat: { id: "longcat", label: "LongCat", env: "LONGCAT_API_KEY" },
   };
   // Log loudly on unmapped variants so a new provider can never be silently
   // dropped from the drift-derived facts again. DeepseekCN (#1104) and the

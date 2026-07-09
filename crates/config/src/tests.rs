@@ -1591,6 +1591,83 @@ fn get_display_value_redacts_sensitive_keys() {
 }
 
 #[test]
+fn stream_chunk_timeout_display_defaults_to_900_for_flat_key() {
+    let config = ConfigToml::default();
+
+    assert_eq!(
+        config
+            .get_display_value("stream_chunk_timeout_secs")
+            .as_deref(),
+        Some("900")
+    );
+}
+
+#[test]
+fn stream_chunk_timeout_display_reads_tui_table_for_flat_key() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+        [tui]
+        stream_chunk_timeout_secs = 1200
+        "#,
+    )
+    .expect("config toml");
+
+    assert_eq!(
+        config
+            .get_display_value("stream_chunk_timeout_secs")
+            .as_deref(),
+        Some("1200")
+    );
+}
+
+#[test]
+fn stream_chunk_timeout_display_supports_dotted_tui_key() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+        [tui]
+        stream_chunk_timeout_secs = 1200
+        "#,
+    )
+    .expect("config toml");
+
+    assert_eq!(
+        config
+            .get_display_value("tui.stream_chunk_timeout_secs")
+            .as_deref(),
+        Some("1200")
+    );
+}
+
+#[test]
+fn stream_chunk_timeout_display_zero_maps_to_default_and_clamps() {
+    let zero: ConfigToml = toml::from_str(
+        r#"
+        [tui]
+        stream_chunk_timeout_secs = 0
+        "#,
+    )
+    .expect("zero config toml");
+    assert_eq!(
+        zero.get_display_value("stream_chunk_timeout_secs")
+            .as_deref(),
+        Some("900")
+    );
+
+    let high: ConfigToml = toml::from_str(
+        r#"
+        [tui]
+        stream_chunk_timeout_secs = 9999
+        "#,
+    )
+    .expect("high config toml");
+    assert_eq!(
+        high.get_display_value("stream_chunk_timeout_secs")
+            .as_deref(),
+        Some("3600")
+    );
+}
+
+#[test]
 fn config_display_redacts_nested_extra_secrets() {
     let mut config = ConfigToml::default();
     let mut profile = toml::map::Map::new();
@@ -2219,39 +2296,13 @@ fn list_values_redacts_unicode_api_key_without_byte_slicing() {
 #[test]
 fn app_homes_prefer_home_env_before_platform_home_fallback() {
     let _lock = env_lock();
-    struct HomeEnvGuard {
-        home: Option<OsString>,
-        userprofile: Option<OsString>,
-        codewhale_home: Option<OsString>,
-    }
-
-    impl Drop for HomeEnvGuard {
-        fn drop(&mut self) {
-            // Safety: test-only environment mutation is serialized by env_lock().
-            unsafe {
-                match self.home.take() {
-                    Some(value) => env::set_var("HOME", value),
-                    None => env::remove_var("HOME"),
-                }
-                match self.userprofile.take() {
-                    Some(value) => env::set_var("USERPROFILE", value),
-                    None => env::remove_var("USERPROFILE"),
-                }
-                match self.codewhale_home.take() {
-                    Some(value) => env::set_var("CODEWHALE_HOME", value),
-                    None => env::remove_var("CODEWHALE_HOME"),
-                }
-            }
-        }
-    }
-
     let home =
         std::env::temp_dir().join(format!("codewhale-config-home-env-{}", std::process::id()));
     let userprofile = std::env::temp_dir().join(format!(
         "codewhale-config-userprofile-{}",
         std::process::id()
     ));
-    let _env = HomeEnvGuard {
+    let _env = StateEnvRestore {
         home: env::var_os("HOME"),
         userprofile: env::var_os("USERPROFILE"),
         codewhale_home: env::var_os("CODEWHALE_HOME"),
@@ -2286,32 +2337,6 @@ fn app_homes_prefer_home_env_before_platform_home_fallback() {
 #[test]
 fn migrate_config_reports_copied_legacy_path() {
     let _lock = env_lock();
-    struct HomeEnvGuard {
-        home: Option<OsString>,
-        userprofile: Option<OsString>,
-        codewhale_home: Option<OsString>,
-    }
-
-    impl Drop for HomeEnvGuard {
-        fn drop(&mut self) {
-            // Safety: test-only environment mutation is serialized by env_lock().
-            unsafe {
-                match self.home.take() {
-                    Some(value) => env::set_var("HOME", value),
-                    None => env::remove_var("HOME"),
-                }
-                match self.userprofile.take() {
-                    Some(value) => env::set_var("USERPROFILE", value),
-                    None => env::remove_var("USERPROFILE"),
-                }
-                match self.codewhale_home.take() {
-                    Some(value) => env::set_var("CODEWHALE_HOME", value),
-                    None => env::remove_var("CODEWHALE_HOME"),
-                }
-            }
-        }
-    }
-
     struct LegacyConfigGuard {
         path: PathBuf,
         original: Option<Vec<u8>>,
@@ -2352,7 +2377,7 @@ fn migrate_config_reports_copied_legacy_path() {
     let legacy_config = legacy_dir.join(CONFIG_FILE_NAME);
     let _legacy = LegacyConfigGuard::install(legacy_config.clone(), b"provider = \"deepseek\"\n");
 
-    let _env = HomeEnvGuard {
+    let _env = StateEnvRestore {
         home: env::var_os("HOME"),
         userprofile: env::var_os("USERPROFILE"),
         codewhale_home: env::var_os("CODEWHALE_HOME"),
@@ -2361,7 +2386,7 @@ fn migrate_config_reports_copied_legacy_path() {
     unsafe {
         env::set_var("HOME", &home);
         env::set_var("USERPROFILE", &home);
-        env::set_var("CODEWHALE_HOME", &primary_dir);
+        env::remove_var("CODEWHALE_HOME");
     }
 
     let migration = migrate_config_if_needed()
@@ -2378,6 +2403,53 @@ fn migrate_config_reports_copied_legacy_path() {
     assert_eq!(
         fs::read_to_string(primary_dir.join(CONFIG_FILE_NAME)).expect("primary config"),
         "provider = \"deepseek\"\n"
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn explicit_codewhale_home_bypasses_legacy_config_fallback_and_migration() {
+    let _lock = env_lock();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let home = std::env::temp_dir().join(format!(
+        "codewhale-config-explicit-isolation-{}-{unique}",
+        std::process::id()
+    ));
+    let legacy_config = home.join(LEGACY_APP_DIR).join(CONFIG_FILE_NAME);
+    fs::create_dir_all(legacy_config.parent().expect("legacy config parent")).expect("legacy dir");
+    fs::write(&legacy_config, b"provider = \"deepseek\"\n").expect("legacy config");
+
+    let explicit_home = home.join("isolated-codewhale");
+    let _env = StateEnvRestore {
+        home: env::var_os("HOME"),
+        userprofile: env::var_os("USERPROFILE"),
+        codewhale_home: env::var_os("CODEWHALE_HOME"),
+    };
+    // Safety: test-only environment mutation is serialized by env_lock().
+    unsafe {
+        env::set_var("HOME", &home);
+        env::set_var("USERPROFILE", &home);
+        env::set_var("CODEWHALE_HOME", &explicit_home);
+    }
+
+    assert_eq!(
+        default_config_path().expect("default config path"),
+        explicit_home.join(CONFIG_FILE_NAME),
+        "explicit CODEWHALE_HOME must not read ambient legacy config"
+    );
+    assert!(
+        migrate_config_if_needed()
+            .expect("migration check")
+            .is_none(),
+        "explicit CODEWHALE_HOME must not migrate ambient legacy config"
+    );
+    assert!(
+        !explicit_home.join(CONFIG_FILE_NAME).exists(),
+        "legacy config must not be copied into explicit CODEWHALE_HOME"
     );
 
     let _ = fs::remove_dir_all(home);
@@ -3039,6 +3111,119 @@ fn config_store_save_preserves_comments_with_other_keys() {
 }
 
 #[test]
+fn setup_transaction_applies_config_store_body_preserving_comments() {
+    // #3410: the comment-preserving ConfigStore write must compose with
+    // SetupTransaction so a setup step can update config.toml atomically
+    // alongside sibling setup files.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join(CONFIG_FILE_NAME);
+    let state_path = dir.path().join(crate::setup_state::SETUP_STATE_FILE_NAME);
+    fs::write(
+        &config_path,
+        "# my model\nmodel = \"deepseek-v4-flash\"\n# end comment\n",
+    )
+    .expect("write config");
+
+    let mut store = ConfigStore::load(Some(config_path.clone())).expect("load config store");
+    store.config.model = Some("deepseek-v4-pro".to_string());
+
+    let mut transaction = persistence::SetupTransaction::new();
+    transaction.stage(
+        &config_path,
+        store.rendered_body().expect("rendered body").into_bytes(),
+    );
+    transaction
+        .stage_json(&state_path, &SetupState::default())
+        .expect("stage setup state");
+    transaction.commit().expect("commit");
+
+    let body = fs::read_to_string(&config_path).expect("read config");
+    assert!(body.contains("# my model"), "prefix comment preserved");
+    assert!(body.contains("# end comment"), "suffix comment preserved");
+    assert!(body.contains("model = \"deepseek-v4-pro\""));
+    assert!(state_path.exists(), "sibling setup state written");
+}
+
+#[test]
+fn setup_transaction_rolls_back_config_store_body_on_sibling_failure() {
+    // #3410 rollback expectation: when a sibling stage fails to apply, the
+    // already-written config.toml is restored byte-for-byte, comments and
+    // all — no half-applied setup.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join(CONFIG_FILE_NAME);
+    let original = "# my model\nmodel = \"deepseek-v4-flash\"\n# end comment\n";
+    fs::write(&config_path, original).expect("write config");
+    // A parent that is a regular file makes the second stage unwritable.
+    let blocker = dir.path().join("blocker");
+    fs::write(&blocker, b"file, not a directory").expect("write blocker");
+
+    let mut store = ConfigStore::load(Some(config_path.clone())).expect("load config store");
+    store.config.model = Some("deepseek-v4-pro".to_string());
+
+    let mut transaction = persistence::SetupTransaction::new();
+    transaction.stage(
+        &config_path,
+        store.rendered_body().expect("rendered body").into_bytes(),
+    );
+    transaction.stage(blocker.join("nested.json"), b"{}".to_vec());
+    transaction
+        .commit()
+        .expect_err("commit must fail on unwritable sibling");
+
+    let body = fs::read_to_string(&config_path).expect("read config");
+    assert_eq!(body, original, "config restored byte-for-byte on rollback");
+}
+
+#[test]
+fn config_store_load_fails_on_malformed_config_without_touching_file() {
+    // #3410 malformed-config posture: repair is explicit, never implicit.
+    // Loading a malformed config surfaces a parse error naming the path and
+    // leaves the file bytes untouched for the user (or doctor) to repair.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join(CONFIG_FILE_NAME);
+    let malformed = "# half-edited config\nmodel = \"deepseek-v4-flash\n";
+    fs::write(&config_path, malformed).expect("write config");
+
+    let err = ConfigStore::load(Some(config_path.clone())).expect_err("malformed must not parse");
+
+    assert!(
+        format!("{err:#}").contains("failed to parse config"),
+        "error should name the parse failure: {err:#}"
+    );
+    let body = fs::read_to_string(&config_path).expect("read config");
+    assert_eq!(body, malformed, "malformed config left untouched");
+}
+
+#[test]
+fn config_store_rendered_body_preserves_comments_at_legacy_deepseek_path() {
+    // #3410 legacy case: a config still living under `.deepseek/` keeps its
+    // comments when written back through a transaction at the same path.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let legacy_dir = dir.path().join(".deepseek");
+    fs::create_dir_all(&legacy_dir).expect("legacy dir");
+    let config_path = legacy_dir.join(CONFIG_FILE_NAME);
+    fs::write(
+        &config_path,
+        "# legacy home config\nmodel = \"deepseek-v4-flash\"\n",
+    )
+    .expect("write config");
+
+    let mut store = ConfigStore::load(Some(config_path.clone())).expect("load config store");
+    store.config.model = Some("deepseek-v4-pro".to_string());
+
+    let mut transaction = persistence::SetupTransaction::new();
+    transaction.stage(
+        &config_path,
+        store.rendered_body().expect("rendered body").into_bytes(),
+    );
+    transaction.commit().expect("commit");
+
+    let body = fs::read_to_string(&config_path).expect("read config");
+    assert!(body.contains("# legacy home config"), "comment preserved");
+    assert!(body.contains("model = \"deepseek-v4-pro\""));
+}
+
+#[test]
 fn merge_and_preserve_comments_returns_err_on_invalid_serialized() {
     let err = merge_and_preserve_comments("{{{ not toml", "model = 1\n")
         .expect_err("invalid serialized should fail");
@@ -3180,6 +3365,115 @@ fn provider_kind_parses_openrouter_and_novita_aliases() {
     let parsed: ConfigToml =
         toml::from_str("provider = \"silicon-flow\"").expect("siliconflow provider alias");
     assert_eq!(parsed.provider, ProviderKind::Siliconflow);
+}
+
+/// Models.dev publishes provider ids that do not always match CodeWhale's
+/// canonical id (`fireworks-ai`, `togetherai`, `novita-ai`, `moonshotai`).
+/// These MUST normalize onto the right [`ProviderKind`] via
+/// [`ProviderKind::parse`], which is the seam `ModelReferenceCard::from_offering`
+/// uses to label a live-catalog row's provider kind. A miss here means
+/// Fireworks/Together/Novita/Moonshot models from the live Models.dev catalog
+/// land under an `unknown` kind (Refs #4186).
+#[test]
+fn provider_kind_normalizes_models_dev_provider_ids() {
+    let cases = [
+        ("fireworks-ai", ProviderKind::Fireworks),
+        ("togetherai", ProviderKind::Together),
+        ("together-ai", ProviderKind::Together),
+        ("together_ai", ProviderKind::Together),
+        ("novita-ai", ProviderKind::Novita),
+        ("novita_ai", ProviderKind::Novita),
+        // Live Models.dev key for Moonshot/Kimi (verified 2026-07-08).
+        ("moonshotai", ProviderKind::Moonshot),
+        ("moonshot-ai", ProviderKind::Moonshot),
+        ("moonshot_ai", ProviderKind::Moonshot),
+        ("nvidia", ProviderKind::NvidiaNim),
+        ("xiaomi", ProviderKind::XiaomiMimo),
+        ("deepinfra", ProviderKind::Deepinfra),
+        ("siliconflow", ProviderKind::Siliconflow),
+        // Models.dev spells the China endpoint `siliconflow-cn`; CodeWhale's
+        // canonical id is `siliconflow-CN` and `parse` is case-insensitive.
+        ("siliconflow-cn", ProviderKind::SiliconflowCN),
+        ("openrouter", ProviderKind::Openrouter),
+        ("longcat", ProviderKind::LongCat),
+    ];
+    for (models_dev_id, expected) in cases {
+        assert_eq!(
+            ProviderKind::parse(models_dev_id),
+            Some(expected),
+            "Models.dev id {models_dev_id:?} must normalize onto {expected:?}"
+        );
+    }
+
+    // The separator-free Models.dev ids must also deserialize from config TOML,
+    // so a `provider = "togetherai"` / `"novita-ai"` / `"moonshotai"` line
+    // resolves identically.
+    for (alias, expected) in [
+        ("togetherai", ProviderKind::Together),
+        ("novita-ai", ProviderKind::Novita),
+        ("fireworks-ai", ProviderKind::Fireworks),
+        ("moonshotai", ProviderKind::Moonshot),
+    ] {
+        let parsed: ConfigToml =
+            toml::from_str(&format!("provider = \"{alias}\"")).expect("models.dev id alias");
+        assert_eq!(parsed.provider, expected, "toml provider = {alias:?}");
+    }
+}
+
+/// Pin the Fireworks and Together transport metadata against the real provider
+/// APIs: the OpenAI-compatible base URL and the canonical API-key env var. These
+/// are the two primary providers this audit targets, so a regression to a wrong
+/// base URL or env var name fails here.
+#[test]
+fn fireworks_and_together_base_url_and_auth_metadata() {
+    let fireworks = provider::provider_for_kind(ProviderKind::Fireworks);
+    assert_eq!(fireworks.id(), "fireworks");
+    assert_eq!(
+        fireworks.default_base_url(),
+        "https://api.fireworks.ai/inference/v1"
+    );
+    assert_eq!(fireworks.default_base_url(), DEFAULT_FIREWORKS_BASE_URL);
+    assert_eq!(fireworks.env_vars(), &["FIREWORKS_API_KEY"]);
+    // Fireworks wire model ids are namespaced `accounts/fireworks/models/<name>`.
+    assert!(
+        fireworks
+            .default_model()
+            .starts_with("accounts/fireworks/models/"),
+        "Fireworks default model must use the accounts/fireworks/models/ prefix, got {:?}",
+        fireworks.default_model()
+    );
+
+    let together = provider::provider_for_kind(ProviderKind::Together);
+    assert_eq!(together.id(), "together");
+    assert_eq!(together.default_base_url(), "https://api.together.xyz/v1");
+    assert_eq!(together.default_base_url(), DEFAULT_TOGETHER_BASE_URL);
+    assert_eq!(together.env_vars(), &["TOGETHER_API_KEY"]);
+    // Together wire model ids are `<org>/<Model>` (a slash-namespaced id).
+    assert!(
+        together.default_model().contains('/'),
+        "Together default model must be an <org>/<Model> id, got {:?}",
+        together.default_model()
+    );
+
+    // The env-based key resolver (secrets crate) must recognize both providers
+    // by canonical id; a shell-exported key would otherwise be ignored.
+    let _lock = env_lock();
+    unsafe {
+        std::env::set_var("FIREWORKS_API_KEY", "fw-test-key");
+        std::env::set_var("TOGETHER_API_KEY", "tg-test-key");
+    }
+    assert_eq!(
+        codewhale_secrets::env_for("fireworks").as_deref(),
+        Some("fw-test-key")
+    );
+    assert_eq!(
+        codewhale_secrets::env_for("together").as_deref(),
+        Some("tg-test-key")
+    );
+    unsafe {
+        std::env::remove_var("FIREWORKS_API_KEY");
+        std::env::remove_var("TOGETHER_API_KEY");
+    }
 }
 
 #[test]
@@ -5198,7 +5492,9 @@ concurrency = 3
         profile.role.instructions.as_deref(),
         Some("Check the patch and report evidence.")
     );
-    assert_eq!(profile.loadout, FleetLoadout::Review);
+    // "review" was a retired decorative tier: it parses as Custom and keeps
+    // the same auto routing it always had.
+    assert_eq!(profile.loadout, FleetLoadout::Custom("review".to_string()));
     assert_eq!(profile.model.as_deref(), Some("deepseek-v4-pro"));
     assert!(!profile.permissions.allow_shell);
     assert!(!profile.permissions.trust);
@@ -5209,10 +5505,24 @@ concurrency = 3
 
 #[test]
 fn fleet_loadout_accepts_default_model_classes() {
-    assert_eq!(FleetLoadout::from_name("strong"), FleetLoadout::Strong);
-    assert_eq!(FleetLoadout::from_name("balanced"), FleetLoadout::Balanced);
     assert_eq!(FleetLoadout::from_name("fast"), FleetLoadout::Fast);
-    assert_eq!(FleetLoadout::Strong.as_str(), "strong");
+    assert_eq!(FleetLoadout::from_name("inherit"), FleetLoadout::Inherit);
+    assert_eq!(FleetLoadout::from_name(""), FleetLoadout::Inherit);
+    assert_eq!(FleetLoadout::Fast.as_str(), "fast");
+    // Retired tiers stay parseable as Custom so old configs keep loading
+    // with identical (auto) routing.
+    assert_eq!(
+        FleetLoadout::from_name("strong"),
+        FleetLoadout::Custom("strong".to_string())
+    );
+    assert_eq!(
+        FleetLoadout::from_name("tool-heavy"),
+        FleetLoadout::Custom("tool-heavy".to_string())
+    );
+    assert_eq!(
+        FleetLoadout::Custom("strong".to_string()).as_str(),
+        "strong"
+    );
 }
 
 #[test]

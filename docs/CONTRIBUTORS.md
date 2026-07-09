@@ -28,6 +28,31 @@ notes, and relevant issue/PR comments.
 ## Contributors by time
 
 <details open>
+<summary><strong>v0.8.68 — maintenance sweep, runtime persistence &amp; release evidence</strong></summary>
+
+The v0.8.68 maintenance lane started with post-release cleanup on `main`: runtime
+thread persistence, terminal selection, UTF-8 edit handling, README discovery,
+and dead-code removal landed alongside Cursor dogfood evidence for v0.8.67.
+
+- **[Jeffrey Luna / Mr-Moon121](https://github.com/Mr-Moon121)** — anti-polling
+  constitution for sub-agent waiting (harvested into #4097 / PR #4229 from
+  PR #4098)
+
+- **[MXAntian](https://github.com/MXAntian)** — persist compaction summaries
+  into thread records so `/v1` engine reloads keep compacted context (#4091)
+- **[nightt5879](https://github.com/nightt5879)** — keep native terminal
+  selection usable when mouse capture is disabled, and advance fuzzy edit
+  matches on UTF-8 character boundaries (#4088, #4045)
+- **[gaord](https://github.com/gaord)** — add the community-maintained
+  CodeWhale for VS Code GUI frontend to the English and Chinese READMEs (#4035)
+- **[Darrell Thomas](https://github.com/DarrellThomas)** — remove the unused
+  whale route taxonomy module and its dead tests (#4041)
+- **[Taixin Guo](https://github.com/taixinguo)** — CJK fuzzy-edit panic report
+  and fix direction credited in the UTF-8 boundary patch (#3971, #4045)
+
+</details>
+
+<details>
 <summary><strong>v0.8.66 — release readiness, provider intake &amp; UI hardening</strong></summary>
 
 The v0.8.66 release prepared the 0.8.66 package lane, hardened provider/model
@@ -194,8 +219,8 @@ patches, and TUI fixes landed alongside first-time and returning contributor wor
   pausable custom-command lifecycle direction harvested into the forward track,
   plus the directly merged command-support boundary cleanup and broader command
   layer design direction (#2788, #2732, #2871, #2851, #2791)
-- **[AdityaVG13](https://github.com/AdityaVG13)** — WhaleFlow orchestration and
-  cost-tracking drafts that shaped the maintained WhaleFlow IR and
+- **[AdityaVG13](https://github.com/AdityaVG13)** — Workflow orchestration
+  and cost-tracking drafts that shaped the maintained workflow IR and
   TraceStore foundation (#2482, #2486)
 - **[lbcheng888](https://github.com/lbcheng888)**,
   **[AiurArtanis](https://github.com/AiurArtanis)**, and

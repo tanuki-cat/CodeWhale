@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, Paragraph, Widget},
+    widgets::{Block, Clear, Paragraph, Widget, Wrap},
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -23,6 +23,7 @@ use crate::tui::approval::{ElevationOption, ReviewDecision};
 use crate::tui::history::{HistoryCell, SubAgentCell, summarize_tool_output};
 use crate::tui::widgets::agent_card::AgentLifecycle;
 
+pub mod fleet_roster;
 pub mod fleet_setup;
 pub mod mode_picker;
 pub mod status_picker;
@@ -43,8 +44,10 @@ pub enum ModalKind {
     ModelPicker,
     ProviderPicker,
     ModePicker,
+    FleetRoster,
     FleetSetup,
     HotbarSetup,
+    SetupWizard,
     FilePicker,
     StatusPicker,
     FeedbackPicker,
@@ -84,7 +87,7 @@ pub(crate) fn render_modal_surface(area: Rect, popup_area: Rect, buf: &mut Buffe
 
     Clear.render(popup_area, buf);
     Block::default()
-        .style(Style::default().bg(palette::DEEPSEEK_INK))
+        .style(Style::default().bg(palette::WHALE_BG))
         .render(popup_area, buf);
 }
 
@@ -93,7 +96,7 @@ fn render_modal_backdrop(area: Rect, buf: &mut Buffer) {
         for x in area.left()..area.right() {
             buf[(x, y)]
                 .set_symbol(" ")
-                .set_style(Style::default().bg(palette::DEEPSEEK_INK));
+                .set_style(Style::default().bg(palette::WHALE_BG));
         }
     }
 }
@@ -161,7 +164,7 @@ impl ActionHint {
             Span::styled(
                 format!(" {} ", self.key),
                 Style::default()
-                    .fg(palette::DEEPSEEK_SKY)
+                    .fg(palette::WHALE_INFO)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -303,6 +306,155 @@ pub(crate) fn render_modal_text_footer(
     place_footer_lines(inner, buf, lines)
 }
 
+/// Shared list/detail geometry for modal managers and pickers.
+///
+/// Wide modals get a stable left list and a right detail pane. Narrow modals
+/// stack the list over the detail so neither side becomes unreadably thin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ListDetailLayout {
+    pub(crate) list: Rect,
+    pub(crate) detail: Rect,
+    pub(crate) stacked: bool,
+}
+
+impl ListDetailLayout {
+    #[must_use]
+    pub(crate) fn split(area: Rect, min_detail_width: u16) -> Self {
+        if area.width == 0 || area.height == 0 {
+            return Self {
+                list: area,
+                detail: area,
+                stacked: true,
+            };
+        }
+
+        let gap = 1;
+        let min_list_width = 30.min(area.width);
+        let can_split = area.width >= 96
+            && area
+                .width
+                .saturating_sub(gap)
+                .saturating_sub(min_list_width)
+                >= min_detail_width;
+        if can_split {
+            let max_list_width = area.width.saturating_sub(gap + min_detail_width);
+            let preferred = area.width.saturating_mul(42) / 100;
+            let list_width = preferred.clamp(min_list_width, max_list_width.min(52));
+            let detail_width = area.width.saturating_sub(list_width + gap);
+            return Self {
+                list: Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: list_width,
+                    height: area.height,
+                },
+                detail: Rect {
+                    x: area.x + list_width + gap,
+                    y: area.y,
+                    width: detail_width,
+                    height: area.height,
+                },
+                stacked: false,
+            };
+        }
+
+        let gap = if area.height >= 8 { 1 } else { 0 };
+        let min_detail_height = 4.min(area.height);
+        let max_list_height = area.height.saturating_sub(gap + min_detail_height);
+        let preferred = area.height.saturating_mul(3) / 5;
+        let list_height = preferred.clamp(1, max_list_height.max(1));
+        let detail_height = area.height.saturating_sub(list_height + gap);
+        Self {
+            list: Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: list_height,
+            },
+            detail: Rect {
+                x: area.x,
+                y: area.y + list_height + gap,
+                width: area.width,
+                height: detail_height,
+            },
+            stacked: true,
+        }
+    }
+}
+
+/// Plain empty-state copy for modal list/detail bodies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmptyState {
+    title: Cow<'static, str>,
+    body: Cow<'static, str>,
+    primary_action: Option<(Cow<'static, str>, Cow<'static, str>)>,
+    secondary_action: Option<(Cow<'static, str>, Cow<'static, str>)>,
+}
+
+impl EmptyState {
+    pub(crate) fn new(
+        title: impl Into<Cow<'static, str>>,
+        body: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            primary_action: None,
+            secondary_action: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn primary_action(
+        mut self,
+        key: impl Into<Cow<'static, str>>,
+        label: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        self.primary_action = Some((key.into(), label.into()));
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn secondary_action(
+        mut self,
+        key: impl Into<Cow<'static, str>>,
+        label: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        self.secondary_action = Some((key.into(), label.into()));
+        self
+    }
+
+    pub(crate) fn render(&self, area: Rect, buf: &mut Buffer) {
+        let mut lines = vec![
+            Line::from(Span::styled(
+                self.title.clone().into_owned(),
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                self.body.clone().into_owned(),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+        ];
+        if self.primary_action.is_some() || self.secondary_action.is_some() {
+            lines.push(Line::from(""));
+        }
+        for (key, label) in [self.primary_action.as_ref(), self.secondary_action.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let hint = ActionHint::new(key.clone(), label.clone());
+            lines.push(Line::from(hint.spans().to_vec()));
+        }
+        Paragraph::new(lines)
+            .style(Style::default().fg(palette::TEXT_PRIMARY))
+            .wrap(Wrap { trim: true })
+            .render(area, buf);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CommandPaletteAction {
     ExecuteCommand { command: String },
@@ -393,6 +545,9 @@ pub enum ViewEvent {
     },
     PlanPromptDismissed,
     SubAgentsRefresh,
+    SidebarAgentCancel {
+        agent_id: String,
+    },
     /// Emitted by the file picker (`Ctrl+P`) when the user presses Enter on a
     /// candidate. The handler should insert `@<path>` at the composer's cursor
     /// position.
@@ -418,18 +573,46 @@ pub enum ViewEvent {
         previous_model: String,
         previous_effort: crate::tui::app::ReasoningEffort,
     },
+    /// Emitted by the `/model` picker on Esc so the next open can restore
+    /// the browsing context — view mode and highlighted row (#4109 / #4115).
+    ModelPickerDismissed {
+        /// True when the dismissed view browses beyond configured providers
+        /// (Catalog / Recent / Coding / Cheap / Long context).
+        catalog_view: bool,
+        /// Named view key (`configured`, `catalog`, `recent`, `coding`,
+        /// `cheap`, `long_context`) for reopen restore (#4115).
+        view: String,
+        selected_row_id: Option<String>,
+    },
+    /// Emitted by the `/provider` picker on Esc so the next open can restore
+    /// the browsing context — view mode and highlighted row.
+    ProviderPickerDismissed {
+        catalog_view: bool,
+        selected_provider_id: Option<String>,
+    },
     /// Emitted by the `/provider` picker when the user selects a provider
     /// that already has credentials — the handler should perform the same
     /// switch as `AppAction::SwitchProvider`.
     ProviderPickerApplied {
         provider: crate::config::ApiProvider,
+        provider_id: Option<String>,
     },
     /// Emitted by the `/provider` picker after the user types an API key
     /// inline for a provider that lacked one. The handler should persist
     /// the key via `save_api_key_for` and then perform the provider switch.
     ProviderPickerApiKeySubmitted {
         provider: crate::config::ApiProvider,
+        provider_id: Option<String>,
         api_key: String,
+    },
+    /// Emitted by the `/provider` picker after the custom provider form is
+    /// completed. The handler persists a named OpenAI-compatible provider
+    /// table and switches to it without storing raw secrets.
+    ProviderPickerCustomProviderSubmitted {
+        provider_id: String,
+        base_url: String,
+        model: Option<String>,
+        api_key_env: Option<String>,
     },
     /// Emitted by the `/provider` picker when Kimi CLI OAuth credentials can
     /// be reused for Moonshot/Kimi dispatch.
@@ -440,6 +623,7 @@ pub enum ViewEvent {
     /// the `/model` picker pre-filtered to the highlighted provider (#3083).
     ProviderPickerOpenModels {
         provider: crate::config::ApiProvider,
+        provider_id: Option<String>,
     },
     /// Emitted by the `/mode` picker when the user chooses a mode.
     ModeSelected {
@@ -459,6 +643,91 @@ pub enum ViewEvent {
     HotbarSetupSaved {
         bindings: Vec<codewhale_config::HotbarBindingToml>,
     },
+    /// Emitted by the constitution-first setup shell when a staged setup-state
+    /// record should be committed atomically to `$CODEWHALE_HOME/setup_state.json`.
+    SetupStateCommitRequested {
+        state: codewhale_config::SetupState,
+        message: String,
+    },
+    /// Emitted by the constitution-first setup shell when accepting a guided
+    /// structured user-global constitution. The host commits the constitution
+    /// and matching setup-state record together.
+    SetupConstitutionCommitRequested {
+        constitution: codewhale_config::UserConstitution,
+        state: codewhale_config::SetupState,
+        message: String,
+    },
+    /// Emitted by the setup Constitution card (`A`, provider route ready) to
+    /// ask the user's first configured model to draft the constitution from
+    /// the guided answers plus an optional bounded own-words note. The host
+    /// performs the one-shot call, pushes the sanitized/bounded draft back into the wizard, and opens the
+    /// ratification preview; on any failure it reports why and leaves the
+    /// deterministic guided draft standing. Nothing is persisted by this
+    /// event — saving still goes through the ratify keypress and
+    /// [`SetupConstitutionCommitRequested`](Self::SetupConstitutionCommitRequested).
+    SetupConstitutionModelDraftRequested {
+        draft: crate::tui::setup::GuidedConstitutionDraft,
+        freeform_note: Option<String>,
+        locale: crate::localization::Locale,
+    },
+    /// Emitted by the fleet setup Review step (`m`) to ask the configured
+    /// model to draft the agent profile the wizard describes. The host
+    /// performs the one-shot call, pushes the sanitized/bounded draft back
+    /// into the wizard, and opens the rendered-TOML preview; on failure it
+    /// reports why and the manual authoring flow stands. Nothing is
+    /// persisted by this event.
+    FleetProfileModelDraftRequested {
+        role: String,
+        /// Target model for the worker: a concrete model id, or "inherit".
+        model: String,
+        /// Canonical provider id for a concrete cross-provider route pick, or
+        /// `None` for `inherit` (#4093). Carried so the model-drafted profile
+        /// keeps the picked provider instead of collapsing to an ambiguous,
+        /// provider-scoped profile — the exact bug #4093 fixes.
+        provider: Option<String>,
+        /// Canonical reasoning tier selected by the wizard, or `None` for
+        /// inherit (#4137). Carried with the async draft for the same reason
+        /// as `provider`: the ratified profile must preserve the operator's
+        /// explicit choice, not whatever the model echoed.
+        reasoning_effort: Option<String>,
+        locale: crate::localization::Locale,
+    },
+    /// Emitted by the `/fleet` roster view (`s` / Enter) to hand off to the
+    /// setup wizard for authoring or overriding a roster member. The roster
+    /// view itself never writes anything.
+    FleetRosterOpenSetupRequested,
+    /// Emitted by the fleet setup Review step after the user previewed a
+    /// model-drafted profile and pressed the explicit ratify key. The host
+    /// renders TOML deterministically from the validated draft and persists
+    /// it atomically under `.codewhale/agents/`.
+    FleetProfileDraftCommitRequested {
+        draft: Box<crate::fleet::profile::FleetProfileDraft>,
+    },
+    /// Emitted by the setup Runtime Posture card after the user has previewed
+    /// and confirmed an explicit preset/config diff.
+    SetupRuntimePresetApplyRequested {
+        preset: crate::tui::setup::SetupRuntimePreset,
+        state: codewhale_config::SetupState,
+        message: String,
+    },
+    /// Emitted by the setup Provider/Model readiness card to hand off to the
+    /// existing provider manager instead of duplicating provider auth UI.
+    SetupOpenProviderRequested,
+    /// Emitted by the setup Provider/Model readiness card to hand off to the
+    /// existing provider-qualified model route picker.
+    SetupOpenModelRequested,
+    /// Emitted by the setup Operate/Fleet readiness card to hand off to the
+    /// existing Fleet setup wizard without writing Fleet config itself.
+    SetupOpenFleetRequested,
+    /// Emitted by the setup Hotbar card to hand off to the existing Hotbar
+    /// setup wizard without rewriting bindings itself.
+    SetupOpenHotbarRequested,
+    /// Emitted by the setup Runtime Posture card to hand off to the existing
+    /// work-mode picker.
+    SetupOpenModeRequested,
+    /// Emitted by the setup Runtime Posture card to hand off to the existing
+    /// config view for approval/sandbox/network details.
+    SetupOpenConfigRequested,
     /// Emitted by the `/hotbar` setup wizard when the user chooses "Disable
     /// Hotbar". The host persists `hotbar = []` and hides the panel.
     HotbarDisableRequested,
@@ -1494,7 +1763,7 @@ fn experimental_config_rows(config: &Config) -> Vec<ConfigRow> {
 
     for spec in FEATURES
         .iter()
-        .filter(|spec| spec.stage == Stage::Experimental)
+        .filter(|spec| matches!(spec.stage, Stage::Experimental | Stage::Beta))
     {
         let effective = features.enabled(spec.id);
         let configured_value = configured
@@ -1514,16 +1783,20 @@ fn experimental_config_rows(config: &Config) -> Vec<ConfigRow> {
     }
 
     rows.push(ConfigRow {
-        section: ConfigSection::Experimental,
+        section: ConfigSection::Fleet,
         key: "goal_command".to_string(),
-        value: "preview placeholder (not stable; see #1976/#891)".to_string(),
+        value:
+            "/goal sets session objectives with optional token budgets; state shows in Work context"
+                .to_string(),
         editable: false,
         scope: ConfigScope::Saved,
     });
     rows.push(ConfigRow {
-        section: ConfigSection::Experimental,
-        key: "whaleflow".to_string(),
-        value: "preview overlay for workflow/fleet runs (not stable; see #3154/#3178)".to_string(),
+        section: ConfigSection::Fleet,
+        key: "workflow".to_string(),
+        value:
+            "/workflow runs scripted fan-out/fan-in operations with run cards and cancel support"
+                .to_string(),
         editable: false,
         scope: ConfigScope::Saved,
     });
@@ -1589,7 +1862,7 @@ fn config_label_for_key(key: &str) -> String {
         "mcp_config_path" => "MCP config path",
         "fleet.exec.max_spawn_depth" => "Fleet recursion depth",
         "goal_command" => "Goal command",
-        "whaleflow" => "WhaleFlow",
+        "workflow" => "Workflow",
         _ => {
             if let Some(feature) = key.strip_prefix("features.") {
                 return format!("Feature: {}", humanize_config_key(feature));
@@ -1654,14 +1927,16 @@ fn config_hint_for_key(key: &str) -> &'static str {
         "fleet.exec.max_spawn_depth" => {
             "0 blocks child agents; 3 default (same axis as sub-agents); capped at 8"
         }
-        "features.subagents" => "read-only feature flag state; Fleet setup is the user-facing path",
+        "features.subagents" => {
+            "read-only feature flag state; /fleet setup is the user-facing path"
+        }
         "features.web_search" => "read-only feature flag state for web search tools",
         "features.apply_patch" => "read-only feature flag state for patch editing tools",
         "features.mcp" => "read-only feature flag state for MCP tools",
         "features.exec_policy" => "read-only feature flag state for execution policy tools",
-        "features.vision_model" => "read-only feature flag state for vision/model image support",
-        "goal_command" => "preview-only; not a stable command surface yet",
-        "whaleflow" => "preview-only workflow/fleet overlay; not a stable command surface yet",
+        "features.vision_model" => "beta feature flag for vision/model image support",
+        "goal_command" => "/goal sets objectives, budgets, and Work-context status",
+        "workflow" => "/workflow runs scripted operations with fan-out/fan-in run cards",
         _ => "",
     }
 }
@@ -1690,8 +1965,8 @@ fn render_config_editor_value_line(
     ));
 
     let cursor_style = Style::default()
-        .fg(palette::DEEPSEEK_INK)
-        .bg(palette::DEEPSEEK_SKY)
+        .fg(palette::WHALE_BG)
+        .bg(palette::WHALE_INFO)
         .bold();
     let selected_style = Style::default()
         .fg(palette::SELECTION_TEXT)
@@ -1859,7 +2134,7 @@ impl ModalView for ConfigView {
         let base_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::DEEPSEEK_INK))
+            .style(Style::default().bg(palette::WHALE_BG))
             .padding(Padding::uniform(1));
 
         let inner = base_block.inner(popup_area);
@@ -1878,7 +2153,7 @@ impl ModalView for ConfigView {
             };
             lines.push(Line::from(vec![Span::styled(
                 edit_title,
-                Style::default().fg(palette::DEEPSEEK_SKY).bold(),
+                Style::default().fg(palette::WHALE_INFO).bold(),
             )]));
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
@@ -1975,7 +2250,7 @@ impl ModalView for ConfigView {
                     ConfigListItem::Section(section) => {
                         lines.push(Line::from(Span::styled(
                             format!("  {}", section.label(self.locale)),
-                            Style::default().fg(palette::DEEPSEEK_SKY).bold(),
+                            Style::default().fg(palette::WHALE_INFO).bold(),
                         )));
                     }
                     ConfigListItem::Row(idx) => {
@@ -2050,7 +2325,7 @@ impl ModalView for ConfigView {
                 selected_hint.unwrap_or_default()
             };
             lines.push(Line::from(Span::styled(
-                truncate_view_text(&bottom_text, usize::from(inner.width)),
+                crate::tui::ui_text::semantic_truncate(&bottom_text, usize::from(inner.width)),
                 Style::default().fg(palette::TEXT_MUTED),
             )));
 
@@ -2071,7 +2346,7 @@ impl ModalView for ConfigView {
             )]))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::DEEPSEEK_INK))
+            .style(Style::default().bg(palette::WHALE_BG))
             .padding(Padding::uniform(1));
 
         let inner = block.inner(popup_area);
@@ -2310,13 +2585,13 @@ impl ModalView for SubAgentsView {
                 ("Running", running.len(), palette::STATUS_WARNING),
                 ("Completed", completed.len(), palette::STATUS_SUCCESS),
                 ("Interrupted", interrupted.len(), palette::STATUS_WARNING),
-                ("Failed", failed.len(), palette::DEEPSEEK_RED),
+                ("Failed", failed.len(), palette::WHALE_ERROR),
                 ("Cancelled", cancelled.len(), palette::TEXT_MUTED),
             ];
 
             lines.push(Line::from(Span::styled(
                 "Fleet workers",
-                Style::default().fg(palette::DEEPSEEK_SKY).bold(),
+                Style::default().fg(palette::WHALE_INFO).bold(),
             )));
             lines.push(Line::from(Span::styled(
                 "Sub-agent roles are Fleet worker roles.",
@@ -2389,7 +2664,7 @@ impl ModalView for SubAgentsView {
             append_subagent_group(
                 &mut lines,
                 "Failed",
-                palette::DEEPSEEK_RED.into(),
+                palette::WHALE_ERROR.into(),
                 &failed,
                 content_width,
             );
@@ -2422,13 +2697,13 @@ impl ModalView for SubAgentsView {
             .title_bottom(
                 Line::from(Span::styled(
                     scroll_indicator,
-                    Style::default().fg(palette::DEEPSEEK_SKY),
+                    Style::default().fg(palette::WHALE_INFO),
                 ))
                 .alignment(Alignment::Right),
             )
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::DEEPSEEK_INK))
+            .style(Style::default().bg(palette::WHALE_BG))
             .padding(Padding::uniform(1));
 
         let inner = block.inner(popup_area);
@@ -2508,7 +2783,7 @@ fn append_subagent_group(
             let detail = truncate_view_text(detail, max_len);
             lines.push(Line::from(vec![
                 Span::styled("    reason: ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::styled(detail, Style::default().fg(palette::DEEPSEEK_RED)),
+                Span::styled(detail, Style::default().fg(palette::WHALE_ERROR)),
             ]));
         }
 
@@ -2517,7 +2792,7 @@ fn append_subagent_group(
             let role = truncate_view_text(role, max_len);
             lines.push(Line::from(vec![
                 Span::styled("    role: ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::styled(role, Style::default().fg(palette::DEEPSEEK_SKY)),
+                Span::styled(role, Style::default().fg(palette::WHALE_INFO)),
             ]));
         }
 
@@ -2536,7 +2811,7 @@ fn append_subagent_group(
             let branch_detail = truncate_view_text(&branch_detail, max_len);
             lines.push(Line::from(vec![
                 Span::styled("    git: ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::styled(branch_detail, Style::default().fg(palette::DEEPSEEK_SKY)),
+                Span::styled(branch_detail, Style::default().fg(palette::WHALE_INFO)),
             ]));
         }
 
@@ -2584,7 +2859,7 @@ fn format_agent_status(
     use ratatui::style::Style;
 
     match status {
-        SubAgentStatus::Running => ("running", Style::default().fg(palette::DEEPSEEK_SKY), None),
+        SubAgentStatus::Running => ("running", Style::default().fg(palette::WHALE_INFO), None),
         SubAgentStatus::Completed => (
             "completed",
             Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
@@ -2603,7 +2878,7 @@ fn format_agent_status(
         ),
         SubAgentStatus::Failed(reason) => (
             "failed",
-            Style::default().fg(palette::DEEPSEEK_RED),
+            Style::default().fg(palette::WHALE_ERROR),
             Some(reason.as_str()),
         ),
     }
@@ -2622,9 +2897,9 @@ fn truncate_view_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionHint, ConfigListItem, ConfigView, HelpView, ModalKind, ModalView, ViewAction,
-        ViewEvent, ViewStack, action_footer_lines, centered_modal_area, render_modal_footer,
-        subagent_view_agents, truncate_view_text,
+        ActionHint, ConfigListItem, ConfigView, EmptyState, HelpView, ListDetailLayout, ModalKind,
+        ModalView, ViewAction, ViewEvent, ViewStack, action_footer_lines, centered_modal_area,
+        render_modal_footer, subagent_view_agents, truncate_view_text,
     };
     use crate::config::Config;
     use crate::localization::{Locale, MessageId, tr};
@@ -2696,7 +2971,7 @@ mod tests {
             );
             assert_eq!(
                 buf[(w / 2, h / 2)].bg,
-                palette::DEEPSEEK_INK,
+                palette::WHALE_BG,
                 "{w}x{h}: modal interior must be opaque"
             );
             for (y, row) in rows.iter().enumerate() {
@@ -2794,6 +3069,49 @@ mod tests {
         assert_eq!(body.y, inner.y);
         assert_eq!(body.height, inner.height - 1);
         assert_eq!(body.y + body.height, inner.y + inner.height - 1);
+    }
+
+    #[test]
+    fn list_detail_layout_splits_wide_and_stacks_narrow() {
+        let wide = ListDetailLayout::split(Rect::new(0, 0, 120, 24), 34);
+        assert!(!wide.stacked);
+        assert!(wide.list.width >= 30);
+        assert!(wide.detail.width >= 34);
+        assert_eq!(wide.list.height, 24);
+        assert_eq!(wide.detail.height, 24);
+        assert!(wide.list.right() < wide.detail.left());
+
+        let narrow = ListDetailLayout::split(Rect::new(0, 0, 80, 20), 34);
+        assert!(narrow.stacked);
+        assert_eq!(narrow.list.width, 80);
+        assert_eq!(narrow.detail.width, 80);
+        assert!(narrow.list.bottom() <= narrow.detail.top());
+        assert!(narrow.list.height > 0);
+    }
+
+    #[test]
+    fn empty_state_renders_copy_and_actions() {
+        let area = Rect::new(0, 0, 48, 8);
+        let mut buf = Buffer::empty(area);
+        EmptyState::new("Nothing here", "Use search or switch categories.")
+            .primary_action("/", "filter")
+            .secondary_action("Esc", "cancel")
+            .render(area, &mut buf);
+
+        let text = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in ["Nothing here", "Use search", "filter", "cancel"] {
+            assert!(
+                text.contains(expected),
+                "empty state missing {expected:?}: {text:?}"
+            );
+        }
     }
 
     struct ConfigSettingsEnvGuard {
@@ -2937,7 +3255,7 @@ mod tests {
     #[test]
     fn subagent_view_agents_includes_live_fanout_workers_when_cache_is_empty() {
         let mut app = create_test_app();
-        let mut card = FanoutCard::new("rlm", app.ui_locale).with_workers(["chunk_1", "chunk_2"]);
+        let mut card = FanoutCard::new("rlm").with_workers(["chunk_1", "chunk_2"]);
         card.upsert_worker("chunk_1", AgentLifecycle::Completed);
         card.upsert_worker("chunk_2", AgentLifecycle::Running);
         app.add_message(HistoryCell::SubAgent(SubAgentCell::Fanout(card)));
@@ -3034,6 +3352,7 @@ mod tests {
                 "MCP",
                 "Fleet",
                 "Experimental",
+                "Fleet",
             ]
         );
     }
@@ -3070,14 +3389,15 @@ mod tests {
         assert!(keys.contains(&"prefer_external_pdftotext"));
         assert!(keys.contains(&"mcp_config_path"));
         assert!(keys.contains(&"fleet.exec.max_spawn_depth"));
-        assert!(keys.contains(&"features.subagents"));
-        assert!(keys.contains(&"features.web_search"));
-        assert!(keys.contains(&"features.apply_patch"));
-        assert!(keys.contains(&"features.mcp"));
-        assert!(keys.contains(&"features.exec_policy"));
         assert!(keys.contains(&"features.vision_model"));
         assert!(keys.contains(&"goal_command"));
-        assert!(keys.contains(&"whaleflow"));
+        assert!(keys.contains(&"workflow"));
+        assert!(!keys.contains(&"features.subagents"));
+        assert!(!keys.contains(&"features.web_search"));
+        assert!(!keys.contains(&"features.apply_patch"));
+        assert!(!keys.contains(&"features.mcp"));
+        assert!(!keys.contains(&"features.exec_policy"));
+        assert!(!keys.contains(&"whaleflow"));
         assert!(
             view.rows
                 .iter()
@@ -3127,10 +3447,8 @@ vision_model = true
         let web_search = view
             .rows
             .iter()
-            .find(|row| row.key == "features.web_search")
-            .expect("web_search feature row");
-        assert_eq!(web_search.value, "disabled (configured; default enabled)");
-        assert!(!web_search.editable);
+            .find(|row| row.key == "features.web_search");
+        assert!(web_search.is_none());
 
         let vision = view
             .rows
@@ -3140,12 +3458,8 @@ vision_model = true
         assert_eq!(vision.value, "enabled (configured; default disabled)");
         assert!(!vision.editable);
 
-        let subagents = view
-            .rows
-            .iter()
-            .find(|row| row.key == "features.subagents")
-            .expect("subagents feature row");
-        assert_eq!(subagents.value, "enabled (default enabled)");
+        let subagents = view.rows.iter().find(|row| row.key == "features.subagents");
+        assert!(subagents.is_none());
     }
 
     #[test]
@@ -3184,7 +3498,7 @@ max_spawn_depth = 2
 
         view.update_filter(|filter| filter.push_str("experimental"));
         assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
-        assert!(visible_row_keys(&view).contains(&"features.subagents"));
+        assert_eq!(visible_row_keys(&view), vec!["features.vision_model"]);
 
         view.clear_filter();
         type_filter(&mut view, "feature vision");
@@ -3193,13 +3507,17 @@ max_spawn_depth = 2
 
         view.clear_filter();
         type_filter(&mut view, "goal");
-        assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
+        assert_eq!(visible_section_labels(&view), vec!["Fleet"]);
         assert_eq!(visible_row_keys(&view), vec!["goal_command"]);
 
         view.clear_filter();
+        type_filter(&mut view, "workflow");
+        assert_eq!(visible_section_labels(&view), vec!["Fleet"]);
+        assert_eq!(visible_row_keys(&view), vec!["workflow"]);
+
+        view.clear_filter();
         type_filter(&mut view, "whaleflow");
-        assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
-        assert_eq!(visible_row_keys(&view), vec!["whaleflow"]);
+        assert!(visible_row_keys(&view).is_empty());
     }
 
     #[test]
@@ -3430,8 +3748,8 @@ base_url = "https://api.xiaomimimo.com/v1"
         assert_eq!(visible_row_keys(&view), vec!["reasoning_effort"]);
 
         view.clear_filter();
-        type_filter(&mut view, "fleet setup user-facing");
-        assert_eq!(visible_row_keys(&view), vec!["features.subagents"]);
+        type_filter(&mut view, "fan-out/fan-in");
+        assert_eq!(visible_row_keys(&view), vec!["workflow"]);
     }
 
     #[test]
@@ -3678,6 +3996,54 @@ base_url = "https://api.xiaomimimo.com/v1"
     }
 
     #[test]
+    fn config_view_bottom_hint_semantically_truncates_at_narrow_width() {
+        // The dense bottom status line must truncate on a word boundary with an
+        // ellipsis instead of leaving a mid-word fragment clipped by the
+        // terminal (#3987).
+        let mut app = create_test_app();
+        app.ui_locale = Locale::En;
+        let mut view = ConfigView::new_for_app(&app);
+        view.status = Some(
+            "CFGSTATUS persisted the configuration override to disk successfully \
+             without clipping the trailing MARKEREND status text"
+                .to_string(),
+        );
+
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // No rendered row may overflow the available columns.
+        for (idx, row) in rows.iter().enumerate() {
+            assert!(
+                crate::tui::ui_text::text_display_width(row) <= usize::from(area.width),
+                "line {idx} overflows: {row:?}"
+            );
+        }
+
+        let status_line = rows
+            .iter()
+            .find(|row| row.contains("CFGSTATUS"))
+            .expect("bottom status hint should be rendered");
+        assert!(
+            status_line.contains('…'),
+            "status should be truncated with an ellipsis: {status_line:?}"
+        );
+        assert!(
+            !status_line.contains("MARKEREND"),
+            "truncated status must drop trailing text: {status_line:?}"
+        );
+    }
+
+    #[test]
     fn config_view_typing_replaces_on_first_char() {
         let app = create_test_app();
         let mut view = ConfigView::new_for_app(&app);
@@ -3776,7 +4142,7 @@ base_url = "https://api.xiaomimimo.com/v1"
                 );
                 assert_eq!(
                     cell.bg,
-                    palette::DEEPSEEK_INK,
+                    palette::WHALE_BG,
                     "backdrop at ({x},{y}) must be opaque"
                 );
             }

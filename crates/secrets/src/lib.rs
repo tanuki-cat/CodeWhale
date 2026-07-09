@@ -500,25 +500,32 @@ impl FileKeyringStore {
     }
 }
 
-#[cfg(unix)]
 fn write_private_file(path: &Path, body: &[u8]) -> Result<(), SecretsError> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(body)?;
-    Ok(())
+    atomic_write_private_file(path, body)
 }
 
-#[cfg(not(unix))]
-fn write_private_file(path: &Path, body: &[u8]) -> Result<(), SecretsError> {
-    fs::write(path, body)?;
+fn atomic_write_private_file(path: &Path, body: &[u8]) -> Result<(), SecretsError> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(SecretsError::Io)?;
+    use std::io::Write as _;
+    tmp.write_all(body).map_err(SecretsError::Io)?;
+    tmp.flush().map_err(SecretsError::Io)?;
+    tmp.as_file().sync_all().map_err(SecretsError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o600);
+        tmp.as_file()
+            .set_permissions(perms)
+            .map_err(SecretsError::Io)?;
+    }
+    tmp.persist(path).map_err(|e| SecretsError::Io(e.error))?;
     Ok(())
 }
 
@@ -810,9 +817,11 @@ impl Secrets {
 /// | `deepseek` | `DEEPSEEK_API_KEY` |
 /// | `openrouter` | `OPENROUTER_API_KEY` |
 /// | `xiaomi-mimo` / `mimo` | `XIAOMI_MIMO_API_KEY`, `XIAOMI_API_KEY`, `MIMO_API_KEY` |
-/// | `novita` | `NOVITA_API_KEY` |
+/// | `novita` / `novita-ai` | `NOVITA_API_KEY` |
 /// | `nvidia` / `nvidia-nim` / `nim` | `NVIDIA_API_KEY`, `NVIDIA_NIM_API_KEY`, `DEEPSEEK_API_KEY` |
-/// | `fireworks` | `FIREWORKS_API_KEY` |
+/// | `fireworks` / `fireworks-ai` | `FIREWORKS_API_KEY` |
+/// | `together` / `togetherai` | `TOGETHER_API_KEY` |
+/// | `deepinfra` | `DEEPINFRA_API_KEY`, `DEEPINFRA_TOKEN` |
 /// | `siliconflow` / `siliconflow-cn` | `SILICONFLOW_API_KEY` |
 /// | `arcee` / `arcee-ai` | `ARCEE_API_KEY` |
 /// | `moonshot` / `kimi` | `MOONSHOT_API_KEY`, `KIMI_API_KEY` |
@@ -834,7 +843,9 @@ pub fn env_for(name: &str) -> Option<String> {
         "xiaomi-mimo" | "xiaomi_mimo" | "xiaomimimo" | "mimo" | "xiaomi" => {
             &["XIAOMI_MIMO_API_KEY", "XIAOMI_API_KEY", "MIMO_API_KEY"]
         }
-        "novita" => &["NOVITA_API_KEY"],
+        "novita" | "novita-ai" | "novita_ai" => &["NOVITA_API_KEY"],
+        "together" | "together-ai" | "together_ai" | "togetherai" => &["TOGETHER_API_KEY"],
+        "deepinfra" | "deep-infra" | "deep_infra" => &["DEEPINFRA_API_KEY", "DEEPINFRA_TOKEN"],
         // NVIDIA NIM falls back to `DEEPSEEK_API_KEY` last because the
         // catalog endpoint accepts the same DeepSeek-issued key when no
         // dedicated NVIDIA token is set. This mirrors pre-v0.7 behaviour.
@@ -865,6 +876,7 @@ pub fn env_for(name: &str) -> Option<String> {
             "WANJIE_MAAS_API_KEY",
         ],
         "sakana" | "sakana-ai" | "sakana_ai" | "fugu" => &["FUGU_API_KEY", "SAKANA_API_KEY"],
+        "longcat" | "long-cat" | "meituan-longcat" | "meituan" => &["LONGCAT_API_KEY"],
         _ => return None,
     };
     for var in candidates {
@@ -900,6 +912,9 @@ mod tests {
             "NVIDIA_API_KEY",
             "NVIDIA_NIM_API_KEY",
             "FIREWORKS_API_KEY",
+            "TOGETHER_API_KEY",
+            "DEEPINFRA_API_KEY",
+            "DEEPINFRA_TOKEN",
             "SILICONFLOW_API_KEY",
             "ARCEE_API_KEY",
             "SGLANG_API_KEY",
@@ -915,6 +930,7 @@ mod tests {
             "MIMO_API_KEY",
             "FUGU_API_KEY",
             "SAKANA_API_KEY",
+            "LONGCAT_API_KEY",
             SECRET_BACKEND_ENV,
             LEGACY_SECRET_BACKEND_ENV,
         ] {
@@ -1287,6 +1303,59 @@ mod tests {
         assert_eq!(env_for("fireworks-ai").as_deref(), Some("fw-key"));
         // Safety: env mutation guarded by env_lock().
         unsafe { std::env::remove_var("FIREWORKS_API_KEY") };
+    }
+
+    #[test]
+    fn together_env_aliases_resolve() {
+        let _lock = env_lock();
+        clear_known_envs();
+        // Safety: env mutation guarded by env_lock().
+        unsafe { std::env::set_var("TOGETHER_API_KEY", "together-key") };
+
+        // Canonical id plus the legacy hyphen/underscore spellings AND the
+        // separator-free `togetherai` id Models.dev publishes must all resolve.
+        assert_eq!(env_for("together").as_deref(), Some("together-key"));
+        assert_eq!(env_for("together-ai").as_deref(), Some("together-key"));
+        assert_eq!(env_for("together_ai").as_deref(), Some("together-key"));
+        assert_eq!(env_for("togetherai").as_deref(), Some("together-key"));
+        // Safety: env mutation guarded by env_lock().
+        unsafe { std::env::remove_var("TOGETHER_API_KEY") };
+    }
+
+    #[test]
+    fn deepinfra_env_aliases_resolve() {
+        let _lock = env_lock();
+        clear_known_envs();
+        // Safety: env mutation guarded by env_lock().
+        unsafe { std::env::set_var("DEEPINFRA_API_KEY", "di-key") };
+
+        assert_eq!(env_for("deepinfra").as_deref(), Some("di-key"));
+        assert_eq!(env_for("deep-infra").as_deref(), Some("di-key"));
+        assert_eq!(env_for("deep_infra").as_deref(), Some("di-key"));
+        // Safety: env mutation guarded by env_lock().
+        unsafe { std::env::remove_var("DEEPINFRA_API_KEY") };
+
+        // The DEEPINFRA_TOKEN fallback is honored when the primary key is unset.
+        // Safety: env mutation guarded by env_lock().
+        unsafe { std::env::set_var("DEEPINFRA_TOKEN", "di-token") };
+        assert_eq!(env_for("deepinfra").as_deref(), Some("di-token"));
+        // Safety: env mutation guarded by env_lock().
+        unsafe { std::env::remove_var("DEEPINFRA_TOKEN") };
+    }
+
+    #[test]
+    fn novita_env_aliases_resolve() {
+        let _lock = env_lock();
+        clear_known_envs();
+        // Safety: env mutation guarded by env_lock().
+        unsafe { std::env::set_var("NOVITA_API_KEY", "novita-key") };
+
+        assert_eq!(env_for("novita").as_deref(), Some("novita-key"));
+        // `novita-ai` is the Models.dev provider id (Refs #4186).
+        assert_eq!(env_for("novita-ai").as_deref(), Some("novita-key"));
+        assert_eq!(env_for("novita_ai").as_deref(), Some("novita-key"));
+        // Safety: env mutation guarded by env_lock().
+        unsafe { std::env::remove_var("NOVITA_API_KEY") };
     }
 
     #[test]

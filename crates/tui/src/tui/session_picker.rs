@@ -32,7 +32,7 @@ fn modal_block(title: &str) -> Block<'static> {
         )]))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::BORDER_COLOR))
-        .style(Style::default().bg(palette::DEEPSEEK_INK))
+        .style(Style::default().bg(palette::WHALE_BG))
         .padding(Padding::uniform(1))
 }
 
@@ -654,14 +654,18 @@ fn build_list_lines(
     } else if let Some(status) = status {
         lines.push(Line::from(Span::styled(
             truncate(status, width),
-            Style::default().fg(palette::DEEPSEEK_SKY),
+            Style::default().fg(palette::WHALE_INFO),
         )));
     }
 
     if sessions.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No sessions available.",
+            "No saved sessions yet.",
             Style::default().fg(palette::TEXT_MUTED),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Send a message to start one; it is saved automatically.",
+            Style::default().fg(palette::TEXT_HINT),
         )));
         return lines;
     }
@@ -959,6 +963,7 @@ mod tests {
             message_count: idx + 1,
             total_tokens: 100,
             model: "deepseek-v4-pro".to_string(),
+            model_provider: "deepseek".to_string(),
             workspace: std::path::PathBuf::from("/tmp"),
             mode: Some("agent".to_string()),
             cost: crate::session_manager::SessionCostSnapshot::default(),
@@ -1540,7 +1545,7 @@ mod tests {
             assert!(!text.contains('X'), "{w}x{h}: background bleed-through");
             assert_eq!(
                 buf[(w / 2, h / 2)].bg,
-                palette::DEEPSEEK_INK,
+                palette::WHALE_BG,
                 "{w}x{h}: modal interior must be opaque"
             );
 
