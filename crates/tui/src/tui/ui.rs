@@ -54,8 +54,7 @@ use crate::commands;
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::config::{
     ApiProvider, Config, ProviderConfig, ProviderIdentity, ProvidersConfig, UpdateConfig,
-    persist_external_credential_consent_for_at,
-    revoke_external_credential_consent_for_at,
+    persist_external_credential_consent_for_at, revoke_external_credential_consent_for_at,
 };
 use crate::config_ui::{self, ConfigUiMode, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
