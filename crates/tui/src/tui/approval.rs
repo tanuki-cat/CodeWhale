@@ -3395,7 +3395,7 @@ diff --git a/src/b.rs b/src/b.rs
         let lines = render_lines(&view, 100, 12);
         let joined = lines.join("\n");
         assert!(
-            joined.contains("full params"),
+            joined.contains("save ask rule"),
             "selection hint clipped on short card:\n{joined}"
         );
         assert!(

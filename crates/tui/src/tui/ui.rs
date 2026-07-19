@@ -2062,11 +2062,12 @@ async fn fetch_deepseek_balance(
 }
 
 fn should_fetch_deepseek_balance(app: &App) -> bool {
-    app.status_items.contains(&StatusItem::Balance)
-        && matches!(
-            app.api_provider,
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN
-        )
+    // Always fetch balance for DeepSeek providers — it is now shown inline
+    // after the session cost in the status line, not only as a separate chip.
+    matches!(
+        app.api_provider,
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN
+    )
 }
 
 #[allow(clippy::too_many_lines)]

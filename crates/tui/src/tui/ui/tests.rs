@@ -14939,7 +14939,7 @@ fn render_footer_from_with_default_items_leaves_header_owned_facts_out() {
     assert!(props.model.is_empty(), "footer should not repeat model");
     // Tiny but real costs should render instead of disappearing as "$0.00".
     assert!(!props.cost.is_empty());
-    assert_eq!(spans_text(&props.cost), "cost <$0.0001");
+    assert_eq!(spans_text(&props.cost), "<$0.0001");
 }
 
 #[test]
