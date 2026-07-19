@@ -17,6 +17,8 @@ pub use traits::CommandInfo;
 
 // Long-standing public paths that predate the group layout.
 pub use groups::project::share;
+#[cfg(test)]
+pub(crate) use groups::session::rename_with_manager as rename_session_with_manager;
 
 // Voice capture plumbing shared with the hotbar and the UI event loop.
 pub use groups::core::voice;
@@ -309,7 +311,6 @@ mod tests {
     use crate::tui::app::{App, AppAction, SidebarFocus, TuiOptions};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use std::sync::MutexGuard;
     use tempfile::tempdir;
 
     fn create_test_app() -> App {
@@ -433,6 +434,21 @@ mod tests {
     }
 
     #[test]
+    fn transcript_command_is_discoverable_and_opens_live_overlay() {
+        let transcript = command_infos()
+            .into_iter()
+            .find(|cmd| cmd.name == "transcript")
+            .expect("transcript command should exist");
+        assert_eq!(transcript.usage, "/transcript");
+        assert!(transcript.show_in_empty_discovery());
+
+        let mut app = create_test_app();
+        let result = execute("/transcript", &mut app);
+        assert!(!result.is_error);
+        assert!(matches!(result.action, Some(AppAction::OpenLiveTranscript)));
+    }
+
+    #[test]
     fn hf_alias_dispatches_to_concepts_helper() {
         let mut app = create_test_app();
         let result = execute("/huggingface concepts", &mut app);
@@ -441,6 +457,17 @@ mod tests {
         assert!(message.contains("Hugging Face provider route"));
         assert!(message.contains("Hugging Face MCP"));
         assert!(message.contains("Hub workflows"));
+    }
+
+    #[test]
+    fn xai_device_auth_slash_command_starts_login() {
+        let mut app = create_test_app();
+        let result = execute("/auth xai-device", &mut app);
+        assert!(!result.is_error);
+        assert!(matches!(
+            result.action,
+            Some(AppAction::StartXaiDeviceLogin)
+        ));
     }
 
     #[test]
@@ -488,9 +515,9 @@ mod tests {
                 critical_files: vec!["crates/tui/src/commands/mod.rs".to_string()],
                 constraints: vec!["Do not invent verification".to_string()],
                 verification_plan: Some("Check relay prompt assertions".to_string()),
-                handoff_packet: Some("Next thread should read the Work checklist".to_string()),
+                handoff_packet: Some("Next thread should read the To-do list".to_string()),
                 plan: vec![PlanItemArg {
-                    step: "keep checklist primary".to_string(),
+                    step: "keep To-do primary".to_string(),
                     status: StepStatus::InProgress,
                 }],
                 ..UpdatePlanArgs::default()
@@ -516,7 +543,7 @@ mod tests {
         assert!(message.contains("Requested relay focus: verify install"));
         assert!(message.contains("Goal objective: Unify the work surface"));
         assert!(message.contains("Goal token budget: 12000"));
-        assert!(message.contains("Work checklist (primary progress surface, 50% complete)"));
+        assert!(message.contains("To-do (primary progress surface, 50% complete)"));
         assert!(message.contains("#1 [completed] inspect workspace"));
         assert!(message.contains("#2 [in_progress] patch relay command"));
         assert!(message.contains("Optional strategy metadata from update_plan"));
@@ -526,8 +553,12 @@ mod tests {
         assert!(message.contains("Critical file: crates/tui/src/commands/mod.rs"));
         assert!(message.contains("Constraint: Do not invent verification"));
         assert!(message.contains("Verification plan: Check relay prompt assertions"));
-        assert!(message.contains("Handoff packet: Next thread should read the Work checklist"));
-        assert!(message.contains("[in_progress] keep checklist primary"));
+        assert!(message.contains("Handoff packet: Next thread should read the To-do list"));
+        assert!(message.contains("[in_progress] keep To-do primary"));
+        assert!(
+            !message.contains("Work checklist"),
+            "relay copy should use To-do vocabulary: {message}"
+        );
     }
 
     #[test]
@@ -640,9 +671,9 @@ mod tests {
                 has_config = true;
                 assert_eq!(
                     commands.len(),
-                    11,
+                    12,
                     "config group (group-local metadata exception) expected \
-                     exactly 11 commands, got {}",
+                     exactly 12 commands, got {}",
                     commands.len()
                 );
             }
@@ -976,6 +1007,14 @@ mod tests {
         assert_eq!(app.sidebar_focus, SidebarFocus::Tasks);
         assert!(app.status_message.is_none());
 
+        let result = execute("/sidebar activity", &mut app);
+        assert!(!result.is_error);
+        assert_eq!(
+            app.sidebar_focus,
+            SidebarFocus::Tasks,
+            "activity is the user-facing alias for the Activity panel"
+        );
+
         let result = execute("/sidebar off", &mut app);
         assert!(!result.is_error);
         assert_eq!(app.sidebar_focus, SidebarFocus::Hidden);
@@ -1017,6 +1056,12 @@ mod tests {
         for cmd in ["/links", "/dashboard", "/api", "/lianjie"] {
             let result = execute(cmd, &mut app);
             let msg = result.message.expect("links commands should return text");
+            assert!(msg.contains("https://codewhale.net/en/docs"));
+            assert!(msg.contains("https://codewhale.net/en/community"));
+            assert!(msg.contains("https://github.com/Hmbown/CodeWhale"));
+            assert!(msg.contains("https://app.codewhale.net"));
+            assert!(msg.contains("separate sign-in"));
+            assert!(msg.contains("not connected to the current local session"));
             assert!(msg.contains("https://platform.deepseek.com"));
             assert!(result.action.is_none());
         }
@@ -1058,7 +1103,7 @@ mod tests {
 
     struct ConfigPathGuard {
         previous: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl ConfigPathGuard {
@@ -1374,5 +1419,97 @@ mod tests {
         let mut app = create_test_app();
         let result = execute("/help", &mut app);
         assert!(!result.is_error);
+    }
+
+    fn write_test_skill(root: &Path, name: &str) {
+        let skill_dir = root.join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir).expect("skill directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: Test {name} skill\n---\nFollow the test instructions."
+            ),
+        )
+        .expect("skill fixture");
+    }
+
+    #[test]
+    fn task_bearing_skill_invocations_send_the_task_on_the_activated_turn() {
+        for invocation in ["$foo do X", "/foo do X", "/skill foo do X"] {
+            let (mut app, tmpdir, _guard) = create_isolated_test_app();
+            write_test_skill(tmpdir.path(), "foo");
+
+            let result = execute(invocation, &mut app);
+
+            assert!(!result.is_error, "{invocation}: {result:?}");
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("Skill 'foo' activated")),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                matches!(result.action, Some(AppAction::SendMessage(ref task)) if task == "do X"),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                app.active_skill
+                    .as_deref()
+                    .is_some_and(|instruction| instruction.contains("# Skill: foo")),
+                "{invocation} did not arm foo for the dispatched task"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_dollar_skill_still_arms_the_next_message() {
+        let (mut app, tmpdir, _guard) = create_isolated_test_app();
+        write_test_skill(tmpdir.path(), "foo");
+
+        let result = execute("$foo", &mut app);
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.action.is_none());
+        assert!(
+            app.active_skill
+                .as_deref()
+                .is_some_and(|instruction| instruction.contains("# Skill: foo"))
+        );
+    }
+
+    #[test]
+    fn shorthand_can_invoke_a_skill_named_install_without_stealing_management_commands() {
+        for invocation in ["$install do X", "/install do X"] {
+            let (mut app, tmpdir, _guard) = create_isolated_test_app();
+            write_test_skill(tmpdir.path(), "install");
+
+            let result = execute(invocation, &mut app);
+
+            assert!(!result.is_error, "{invocation}: {result:?}");
+            assert!(
+                matches!(result.action, Some(AppAction::SendMessage(ref task)) if task == "do X"),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                app.active_skill
+                    .as_deref()
+                    .is_some_and(|instruction| instruction.contains("# Skill: install")),
+                "{invocation} did not activate the install skill"
+            );
+        }
+
+        let (mut app, tmpdir, _guard) = create_isolated_test_app();
+        write_test_skill(tmpdir.path(), "install");
+        let result = execute("/skill install", &mut app);
+        assert!(result.is_error, "management subcommand should show usage");
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("/skill install"))
+        );
+        assert!(result.action.is_none());
+        assert!(app.active_skill.is_none());
     }
 }

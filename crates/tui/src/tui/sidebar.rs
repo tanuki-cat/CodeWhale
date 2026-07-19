@@ -24,7 +24,9 @@ use ratatui::{
 use crate::deepseek_theme::Theme;
 use crate::palette;
 use crate::tools::plan::StepStatus;
-use crate::tools::subagent::{AgentWorkerStatus, SubAgentStatus, agent_worker_status_name};
+use crate::tools::subagent::{
+    AgentWorkerStatus, SubAgentStatus, agent_worker_status_name, localized_whale_display_names,
+};
 use crate::tools::todo::TodoStatus;
 
 use super::app::{
@@ -51,7 +53,7 @@ const HOTBAR_ROW_COLUMNS: usize = 4;
 pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App, config: &Config) {
     // Clear hover state at the start of each render
     app.sidebar_hover = SidebarHoverState::default();
-    if area.width < 24 || area.height < 8 {
+    if area.width < 20 || area.height < 3 {
         // Paint a styled block over the area so stale cells from a previous
         // (wider) frame don't persist as bleed-through artifacts (#400).
         Block::default()
@@ -67,15 +69,42 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App, config: &Config)
         return;
     }
 
-    let hotbar_enabled = hotbar_panel_enabled(app, config) && !is_hotbar_disabled(config);
+    let work_has_content = sidebar_work_summary(app).has_useful_content();
+    // At compact heights the durable Work state outranks optional Hotbar
+    // chrome. The Hotbar returns automatically after the terminal grows.
+    let hotbar_enabled = hotbar_panel_enabled(app, config)
+        && !is_hotbar_disabled(config)
+        && !(work_has_content && area.height < 12);
     let (main_area, hotbar_area) = split_sidebar_hotbar_area(area, hotbar_enabled);
-    match app.sidebar_focus {
-        SidebarFocus::Auto => render_sidebar_auto(f, main_area, app),
-        SidebarFocus::Pinned => render_sidebar_pinned(f, main_area, app),
-        SidebarFocus::Tasks => render_sidebar_tasks(f, main_area, app),
-        SidebarFocus::Agents => render_sidebar_subagents(f, main_area, app),
-        SidebarFocus::Context => render_context_panel(f, main_area, app),
-        SidebarFocus::Hidden => unreachable!("hidden sidebar returned before render dispatch"),
+    let fixed_focus = matches!(
+        app.sidebar_focus,
+        SidebarFocus::Tasks | SidebarFocus::Agents | SidebarFocus::Context
+    );
+    if fixed_focus && work_has_content {
+        if main_area.height < 7 {
+            render_sidebar_work_compact(f, main_area, app);
+        } else {
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(4)])
+                .split(main_area);
+            match app.sidebar_focus {
+                SidebarFocus::Tasks => render_sidebar_tasks(f, sections[0], app),
+                SidebarFocus::Agents => render_sidebar_subagents(f, sections[0], app),
+                SidebarFocus::Context => render_context_panel(f, sections[0], app),
+                _ => unreachable!("fixed focus was checked above"),
+            }
+            render_sidebar_work_compact(f, sections[1], app);
+        }
+    } else {
+        match app.sidebar_focus {
+            SidebarFocus::Auto => render_sidebar_auto(f, main_area, app),
+            SidebarFocus::Pinned => render_sidebar_pinned(f, main_area, app),
+            SidebarFocus::Tasks => render_sidebar_tasks(f, main_area, app),
+            SidebarFocus::Agents => render_sidebar_subagents(f, main_area, app),
+            SidebarFocus::Context => render_context_panel(f, main_area, app),
+            SidebarFocus::Hidden => unreachable!("hidden sidebar returned before render dispatch"),
+        }
     }
     if let Some(hotbar_area) = hotbar_area {
         render_hotbar_panel(f, hotbar_area, app, config);
@@ -136,10 +165,12 @@ fn render_sidebar_panel_stack(
             Constraint::Min(0),
         ],
         4 => vec![
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Min(6),
+            // Work is first whenever present. Give it a hard compact floor so
+            // Context cannot starve a live To-do after a resize.
+            Constraint::Length(5),
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+            Constraint::Min(3),
         ],
         _ => vec![
             Constraint::Percentage(20),
@@ -265,9 +296,16 @@ fn render_hotbar_panel(f: &mut Frame, area: Rect, app: &mut App, config: &Config
         &title,
         hotbar_panel_lines(&slots, content_width, &app.ui_theme),
         hotbar_panel_hover_texts(&slots),
-        Vec::new(),
+        hotbar_panel_row_actions(),
         app,
     );
+}
+
+fn hotbar_panel_row_actions() -> Vec<Option<SidebarRowAction>> {
+    (1..=codewhale_config::HOTBAR_SLOT_COUNT)
+        .step_by(HOTBAR_ROW_COLUMNS)
+        .map(|slot| Some(SidebarRowAction::HotbarSlot(slot)))
+        .collect()
 }
 
 fn hotbar_panel_enabled(app: &App, config: &Config) -> bool {
@@ -528,6 +566,51 @@ impl SidebarWorkSummary {
         let percent = completed.saturating_mul(100) / self.strategy_steps.len();
         u8::try_from(percent).unwrap_or(u8::MAX)
     }
+
+    fn compact_indicator(&self) -> Option<String> {
+        if !self.checklist_items.is_empty() {
+            return Some(format!(
+                "To-do {} · {}%",
+                self.checklist_items.len(),
+                self.checklist_completion_pct
+            ));
+        }
+        if self.has_strategy() {
+            return Some("Work plan active".to_string());
+        }
+        self.goal_objective
+            .as_ref()
+            .map(|_| "Work goal active".to_string())
+    }
+}
+
+/// Compact Work fallback for surfaces used when the sidebar cannot fit.
+/// Reads the live stores first and only falls back to the last rendered
+/// summary during brief lock contention.
+pub(crate) fn compact_work_indicator(app: &App) -> Option<String> {
+    let todos = app.todos.try_lock().ok().map(|todos| todos.snapshot());
+    if let Some(snapshot) = todos.as_ref().filter(|snapshot| !snapshot.is_empty()) {
+        return Some(format!(
+            "To-do {} · {}%",
+            snapshot.items.len(),
+            snapshot.completion_pct
+        ));
+    }
+
+    let plan = app.plan_state.try_lock().ok().map(|plan| !plan.is_empty());
+    if plan == Some(true) {
+        return Some("Work plan active".to_string());
+    }
+    if app.hunt.quarry.is_some() || app.paused_quarry.is_some() {
+        return Some("Work goal active".to_string());
+    }
+    if todos.is_none() || plan.is_none() {
+        return app
+            .cached_work_summary
+            .as_ref()
+            .and_then(SidebarWorkSummary::compact_indicator);
+    }
+    None
 }
 
 fn should_render_strategy_step(
@@ -809,8 +892,8 @@ fn work_panel_hover_texts(
         let remaining = earlier.saturating_add(later);
         if remaining > 0 && texts.len() < max_rows {
             let mut label = match (earlier, later) {
-                (0, later) => format!("+{later} more checklist items"),
-                (earlier, 0) => format!("+{earlier} earlier checklist items"),
+                (0, later) => format!("+{later} more To-do items"),
+                (earlier, 0) => format!("+{earlier} earlier To-do items"),
                 (earlier, later) => format!("+{earlier} earlier, +{later} later"),
             };
             // Hovering the overflow row reveals the omitted items, since
@@ -1054,8 +1137,8 @@ fn push_work_checklist_lines(
     let remaining = earlier.saturating_add(later);
     if remaining > 0 && lines.len() < max_rows {
         let label = match (earlier, later) {
-            (0, later) => format!("+{later} more checklist items"),
-            (earlier, 0) => format!("+{earlier} earlier checklist items"),
+            (0, later) => format!("+{later} more To-do items"),
+            (earlier, 0) => format!("+{earlier} earlier To-do items"),
             (earlier, later) => format!("+{earlier} earlier, +{later} later"),
         };
         lines.push(Line::from(Span::styled(
@@ -1171,10 +1254,12 @@ fn work_strategy_context_label(summary: &SidebarWorkSummary) -> &'static str {
 }
 
 fn strategy_context_step_prefix(status: &StepStatus) -> &'static str {
+    // Strategy = metadata/context/route (not a second checklist).
+    // Reserve "Phase" for Workflow stages only (#4135).
     match status {
-        StepStatus::Pending => "phase next:",
-        StepStatus::InProgress => "phase now:",
-        StepStatus::Completed => "phase done:",
+        StepStatus::Pending => "route next:",
+        StepStatus::InProgress => "route now:",
+        StepStatus::Completed => "route done:",
     }
 }
 
@@ -1209,6 +1294,41 @@ fn render_sidebar_work(f: &mut Frame, area: Rect, app: &mut App) {
 
     let full_texts = work_panel_hover_texts(&summary, content_width.max(1), usable_rows);
     render_sidebar_section(f, area, "To-do", lines, full_texts, Vec::new(), app);
+}
+
+fn render_sidebar_work_compact(f: &mut Frame, area: Rect, app: &mut App) {
+    let summary = sidebar_work_summary(app);
+    let label = if !summary.checklist_items.is_empty() {
+        let count = summary.checklist_items.len();
+        format!(
+            "{count} item{} · {}%",
+            if count == 1 { "" } else { "s" },
+            summary.checklist_completion_pct
+        )
+    } else if summary.has_strategy() {
+        let (pending, in_progress, completed) = summary.strategy_counts();
+        let total = pending + in_progress + completed;
+        if total == 0 {
+            "plan active".to_string()
+        } else {
+            format!("plan {completed}/{total} · {in_progress} active")
+        }
+    } else if summary.goal_objective.is_some() {
+        "goal active".to_string()
+    } else {
+        "Work state updating...".to_string()
+    };
+    let content_width = area.width.saturating_sub(4) as usize;
+    let line = truncate_line_to_width(&label, content_width.max(1));
+    render_sidebar_section(
+        f,
+        area,
+        "To-do",
+        vec![Line::from(line.clone())],
+        vec![label],
+        Vec::new(),
+        app,
+    );
 }
 
 /// Click actions for one background job row pair (#3028).
@@ -1260,9 +1380,11 @@ fn render_sidebar_tasks(f: &mut Frame, area: Rect, app: &mut App) {
 
     let content_width = area.width.saturating_sub(4) as usize;
     let usable_rows = area.height.saturating_sub(3) as usize;
-    let (lines, row_actions) = task_panel_rows(app, content_width.max(1), usable_rows.max(1));
+    let row_sets = task_panel_row_sets(app);
+    let (lines, row_actions) =
+        task_panel_rows(app, &row_sets, content_width.max(1), usable_rows.max(1));
 
-    let full_texts = task_panel_hover_texts(app, usable_rows.max(1));
+    let full_texts = task_panel_hover_texts(app, &row_sets, usable_rows.max(1));
     // #4147: This panel renders live tools / background jobs, not durable task
     // state, so the user-facing label is "Activity" to match its contents and
     // avoid colliding with durable tasks. The internal identifiers keep the
@@ -1278,9 +1400,40 @@ struct SidebarToolRow {
     duration_ms: Option<u64>,
 }
 
+/// Row sets shared by the Tasks panel line renderer and hover-text builder.
+///
+/// Computed once per frame in `render_sidebar_tasks` (#3898): both consumers
+/// previously recomputed `active_tool_rows` / `background_task_rows` (a
+/// clone+sort of `app.task_panel`) independently,
+/// doubling the work and risking the two passes disagreeing across an
+/// `Instant::elapsed` TTL boundary within the same frame.
+struct TaskPanelRowSets {
+    active: Vec<SidebarToolRow>,
+    background: Vec<TaskPanelEntry>,
+    recent: Vec<SidebarToolRow>,
+}
+
+fn task_panel_row_sets(app: &App) -> TaskPanelRowSets {
+    let explicit_tasks_focus = app.sidebar_focus == SidebarFocus::Tasks;
+    let active = active_tool_rows(app);
+    // Auto/Pinned mode deliberately skips live-tool dedup (passes an empty
+    // slice), matching the previous per-consumer call sites.
+    let background = background_task_rows(app, if explicit_tasks_focus { &active } else { &[] });
+    let recent = if explicit_tasks_focus {
+        recent_tool_rows(app, 4)
+    } else {
+        Vec::new()
+    };
+    TaskPanelRowSets {
+        active,
+        background,
+        recent,
+    }
+}
+
 #[cfg(test)]
 fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Line<'static>> {
-    task_panel_rows(app, content_width, max_rows).0
+    task_panel_rows(app, &task_panel_row_sets(app), content_width, max_rows).0
 }
 
 /// Build the Activity panel lines together with a parallel per-line click-action
@@ -1288,6 +1441,7 @@ fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Lin
 /// aligned with the rendered lines no matter how the layout evolves.
 fn task_panel_rows(
     app: &App,
+    row_sets: &TaskPanelRowSets,
     content_width: usize,
     max_rows: usize,
 ) -> (Vec<Line<'static>>, Vec<Option<SidebarRowAction>>) {
@@ -1316,26 +1470,13 @@ fn task_panel_rows(
         )));
     }
 
-    let active_rows = active_tool_rows(app);
+    let active_rows = &row_sets.active;
     if explicit_tasks_focus && !active_rows.is_empty() && lines.len() < max_rows {
         push_sidebar_label_theme(&mut lines, "Live tools", theme);
-        push_tool_rows(&mut lines, &active_rows, content_width, max_rows, theme);
+        push_tool_rows(&mut lines, active_rows, content_width, max_rows, theme);
     }
 
-    let reasoning_rows = reasoning_task_rows(app);
-    if explicit_tasks_focus && !reasoning_rows.is_empty() && lines.len() < max_rows {
-        push_sidebar_label_theme(&mut lines, "Model reasoning", theme);
-        push_reasoning_rows(&mut lines, &reasoning_rows, content_width, max_rows, theme);
-    }
-
-    let background_rows = background_task_rows(
-        app,
-        if explicit_tasks_focus {
-            &active_rows
-        } else {
-            &[]
-        },
-    );
+    let background_rows = &row_sets.background;
     // Lines pushed so far (turn label, Live tools header, live tool rows)
     // are not clickable — backfill their action slots.
     actions.resize(lines.len(), None);
@@ -1377,7 +1518,7 @@ fn task_panel_rows(
                 .map(format_duration_ms)
                 .unwrap_or_else(|| "-".to_string());
             let (label, detail) = background_task_labels(task, &duration);
-            let label = background_task_spinner_prefix(task)
+            let label = background_task_spinner_prefix(task, app.low_motion)
                 .map(|prefix| format!("{prefix} {label}"))
                 .unwrap_or(label);
             let (show_action, detail_action) = background_task_click_actions(task);
@@ -1434,10 +1575,10 @@ fn task_panel_rows(
     }
 
     if explicit_tasks_focus && lines.len() < max_rows {
-        let recent_rows = recent_tool_rows(app, 4);
+        let recent_rows = &row_sets.recent;
         if !recent_rows.is_empty() {
             push_sidebar_label_theme(&mut lines, "Recent tools", theme);
-            push_tool_rows(&mut lines, &recent_rows, content_width, max_rows, theme);
+            push_tool_rows(&mut lines, recent_rows, content_width, max_rows, theme);
         }
     }
 
@@ -1458,7 +1599,6 @@ fn task_panel_rows(
         || (lines.len() == 1
             && app.runtime_turn_id.is_some()
             && active_rows.is_empty()
-            && reasoning_rows.is_empty()
             && background_rows.is_empty())
     {
         lines.push(Line::from(Span::styled(
@@ -1473,7 +1613,7 @@ fn task_panel_rows(
     (lines, actions)
 }
 
-fn task_panel_hover_texts(app: &App, max_rows: usize) -> Vec<String> {
+fn task_panel_hover_texts(app: &App, row_sets: &TaskPanelRowSets, max_rows: usize) -> Vec<String> {
     let mut texts = Vec::with_capacity(max_rows.max(4));
     let explicit_tasks_focus = app.sidebar_focus == SidebarFocus::Tasks;
 
@@ -1482,26 +1622,13 @@ fn task_panel_hover_texts(app: &App, max_rows: usize) -> Vec<String> {
         texts.push(format!("turn {turn_id} ({status})"));
     }
 
-    let active_rows = active_tool_rows(app);
+    let active_rows = &row_sets.active;
     if explicit_tasks_focus && !active_rows.is_empty() && texts.len() < max_rows {
         texts.push("Live tools".to_string());
-        push_tool_row_hover_texts(&mut texts, &active_rows, max_rows);
+        push_tool_row_hover_texts(&mut texts, active_rows, max_rows);
     }
 
-    let reasoning_rows = reasoning_task_rows(app);
-    if explicit_tasks_focus && !reasoning_rows.is_empty() && texts.len() < max_rows {
-        texts.push("Model reasoning".to_string());
-        push_reasoning_row_hover_texts(&mut texts, &reasoning_rows, max_rows);
-    }
-
-    let background_rows = background_task_rows(
-        app,
-        if explicit_tasks_focus {
-            &active_rows
-        } else {
-            &[]
-        },
-    );
+    let background_rows = &row_sets.background;
     if !background_rows.is_empty() && texts.len() < max_rows {
         let running = background_rows
             .iter()
@@ -1524,7 +1651,7 @@ fn task_panel_hover_texts(app: &App, max_rows: usize) -> Vec<String> {
                 .map(format_duration_ms)
                 .unwrap_or_else(|| "-".to_string());
             let (label, detail) = background_task_labels(task, &duration);
-            let label = background_task_spinner_prefix(task)
+            let label = background_task_spinner_prefix(task, app.low_motion)
                 .map(|prefix| format!("{prefix} {label}"))
                 .unwrap_or(label);
             texts.push(label);
@@ -1553,10 +1680,10 @@ fn task_panel_hover_texts(app: &App, max_rows: usize) -> Vec<String> {
     }
 
     if explicit_tasks_focus && texts.len() < max_rows {
-        let recent_rows = recent_tool_rows(app, 4);
+        let recent_rows = &row_sets.recent;
         if !recent_rows.is_empty() {
             texts.push("Recent tools".to_string());
-            push_tool_row_hover_texts(&mut texts, &recent_rows, max_rows);
+            push_tool_row_hover_texts(&mut texts, recent_rows, max_rows);
         }
     }
 
@@ -1571,7 +1698,6 @@ fn task_panel_hover_texts(app: &App, max_rows: usize) -> Vec<String> {
         || (texts.len() == 1
             && app.runtime_turn_id.is_some()
             && active_rows.is_empty()
-            && reasoning_rows.is_empty()
             && background_rows.is_empty())
     {
         texts.push("No live tools or background jobs".to_string());
@@ -1601,69 +1727,6 @@ fn push_tool_row_hover_texts(texts: &mut Vec<String>, rows: &[SidebarToolRow], m
         texts.push(label);
         if !row.summary.trim().is_empty() && texts.len() < max_rows {
             texts.push(format!("  {}", row.summary));
-        }
-    }
-}
-
-fn push_reasoning_rows(
-    lines: &mut Vec<Line<'static>>,
-    rows: &[TaskPanelEntry],
-    content_width: usize,
-    max_rows: usize,
-    theme: &palette::UiTheme,
-) {
-    for task in rows {
-        if lines.len() >= max_rows {
-            break;
-        }
-        let color = match task.status.as_str() {
-            "running" => theme.warning,
-            "completed" => theme.success,
-            "failed" => theme.error_fg,
-            _ => theme.text_muted,
-        };
-        let duration = task
-            .duration_ms
-            .map(format_duration_ms)
-            .unwrap_or_else(|| "-".to_string());
-        lines.push(Line::from(Span::styled(
-            truncate_line_to_width(
-                &format!("thinking {} {duration}", task.status),
-                content_width,
-            ),
-            Style::default().fg(color),
-        )));
-        if !task.prompt_summary.trim().is_empty() && lines.len() < max_rows {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  {}",
-                    truncate_line_to_width(
-                        &task.prompt_summary,
-                        content_width.saturating_sub(2).max(1)
-                    )
-                ),
-                Style::default().fg(theme.text_dim),
-            )));
-        }
-    }
-}
-
-fn push_reasoning_row_hover_texts(
-    texts: &mut Vec<String>,
-    rows: &[TaskPanelEntry],
-    max_rows: usize,
-) {
-    for task in rows {
-        if texts.len() >= max_rows {
-            break;
-        }
-        let duration = task
-            .duration_ms
-            .map(format_duration_ms)
-            .unwrap_or_else(|| "-".to_string());
-        texts.push(format!("thinking {} {duration}", task.status));
-        if !task.prompt_summary.trim().is_empty() && texts.len() < max_rows {
-            texts.push(format!("  {}", task.prompt_summary));
         }
     }
 }
@@ -1714,13 +1777,13 @@ fn background_task_is_live(task: &TaskPanelEntry) -> bool {
         && matches!(task.status.as_str(), "queued" | "running")
 }
 
-fn background_task_spinner_prefix(task: &TaskPanelEntry) -> Option<&'static str> {
+fn background_task_spinner_prefix(task: &TaskPanelEntry, low_motion: bool) -> Option<&'static str> {
     if task.status != "running" {
         return None;
     }
     Some(braille_spinner_frame_for_duration_ms(
         task.duration_ms.unwrap_or_default(),
-        false,
+        low_motion,
     ))
 }
 
@@ -2096,17 +2159,6 @@ fn background_task_rows(app: &App, active_rows: &[SidebarToolRow]) -> Vec<TaskPa
         .iter()
         .filter(|task| task.kind == TaskPanelEntryKind::Background)
         .filter(|task| !background_task_duplicates_live_tool(task, active_rows))
-        .cloned()
-        .collect();
-    rows.sort_by_key(|task| (task_status_rank(task.status.as_str()), task.id.clone()));
-    rows
-}
-
-fn reasoning_task_rows(app: &App) -> Vec<TaskPanelEntry> {
-    let mut rows: Vec<TaskPanelEntry> = app
-        .task_panel
-        .iter()
-        .filter(|task| task.kind == TaskPanelEntryKind::ModelReasoning)
         .cloned()
         .collect();
     rows.sort_by_key(|task| (task_status_rank(task.status.as_str()), task.id.clone()));
@@ -2555,6 +2607,17 @@ fn foreground_rlm_running(app: &App) -> bool {
 }
 
 fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
+    let cached_ids: std::collections::HashSet<&str> = app
+        .subagent_cache
+        .iter()
+        .map(|agent| agent.agent_id.as_str())
+        .collect();
+    let display_names = localized_whale_display_names(
+        app.subagent_cache
+            .iter()
+            .map(|agent| (agent.agent_id.as_str(), agent.nickname.as_deref())),
+        app.ui_locale.tag(),
+    );
     let mut rows: Vec<SidebarAgentRow> = app
         .subagent_cache
         .iter()
@@ -2570,12 +2633,11 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
                         .map(summarize_tool_output)
                         .filter(|summary| !summary.trim().is_empty())
                 });
-            // #3030: Prefer the user-assigned nickname > stable label
-            // ("Agent 1") > raw name. Every spawned agent gets a label-map
-            // entry, so the generated label must not shadow nicknames.
-            let display_name = agent
-                .nickname
-                .clone()
+            // Generated whales are locale-derived from the neutral agent id;
+            // never replay a persisted label from another language.
+            let display_name = display_names
+                .get(&agent.agent_id)
+                .cloned()
                 .or_else(|| app.agent_label_map.get(&agent.agent_id).cloned())
                 .unwrap_or_else(|| agent.name.clone());
             SidebarAgentRow {
@@ -2601,17 +2663,14 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
         })
         .collect();
 
-    let cached_ids: std::collections::HashSet<&str> = app
-        .subagent_cache
-        .iter()
-        .map(|agent| agent.agent_id.as_str())
-        .collect();
     rows.extend(
         app.agent_progress
             .iter()
             .filter(|(id, _)| !cached_ids.contains(id.as_str()))
             .map(|(id, progress)| {
-                // #3030: Prefer stable label for progress-only agents too.
+                // Progress-only rows do not carry a generated whale name yet;
+                // keep their existing stable Agent-N placeholder until the
+                // manager snapshot arrives.
                 let display_name = app
                     .agent_label_map
                     .get(id.as_str())
@@ -2666,28 +2725,36 @@ fn sort_sidebar_agent_rows_as_tree(rows: Vec<SidebarAgentRow>) -> Vec<SidebarAge
         rows: &[SidebarAgentRow],
         children: &std::collections::HashMap<String, Vec<usize>>,
         seen: &mut std::collections::HashSet<usize>,
-        out: &mut Vec<SidebarAgentRow>,
+        order: &mut Vec<usize>,
     ) {
         if !seen.insert(idx) {
             return;
         }
-        out.push(rows[idx].clone());
+        order.push(idx);
         if let Some(child_indices) = children.get(&rows[idx].id) {
             for child_idx in child_indices {
-                push_tree(*child_idx, rows, children, seen, out);
+                push_tree(*child_idx, rows, children, seen, order);
             }
         }
     }
 
-    let mut out = Vec::with_capacity(rows.len());
+    let mut order = Vec::with_capacity(rows.len());
     let mut seen = std::collections::HashSet::new();
     for idx in roots {
-        push_tree(idx, &rows, &children, &mut seen, &mut out);
+        push_tree(idx, &rows, &children, &mut seen, &mut order);
     }
     for idx in 0..rows.len() {
-        push_tree(idx, &rows, &children, &mut seen, &mut out);
+        push_tree(idx, &rows, &children, &mut seen, &mut order);
     }
-    out
+
+    // Materialize by move instead of cloning each row a second time (#3898):
+    // `seen` guarantees every index lands in `order` exactly once, so each
+    // slot is taken exactly once and no row is dropped.
+    let mut slots: Vec<Option<SidebarAgentRow>> = rows.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|idx| slots[idx].take().expect("each row emitted exactly once"))
+        .collect()
 }
 
 fn subagent_status_text(status: &SubAgentStatus) -> &'static str {
@@ -2769,12 +2836,12 @@ fn indented_detail_line(indent: &str, body: &str, content_width: usize) -> Strin
     )
 }
 
-/// #4094: reference to a worker's full output transcript, surfaced as a
+/// #4094: reference to a worker's transcript projection, surfaced as a
 /// `handle_read` handle instead of dumping the (possibly huge) transcript
 /// inline — the inline dump is the freeze/emptiness risk this issue tracks.
 /// The child transcript is addressable as the `agent:<id>/full_transcript` var
-/// handle (see `subagent_session_projection`), so the panel hands the user a
-/// copyable reference to the fuller artifact rather than the bytes themselves.
+/// handle (see `subagent_session_projection`); its JSON names the private
+/// complete artifact, while clicking Open loads that artifact directly.
 ///
 /// Returns `None` for workers that have not produced anything inspectable yet,
 /// so an empty transcript is never advertised. This is the one place a raw
@@ -2947,10 +3014,10 @@ fn subagent_panel_rows(
             agent_id: row.id.clone(),
         }));
 
-        // #4094: hand the user a copyable handle to the worker's *full* output
-        // transcript instead of dumping it inline — the inline dump is this
-        // issue's freeze/emptiness risk. The bounded dossier above is the
-        // preview; this is the "inspect/copy more" affordance the AC calls for.
+        // #4094: hand the user a copyable bounded projection instead of
+        // dumping the transcript inline — the inline dump is this issue's
+        // freeze/emptiness risk. Clicking the row opens the complete private
+        // artifact; handle_read exposes bounded slices and its artifact path.
         // Guarded by `max_rows` so the panel stays bounded, and width-clamped so
         // narrow terminals never overflow.
         if let Some(handle) = subagent_output_handle(row) {
@@ -2960,7 +3027,7 @@ fn subagent_panel_rows(
             lines.push(Line::from(Span::styled(
                 indented_detail_line(
                     "  ",
-                    &format!("\u{25B8} full output \u{00B7} handle_read {handle}"),
+                    &format!("\u{25B8} complete chat: open \u{00B7} handle_read {handle}"),
                     content_width.max(1),
                 ),
                 Style::default().fg(theme.text_muted),
@@ -3273,25 +3340,40 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn context_panel_cost_line(app: &App) -> String {
     let displayed_total = app.displayed_session_cost_for_currency(app.cost_currency);
-    if displayed_total == 0.0 && !crate::pricing::has_pricing_for_model(&app.model) {
-        return format!("cost: n/a (no pricing data for {})", app.model);
-    }
-
-    let session_cost = app.session_cost_for_currency(app.cost_currency);
-    let agent_cost = app.subagent_cost_for_currency(app.cost_currency);
-    let real_total = session_cost + agent_cost;
-    // Only show the additive breakdown when it matches the displayed
-    // total; when the high-water mark is in effect (post-reconciliation),
-    // the breakdown would not sum to the displayed value (#244).
-    if (displayed_total - real_total).abs() < COST_EQ_TOLERANCE {
-        format!(
-            "cost: {} (session {} + agents {})",
-            app.format_cost_amount(displayed_total),
-            app.format_cost_amount(session_cost),
-            app.format_cost_amount(agent_cost)
-        )
-    } else {
-        format!("cost: {}", app.format_cost_amount(displayed_total))
+    let chip = crate::route_billing::usage_chip(
+        app.billing_presentation,
+        app.api_provider,
+        &app.model,
+        displayed_total,
+        app.cost_display_currency(app.cost_currency),
+        None,
+    );
+    match &chip {
+        crate::route_billing::UsageChip::Money(_)
+            if crate::route_billing::has_priced_metered_basis(
+                app.billing_presentation,
+                app.api_provider,
+                &app.model,
+            ) =>
+        {
+            let session_cost = app.session_cost_for_currency(app.cost_currency);
+            let agent_cost = app.subagent_cost_for_currency(app.cost_currency);
+            let real_total = session_cost + agent_cost;
+            // Only show the additive breakdown when it matches the displayed
+            // total; when the high-water mark is in effect (post-reconciliation),
+            // the breakdown would not sum to the displayed value (#244).
+            if (displayed_total - real_total).abs() < COST_EQ_TOLERANCE {
+                format!(
+                    "cost: {} (session {} + agents {})",
+                    app.format_cost_amount(displayed_total),
+                    app.format_cost_amount(session_cost),
+                    app.format_cost_amount(agent_cost)
+                )
+            } else {
+                crate::route_billing::format_usage_line(&chip)
+            }
+        }
+        _ => crate::route_billing::format_usage_line(&chip),
     }
 }
 
@@ -3451,8 +3533,11 @@ fn agent_stop_action_for_click(action: &SidebarRowAction) -> Option<SidebarRowAc
             agent_id: agent_id.clone(),
         }),
         SidebarRowAction::Command(_)
+        | SidebarRowAction::PrefillCommand(_)
+        | SidebarRowAction::HotbarSlot(_)
         | SidebarRowAction::OpenAgentDetail { .. }
-        | SidebarRowAction::CancelAgent { .. } => None,
+        | SidebarRowAction::CancelAgent { .. }
+        | SidebarRowAction::InspectText { .. } => None,
     }
 }
 
@@ -3469,8 +3554,8 @@ mod tests {
         normalize_activity_text, render_sidebar, sidebar_agent_rows, sidebar_hover_rows,
         sidebar_work_summary, sort_sidebar_agent_rows_as_tree, subagent_output_handle,
         subagent_panel_hover_texts, subagent_panel_lines, subagent_panel_rows,
-        task_panel_hover_texts, task_panel_lines, task_panel_rows, work_panel_empty_hint,
-        work_panel_hover_texts, work_panel_lines,
+        task_panel_hover_texts, task_panel_lines, task_panel_row_sets, task_panel_rows,
+        work_panel_empty_hint, work_panel_hover_texts, work_panel_lines,
     };
     use crate::config::Config;
     use crate::localization::Locale;
@@ -3486,7 +3571,7 @@ mod tests {
     use crate::tui::history::{
         ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolStatus,
     };
-    use crate::tui::spinner::BRAILLE_SPINNER_FRAME_MS;
+    use crate::tui::spinner::{BRAILLE_SPINNER_FRAME_MS, LIVE_MARKER_DELAY_MS, LIVE_STATIC_MARKER};
     use ratatui::{Terminal, backend::TestBackend, text::Line};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -3545,17 +3630,45 @@ mod tests {
     fn context_panel_cost_line_shows_na_for_unpriced_zero_cost_model() {
         let mut app = create_test_app();
         app.model = "unknown-provider/unknown-model".to_string();
+        app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
 
-        assert_eq!(
-            context_panel_cost_line(&app),
-            "cost: n/a (no pricing data for unknown-provider/unknown-model)"
-        );
+        assert_eq!(context_panel_cost_line(&app), "cost: unknown");
+    }
+
+    #[test]
+    fn context_panel_cost_line_does_not_inherit_api_pricing_for_codex_oauth() {
+        let mut app = create_test_app();
+        app.api_provider = crate::config::ApiProvider::OpenaiCodex;
+        app.model = "gpt-5.5".to_string();
+        app.billing_presentation =
+            crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
+        app.accrue_session_cost_estimate(crate::pricing::CostEstimate::usd_only(12.34));
+
+        let line = context_panel_cost_line(&app);
+        assert_eq!(line, "usage: Codex OAuth quota");
+        assert!(!line.contains('$'), "OAuth must not invent dollars: {line}");
+    }
+
+    #[test]
+    fn context_panel_cost_line_marks_unpriced_metered_as_unknown() {
+        let mut app = create_test_app();
+        app.api_provider = crate::config::ApiProvider::NvidiaNim;
+        app.model = "deepseek-ai/deepseek-v4-pro".to_string();
+        app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
+
+        assert_eq!(context_panel_cost_line(&app), "cost: unknown");
     }
 
     #[test]
     fn context_panel_cost_line_uses_usd_for_usd_only_model_in_cny_mode() {
         let mut app = create_test_app();
         app.model = "kimi-k2.6".to_string();
+        // This test is about METERED currency rendering; pin the route class
+        // and a metered provider so the session default (which may be a
+        // subscription/OAuth route with no API pricing basis) cannot change
+        // what is under test (TUI-DOG-010).
+        app.api_provider = crate::config::ApiProvider::Moonshot;
+        app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
         app.cost_currency = crate::pricing::CostCurrency::Cny;
         app.accrue_session_cost_estimate(crate::pricing::CostEstimate::usd_only(0.42));
 
@@ -3697,6 +3810,17 @@ mod tests {
                 .iter()
                 .all(|slot| slot.state == HotbarSlotState::Empty),
             "fresh config resolves to no bound slots"
+        );
+    }
+
+    #[test]
+    fn hotbar_rows_register_one_typed_action_per_rendered_row() {
+        assert_eq!(
+            super::hotbar_panel_row_actions(),
+            vec![
+                Some(SidebarRowAction::HotbarSlot(1)),
+                Some(SidebarRowAction::HotbarSlot(5)),
+            ]
         );
     }
 
@@ -3915,6 +4039,104 @@ mod tests {
     }
 
     #[test]
+    fn nonempty_todo_remains_visible_across_release_sizes_and_focuses() {
+        // These sidebar widths are the actual splits produced by 120, 100,
+        // and 80-column terminals (the compact 80-column case is 20 wide).
+        for (sidebar_width, height) in [(33, 32), (28, 30), (20, 24)] {
+            for focus in [
+                SidebarFocus::Auto,
+                SidebarFocus::Pinned,
+                SidebarFocus::Tasks,
+                SidebarFocus::Agents,
+                SidebarFocus::Context,
+            ] {
+                let mut app = create_test_app();
+                app.sidebar_focus = focus;
+                {
+                    let mut todos = app.todos.try_lock().expect("todos lock");
+                    todos.add("inspect".to_string(), TodoStatus::Completed);
+                    todos.add("patch".to_string(), TodoStatus::InProgress);
+                }
+                let config = Config {
+                    hotbar: Some(Vec::new()),
+                    ..Config::default()
+                };
+                let backend = TestBackend::new(sidebar_width, height);
+                let mut terminal = Terminal::new(backend).expect("terminal");
+                terminal
+                    .draw(|frame| render_sidebar(frame, frame.area(), &mut app, &config))
+                    .expect("draw sidebar");
+                let rendered = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+
+                assert!(
+                    rendered.contains("To-do"),
+                    "To-do title missing at {sidebar_width}x{height} in {focus:?}: {rendered:?}"
+                );
+                assert!(
+                    rendered.contains("patch") || rendered.contains("2 items"),
+                    "neither full nor compact To-do state rendered at {sidebar_width}x{height} in {focus:?}: {rendered:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_is_the_only_focus_that_suppresses_nonempty_todo() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Hidden;
+        app.todos
+            .try_lock()
+            .expect("todos lock")
+            .add("hidden explicitly".to_string(), TodoStatus::InProgress);
+        let backend = TestBackend::new(20, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, frame.area(), &mut app, &Config::default()))
+            .expect("draw sidebar");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("To-do"));
+    }
+
+    #[test]
+    fn compact_metadata_only_plan_reports_active_without_zero_counts() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Agents;
+        app.plan_state
+            .try_lock()
+            .expect("plan lock")
+            .update(crate::tools::plan::UpdatePlanArgs {
+                objective: Some("metadata-only release plan".to_string()),
+                ..crate::tools::plan::UpdatePlanArgs::default()
+            });
+        let backend = TestBackend::new(20, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, frame.area(), &mut app, &Config::default()))
+            .expect("draw sidebar");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("plan active"), "{rendered:?}");
+        assert!(!rendered.contains("0/0"), "{rendered:?}");
+    }
+
+    #[test]
     fn pinned_sidebar_renders_agents_section_when_subagents_are_active() {
         let mut app = create_test_app();
         app.ui_locale = Locale::En;
@@ -4031,20 +4253,20 @@ mod tests {
         );
         assert!(
             text.iter()
-                .any(|line| line.contains("phase done: Simplify sidebar")),
-            "completed strategy steps should render as phase context: {text:?}"
+                .any(|line| line.contains("route done: Simplify sidebar")),
+            "completed strategy steps should render as route context: {text:?}"
         );
         assert!(
             text.iter()
-                .any(|line| line.contains("phase next: Update prompts")),
-            "pending strategy steps should render as phase context: {text:?}"
+                .any(|line| line.contains("route next: Update prompts")),
+            "pending strategy steps should render as route context: {text:?}"
         );
         assert!(
             !text
                 .iter()
                 .any(|line| line.contains("[✓] Simplify sidebar"))
                 && !text.iter().any(|line| line.contains("[ ] Update prompts")),
-            "strategy rows must not look like a second checklist when Work checklist exists: {text:?}"
+            "strategy rows must not look like a second To-do when To-do items exist: {text:?}"
         );
     }
 
@@ -4082,14 +4304,14 @@ mod tests {
         assert!(
             hover
                 .iter()
-                .any(|line| line.contains("phase done: Map phase boundaries")),
-            "hover strategy rows should be phase context: {hover:?}"
+                .any(|line| line.contains("route done: Map phase boundaries")),
+            "hover strategy rows should be route context: {hover:?}"
         );
         assert!(
             hover
                 .iter()
-                .any(|line| line.contains("phase now: Implement counted work")),
-            "hover should expose the active strategy phase without checklist markers: {hover:?}"
+                .any(|line| line.contains("route now: Implement counted work")),
+            "hover should expose the active strategy route without To-do markers: {hover:?}"
         );
         assert!(
             !hover
@@ -4149,15 +4371,15 @@ mod tests {
             assert!(
                 rendered
                     .iter()
-                    .any(|line| line.contains("phase done: Completed context")),
+                    .any(|line| line.contains("route done: Completed context")),
                 "completed strategy context may still render: {rendered:?}"
             );
             assert!(
-                !rendered.iter().any(|line| line.contains("phase now:")),
+                !rendered.iter().any(|line| line.contains("route now:")),
                 "stale in-progress strategy must not render as active work: {rendered:?}"
             );
             assert!(
-                !rendered.iter().any(|line| line.contains("phase next:")),
+                !rendered.iter().any(|line| line.contains("route next:")),
                 "stale pending strategy must not render as upcoming work: {rendered:?}"
             );
         }
@@ -4432,6 +4654,86 @@ mod tests {
     }
 
     #[test]
+    fn workflow_vocab_avoids_dual_meanings_in_work_and_activity_copy() {
+        // #4135 copy audit: To-do / Strategy / Phase / Activity stay distinct.
+        assert_eq!(
+            super::strategy_context_step_prefix(&StepStatus::Pending),
+            "route next:"
+        );
+        assert_eq!(
+            super::strategy_context_step_prefix(&StepStatus::InProgress),
+            "route now:"
+        );
+        assert_eq!(
+            super::strategy_context_step_prefix(&StepStatus::Completed),
+            "route done:"
+        );
+        for prefix in ["route next:", "route now:", "route done:"] {
+            assert!(
+                !prefix.contains("phase"),
+                "Strategy route prefixes must not reuse Workflow Phase vocabulary: {prefix}"
+            );
+        }
+
+        let summary = SidebarWorkSummary {
+            checklist_completion_pct: 10,
+            checklist_items: (1..=6)
+                .map(|id| SidebarWorkChecklistItem {
+                    id,
+                    content: format!("Item {id}"),
+                    status: if id == 1 {
+                        TodoStatus::InProgress
+                    } else {
+                        TodoStatus::Pending
+                    },
+                })
+                .collect(),
+            strategy_steps: vec![SidebarWorkStrategyStep {
+                text: "Approach".to_string(),
+                status: StepStatus::Pending,
+                elapsed: String::new(),
+            }],
+            ..SidebarWorkSummary::default()
+        };
+        let text = lines_to_text(&work_panel_lines(
+            &summary,
+            40,
+            4,
+            PaletteMode::Dark,
+            &palette::UI_THEME,
+        ));
+        let joined = text.join("\n");
+        assert!(
+            joined.contains("To-do items") || !joined.contains("checklist items"),
+            "To-do overflow must not say checklist: {text:?}"
+        );
+        assert!(
+            !joined.contains("phase next:")
+                && !joined.contains("phase now:")
+                && !joined.contains("phase done:"),
+            "Strategy context must not use Phase labels: {text:?}"
+        );
+        assert!(
+            joined.contains("route next:") || joined.contains("Strategy context"),
+            "Strategy context should use route prefixes under To-do: {text:?}"
+        );
+
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
+        let activity = lines_to_text(&task_panel_lines(&app, 48, 4));
+        assert!(
+            activity
+                .iter()
+                .any(|line| line.contains("No live tools or background jobs")),
+            "Activity empty state should describe live activity: {activity:?}"
+        );
+        assert!(
+            !activity.iter().any(|line| line.contains("No active tasks")),
+            "Activity must not reuse durable Tasks wording: {activity:?}"
+        );
+    }
+
+    #[test]
     fn tasks_panel_renders_active_tool_rows_before_background_empty_state() {
         let mut app = create_test_app();
         app.sidebar_focus = SidebarFocus::Tasks;
@@ -4569,6 +4871,98 @@ mod tests {
     }
 
     #[test]
+    fn task_panel_row_sets_dedup_background_only_when_tasks_focused() {
+        let mut app = create_test_app();
+        let mut active = ActiveCell::new();
+        active.push_tool(
+            "tool-1",
+            HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                name: "rlm_search".to_string(),
+                status: ToolStatus::Running,
+                input_summary: Some("scanning workspace".to_string()),
+                output: None,
+                prompts: None,
+                spillover_path: None,
+                output_summary: None,
+                is_diff: false,
+            })),
+        );
+        app.active_cell = Some(active);
+        app.task_panel.push(TaskPanelEntry {
+            id: "rlm-123".to_string(),
+            status: "running".to_string(),
+            prompt_summary: "RLM: scanning workspace".to_string(),
+            duration_ms: Some(1_000),
+            kind: TaskPanelEntryKind::Background,
+            stale: false,
+            elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+        });
+
+        app.sidebar_focus = SidebarFocus::Tasks;
+        let focused = task_panel_row_sets(&app);
+        assert!(
+            focused.background.is_empty(),
+            "Tasks focus dedups background jobs against live tools: {:?}",
+            focused.background
+        );
+
+        app.sidebar_focus = SidebarFocus::Auto;
+        let auto = task_panel_row_sets(&app);
+        assert_eq!(
+            auto.background.len(),
+            1,
+            "Auto mode keeps background jobs even when a live tool matches"
+        );
+    }
+
+    #[test]
+    fn task_panel_rows_and_hover_share_one_snapshot() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
+        app.runtime_turn_id = Some("turn_abcdef123456".to_string());
+        app.runtime_turn_status = Some("in_progress".to_string());
+        app.turn_counter = 3;
+        app.task_panel.push(TaskPanelEntry {
+            id: "job_123".to_string(),
+            status: "running".to_string(),
+            prompt_summary: "shell: cargo test --workspace".to_string(),
+            duration_ms: Some(12_000),
+            kind: TaskPanelEntryKind::Background,
+            stale: false,
+            elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+        });
+
+        let row_sets = task_panel_row_sets(&app);
+        let (lines, actions) = task_panel_rows(&app, &row_sets, 80, 12);
+        let hover = task_panel_hover_texts(&app, &row_sets, 12);
+        let text = lines_to_text(&lines);
+
+        assert_eq!(lines.len(), actions.len(), "actions align with lines");
+        let job_idx = text
+            .iter()
+            .position(|line| line.contains("Bash running"))
+            .unwrap_or_else(|| panic!("bash job row missing: {text:?}"));
+        assert!(
+            hover[job_idx].contains("cargo test --workspace"),
+            "hover text at the job row index carries the full command: {hover:?}"
+        );
+        assert!(
+            text[0].starts_with("Turn 3"),
+            "line shows stable turn label: {:?}",
+            text[0]
+        );
+        assert!(
+            hover[0].contains("turn_abcdef123456"),
+            "hover carries the full turn id: {:?}",
+            hover[0]
+        );
+    }
+
+    #[test]
     fn tasks_panel_collapses_stale_running_tool_rows() {
         let mut app = create_test_app();
         app.sidebar_focus = SidebarFocus::Tasks;
@@ -4664,6 +5058,7 @@ mod tests {
     #[test]
     fn tasks_panel_puts_background_shell_command_on_primary_row() {
         let mut app = create_test_app();
+        app.low_motion = false;
         app.task_panel.push(TaskPanelEntry {
             id: "shell_33a08c3c".to_string(),
             status: "running".to_string(),
@@ -4685,10 +5080,8 @@ mod tests {
             "background shell headline should show the command, not only the shell id: {text:?}"
         );
         assert!(
-            text.iter().any(|line| line.contains(&format!(
-                "{} Bash running",
-                crate::tui::spinner::BRAILLE_SPINNER_FRAMES[0]
-            ))),
+            text.iter()
+                .any(|line| line.contains(&format!("{} Bash running", LIVE_STATIC_MARKER))),
             "running background shell should show a braille spinner prefix: {text:?}"
         );
         assert!(
@@ -4739,59 +5132,33 @@ mod tests {
         };
 
         assert_eq!(
-            background_task_spinner_prefix(&task),
+            background_task_spinner_prefix(&task, false),
+            Some(LIVE_STATIC_MARKER)
+        );
+
+        task.duration_ms = Some(LIVE_MARKER_DELAY_MS - 1);
+        assert_eq!(
+            background_task_spinner_prefix(&task, false),
+            Some(LIVE_STATIC_MARKER)
+        );
+
+        task.duration_ms = Some(LIVE_MARKER_DELAY_MS);
+        assert_eq!(
+            background_task_spinner_prefix(&task, false),
             Some(crate::tui::spinner::BRAILLE_SPINNER_FRAMES[0])
         );
 
-        task.duration_ms = Some(BRAILLE_SPINNER_FRAME_MS - 1);
+        task.duration_ms = Some(LIVE_MARKER_DELAY_MS + BRAILLE_SPINNER_FRAME_MS);
         assert_eq!(
-            background_task_spinner_prefix(&task),
-            Some(crate::tui::spinner::BRAILLE_SPINNER_FRAMES[0])
-        );
-
-        task.duration_ms = Some(BRAILLE_SPINNER_FRAME_MS);
-        assert_eq!(
-            background_task_spinner_prefix(&task),
+            background_task_spinner_prefix(&task, false),
             Some(crate::tui::spinner::BRAILLE_SPINNER_FRAMES[1])
-        );
-    }
-
-    #[test]
-    fn tasks_panel_renders_model_reasoning_outside_background_commands() {
-        let mut app = create_test_app();
-        app.sidebar_focus = SidebarFocus::Tasks;
-        app.task_panel.push(TaskPanelEntry {
-            id: "reasoning-1".to_string(),
-            status: "running".to_string(),
-            prompt_summary: "model reasoning".to_string(),
-            duration_ms: Some(4_200),
-            kind: TaskPanelEntryKind::ModelReasoning,
-            stale: false,
-            elapsed_since_output_ms: None,
-            owner_agent_id: None,
-            owner_agent_name: None,
-        });
-
-        let text = lines_to_text(&task_panel_lines(&app, 80, 8));
-
-        assert!(
-            text.iter().any(|line| line == "Model reasoning"),
-            "reasoning section missing: {text:?}"
-        );
-        assert!(
-            text.iter()
-                .any(|line| line.contains("thinking running 4.2s")),
-            "reasoning row should show live thinking duration: {text:?}"
-        );
-        assert!(
-            !text.iter().any(|line| line.contains("Bash jobs")),
-            "reasoning must not be counted as a background command: {text:?}"
         );
     }
 
     #[test]
     fn tasks_panel_auto_mode_shows_only_live_background_jobs() {
         let mut app = create_test_app();
+        app.low_motion = false;
         app.sidebar_focus = SidebarFocus::Auto;
         app.runtime_turn_id = Some("turn_abcdef123456".to_string());
         app.runtime_turn_status = Some("in_progress".to_string());
@@ -4822,17 +5189,6 @@ mod tests {
                 is_diff: false,
             })));
         app.task_panel.push(TaskPanelEntry {
-            id: "reasoning-1".to_string(),
-            status: "running".to_string(),
-            prompt_summary: "model reasoning".to_string(),
-            duration_ms: Some(4_200),
-            kind: TaskPanelEntryKind::ModelReasoning,
-            stale: false,
-            elapsed_since_output_ms: None,
-            owner_agent_id: None,
-            owner_agent_name: None,
-        });
-        app.task_panel.push(TaskPanelEntry {
             id: "shell_live".to_string(),
             status: "running".to_string(),
             prompt_summary: "shell: cargo test -p codewhale-tui".to_string(),
@@ -4851,10 +5207,8 @@ mod tests {
             "auto Tasks should keep live background jobs visible: {text:?}"
         );
         assert!(
-            text.iter().any(|line| line.contains(&format!(
-                "{} Bash running",
-                crate::tui::spinner::BRAILLE_SPINNER_FRAMES[0]
-            ))),
+            text.iter()
+                .any(|line| line.contains(&format!("{} Bash running", LIVE_STATIC_MARKER))),
             "auto Tasks should animate running background jobs: {text:?}"
         );
         for hidden in [
@@ -4874,6 +5228,30 @@ mod tests {
     }
 
     #[test]
+    fn tasks_panel_keeps_model_reasoning_in_transcript_only() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
+        app.runtime_turn_id = Some("turn_reasoning".to_string());
+        app.runtime_turn_status = Some("in_progress".to_string());
+        app.history.push(HistoryCell::Thinking {
+            content: "private chain of thought".to_string(),
+            streaming: true,
+            duration_secs: Some(1.0),
+        });
+
+        let text = lines_to_text(&task_panel_lines(&app, 96, 12));
+
+        assert!(
+            !text.iter().any(|line| {
+                line.contains("Model reasoning")
+                    || line.contains("private chain of thought")
+                    || line.contains("thinking")
+            }),
+            "reasoning belongs to transcript detail, not Activity: {text:?}"
+        );
+    }
+
+    #[test]
     fn task_panel_actions_make_single_background_job_clickable() {
         let mut app = create_test_app();
         app.sidebar_focus = SidebarFocus::Tasks;
@@ -4889,7 +5267,7 @@ mod tests {
             owner_agent_name: None,
         });
 
-        let (lines, actions) = task_panel_rows(&app, 80, 12);
+        let (lines, actions) = task_panel_rows(&app, &task_panel_row_sets(&app), 80, 12);
         let text = lines_to_text(&lines);
         assert_eq!(lines.len(), actions.len());
 
@@ -4929,7 +5307,7 @@ mod tests {
             owner_agent_name: None,
         });
 
-        let (lines, actions) = task_panel_rows(&app, 80, 12);
+        let (lines, actions) = task_panel_rows(&app, &task_panel_row_sets(&app), 80, 12);
         let text = lines_to_text(&lines);
 
         assert!(
@@ -4983,7 +5361,7 @@ mod tests {
             owner_agent_name: None,
         });
 
-        let (lines, actions) = task_panel_rows(&app, 96, 16);
+        let (lines, actions) = task_panel_rows(&app, &task_panel_row_sets(&app), 96, 16);
         let text = lines_to_text(&lines);
         assert_eq!(lines.len(), actions.len());
 
@@ -5050,7 +5428,7 @@ mod tests {
             owner_agent_name: None,
         });
 
-        let (lines, actions) = task_panel_rows(&app, 80, 12);
+        let (lines, actions) = task_panel_rows(&app, &task_panel_row_sets(&app), 80, 12);
         let text = lines_to_text(&lines);
 
         let label_idx = text
@@ -5104,7 +5482,7 @@ mod tests {
             owner_agent_name: None,
         });
 
-        let (lines, actions) = task_panel_rows(&app, 96, 16);
+        let (lines, actions) = task_panel_rows(&app, &task_panel_row_sets(&app), 96, 16);
         let text = lines_to_text(&lines);
         assert_eq!(
             lines.len(),
@@ -5340,6 +5718,52 @@ mod tests {
     }
 
     #[test]
+    fn sort_sidebar_agent_rows_as_tree_emits_each_row_exactly_once() {
+        let agent_row = |id: &str, parent: Option<&str>| SidebarAgentRow {
+            id: id.to_string(),
+            parent_run_id: parent.map(str::to_string),
+            spawn_depth: 1,
+            name: id.to_string(),
+            role: "explore".to_string(),
+            model: None,
+            status: "running".to_string(),
+            objective: None,
+            git_branch: None,
+            progress: None,
+            steps_taken: 1,
+            duration_ms: None,
+            expanded: false,
+        };
+        // Parent + child + a two-node parent cycle: the cycle has no root, so
+        // only the orphan sweep reaches it. Every row must still come out
+        // exactly once (the move-based materialization panics on a double
+        // take and this pins the drop case too).
+        let rows = vec![
+            agent_row("agent_parent", None),
+            agent_row("agent_child", Some("agent_parent")),
+            agent_row("agent_cycle_a", Some("agent_cycle_b")),
+            agent_row("agent_cycle_b", Some("agent_cycle_a")),
+        ];
+
+        let sorted = sort_sidebar_agent_rows_as_tree(rows);
+
+        assert_eq!(sorted.len(), 4, "no rows dropped or duplicated");
+        let mut ids: Vec<&str> = sorted.iter().map(|row| row.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![
+                "agent_child",
+                "agent_cycle_a",
+                "agent_cycle_b",
+                "agent_parent"
+            ]
+        );
+        assert_eq!(sorted[0].id, "agent_parent");
+        assert_eq!(sorted[1].id, "agent_child");
+    }
+
+    #[test]
     fn subagent_sidebar_orders_and_indents_nested_children() {
         let rows = vec![
             SidebarAgentRow {
@@ -5376,6 +5800,7 @@ mod tests {
         let sorted = sort_sidebar_agent_rows_as_tree(rows);
         assert_eq!(sorted[0].id, "agent_parent");
         assert_eq!(sorted[1].id, "agent_grandchild");
+        assert_eq!(sorted.len(), 2, "tree sort must not drop or duplicate rows");
 
         let summary = SidebarSubagentSummary {
             cached_total: 2,
@@ -6761,7 +7186,7 @@ mod tests {
             "raw turn UUID must stay out of the compact row: {text:?}"
         );
 
-        let hover = task_panel_hover_texts(&app, 8);
+        let hover = task_panel_hover_texts(&app, &task_panel_row_sets(&app), 8);
         assert!(
             hover[0].contains("0196f0a3-1111-2222-3333-444455556666"),
             "full turn UUID must remain available in hover text: {hover:?}"
@@ -6843,6 +7268,7 @@ mod tests {
     #[test]
     fn sidebar_progress_only_rows_parse_status_instead_of_hardcoding_running() {
         let mut app = create_test_app();
+        app.ensure_agent_label("agent_queued");
         app.agent_progress.insert(
             "agent_queued".to_string(),
             "queued for launch permit".to_string(),
@@ -6851,11 +7277,12 @@ mod tests {
         let rows = sidebar_agent_rows(&app);
 
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Agent 1");
         assert_eq!(rows[0].status, "queued");
     }
 
     #[test]
-    fn sidebar_agent_rows_prefer_nickname_over_generated_label() {
+    fn sidebar_agent_rows_preserve_explicit_names_and_derive_whales_from_locale() {
         let mut app = create_test_app();
         let agent_id = "agent_cafe0123";
         app.ensure_agent_label(agent_id);
@@ -6865,13 +7292,47 @@ mod tests {
         let rows = super::sidebar_agent_rows(&app);
         assert_eq!(
             rows[0].name, "doc-fixer",
-            "user nickname must beat the generated Agent-N label"
+            "an explicit custom nickname remains user-owned"
         );
 
-        // Without a nickname the generated label is used.
+        // Without an explicit nickname, display is derived from the neutral id
+        // in the active UI locale rather than from the old Agent-N label.
         app.subagent_cache[0].nickname = None;
         let rows = super::sidebar_agent_rows(&app);
-        assert_eq!(rows[0].name, "Agent 1");
+        assert_eq!(
+            rows[0].name,
+            crate::tools::subagent::whale_name_for_id_in_locale(agent_id, "en")
+        );
+    }
+
+    #[test]
+    fn english_sidebar_relocalizes_mixed_persisted_whale_names() {
+        let mut app = create_test_app();
+        app.ui_locale = Locale::En;
+        for (agent_id, legacy_locale) in [
+            ("agent_locale_a", "zh-Hans"),
+            ("agent_locale_b", "ja"),
+            ("agent_locale_c", "vi"),
+        ] {
+            let legacy_name =
+                crate::tools::subagent::whale_name_for_id_in_locale(agent_id, legacy_locale);
+            app.subagent_cache
+                .push(cached_agent(agent_id, Some(&legacy_name)));
+        }
+
+        let rows = super::sidebar_agent_rows(&app);
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert!(
+                row.name.is_ascii(),
+                "English Fleet display leaked a prior-locale whale: {}",
+                row.name
+            );
+            assert_eq!(
+                row.name,
+                crate::tools::subagent::whale_name_for_id_in_locale(&row.id, "en")
+            );
+        }
     }
 
     // --- Unicode / CJK / terminal-width QA (issue #3488) -------------------

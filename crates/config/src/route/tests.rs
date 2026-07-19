@@ -161,9 +161,10 @@ fn descriptor_protocol_matches_provider_wire() {
         );
         let expected = match kind {
             ProviderKind::OpenaiCodex => RequestProtocol::Responses,
-            ProviderKind::DeepseekAnthropic | ProviderKind::Anthropic | ProviderKind::Openmodel => {
-                RequestProtocol::AnthropicMessages
-            }
+            ProviderKind::DeepseekAnthropic
+            | ProviderKind::Anthropic
+            | ProviderKind::MinimaxAnthropic
+            | ProviderKind::Openmodel => RequestProtocol::AnthropicMessages,
             _ => RequestProtocol::ChatCompletions,
         };
         assert_eq!(d.protocol(), expected, "{kind:?} protocol mismatch");
@@ -363,6 +364,24 @@ fn resolver_carries_models_dev_limits_into_ready_candidate() {
 }
 
 #[test]
+fn minimax_anthropic_routes_use_catalog_limits_and_messages_protocol() {
+    let resolver = RouteResolver::new();
+
+    for (model, context) in [("MiniMax-M3", 1_000_000), ("MiniMax-M2.7", 204_800)] {
+        let route = resolver
+            .resolve(&req(Some(ProviderKind::MinimaxAnthropic), Some(model)))
+            .expect("MiniMax Messages route should resolve");
+
+        assert_eq!(route.provider_kind, ProviderKind::MinimaxAnthropic);
+        assert_eq!(route.wire_model_id.as_str(), model);
+        assert_eq!(route.protocol, RequestProtocol::AnthropicMessages);
+        assert_eq!(route.endpoint.protocol, RequestProtocol::AnthropicMessages);
+        assert_eq!(route.endpoint.base_url, "https://api.minimax.io/anthropic");
+        assert_eq!(route.limits.context_tokens, Some(context));
+    }
+}
+
+#[test]
 fn resolver_keeps_limits_provider_scoped_for_same_canonical_model() {
     let r = models_dev_route_resolver();
     let direct = r
@@ -422,6 +441,45 @@ fn resolver_custom_endpoint_allows_namespaced_selector_for_strict_provider() {
     assert_eq!(out.provider_kind, ProviderKind::Deepseek);
     assert_eq!(out.wire_model_id.as_str(), "vendor/custom-coder");
     assert_eq!(out.endpoint.base_url, "https://example.local/v1");
+}
+
+#[test]
+fn resolver_treats_every_official_deepseek_endpoint_as_strict_direct() {
+    let resolver = RouteResolver::new();
+    for base_url in [
+        "https://api.deepseek.com",
+        "https://api.deepseek.com/v1/",
+        "https://api.deepseek.com/beta",
+    ] {
+        let request = RouteRequest {
+            explicit_provider: Some(ProviderKind::Deepseek),
+            model_selector: Some(LogicalModelRef::from("anthropic/claude-foo")),
+            saved_provider_model: None,
+            base_url_override: Some(base_url.to_string()),
+        };
+        assert!(
+            matches!(
+                resolver.resolve(&request),
+                Err(RouteError::ForeignModelForDirectProvider { .. })
+            ),
+            "official endpoint {base_url} must retain DeepSeek's strict namespace"
+        );
+    }
+}
+
+#[test]
+fn resolver_does_not_trust_deepseek_hostname_substrings() {
+    let resolver = RouteResolver::new();
+    let request = RouteRequest {
+        explicit_provider: Some(ProviderKind::Deepseek),
+        model_selector: Some(LogicalModelRef::from("vendor/custom-coder")),
+        saved_provider_model: None,
+        base_url_override: Some("https://api.deepseek.com.evil.example/v1".to_string()),
+    };
+    let route = resolver
+        .resolve(&request)
+        .expect("lookalike host must be treated as a custom endpoint");
+    assert_eq!(route.wire_model_id.as_str(), "vendor/custom-coder");
 }
 
 #[test]
@@ -489,11 +547,17 @@ fn default_resolver_yields_real_facts_from_bundled_catalog() {
 
     // A Kimi row (Moonshot) likewise resolves with its real window — a model
     // the 4-row seam never knew about at all.
-    let kimi = r
+    let kimi_k27 = r
         .resolve(&req(Some(ProviderKind::Moonshot), Some("kimi-k2.7-code")))
         .expect("Moonshot kimi-k2.7-code should resolve from the bundled catalog");
-    assert_eq!(kimi.limits.context_tokens, Some(262_144));
-    assert_eq!(kimi.limits.output_tokens, Some(262_144));
+    assert_eq!(kimi_k27.limits.context_tokens, Some(262_144));
+    assert_eq!(kimi_k27.limits.output_tokens, Some(262_144));
+
+    let kimi_k3 = r
+        .resolve(&req(Some(ProviderKind::Moonshot), Some("kimi-k3")))
+        .expect("Moonshot kimi-k3 should resolve from the bundled catalog");
+    assert_eq!(kimi_k3.limits.context_tokens, Some(1_048_576));
+    assert_eq!(kimi_k3.limits.output_tokens, Some(131_072));
 
     // With the #3085 pricing keystone present on the release branch, the asset's
     // provider-scoped `cost` now projects onto the candidate via
@@ -539,6 +603,135 @@ fn default_resolver_preserves_seam_canonical_joins() {
         "seam canonical join must survive the asset merge"
     );
     assert_eq!(hosted.wire_model_id.as_str(), "deepseek-ai/DeepSeek-V4-Pro");
+}
+
+#[test]
+fn together_inkling_aliases_use_the_exact_wire_identity_without_invented_metadata() {
+    let resolver = RouteResolver::new();
+
+    for requested in ["inkling", "together-inkling", "thinkingmachines/inkling"] {
+        let route = resolver
+            .resolve(&req(Some(ProviderKind::Together), Some(requested)))
+            .expect("Together Inkling route should resolve");
+        assert_eq!(route.provider_kind, ProviderKind::Together, "{requested}");
+        assert_eq!(
+            route.wire_model_id.as_str(),
+            "thinkingmachines/inkling",
+            "{requested}"
+        );
+        assert!(route.canonical_model.is_none(), "{requested}");
+        assert!(!route.limits.has_known_limit(), "{requested}");
+        assert!(matches!(
+            route.pricing,
+            Some(super::candidate::PricingSku::UnknownOrStale)
+        ));
+    }
+}
+
+#[test]
+fn together_custom_endpoint_preserves_its_explicit_model_id() {
+    let resolver = RouteResolver::new();
+    let route = resolver
+        .resolve(&RouteRequest {
+            explicit_provider: Some(ProviderKind::Together),
+            model_selector: Some(LogicalModelRef::from("inkling")),
+            saved_provider_model: None,
+            base_url_override: Some("http://127.0.0.1:8000/v1".to_string()),
+        })
+        .expect("custom Together-compatible endpoint should resolve");
+
+    assert_eq!(route.wire_model_id.as_str(), "inkling");
+}
+
+#[test]
+fn openrouter_qwen37_plus_aliases_use_exact_catalog_wire_identity() {
+    let resolver = RouteResolver::new();
+
+    for requested in ["qwen3.7-plus", "qwen-3.7-plus", "qwen/qwen3.7-plus"] {
+        let route = resolver
+            .resolve(&req(Some(ProviderKind::Openrouter), Some(requested)))
+            .expect("OpenRouter Qwen 3.7 Plus route should resolve");
+        assert_eq!(route.wire_model_id.as_str(), "qwen/qwen3.7-plus");
+        assert!(!route.limits.has_known_limit());
+        assert!(matches!(
+            route.pricing,
+            Some(super::candidate::PricingSku::Token {
+                input_per_mtok: Some(_),
+                output_per_mtok: Some(_)
+            })
+        ));
+    }
+}
+
+#[test]
+fn openrouter_custom_endpoint_preserves_qwen37_alias() {
+    let route = RouteResolver::new()
+        .resolve(&RouteRequest {
+            explicit_provider: Some(ProviderKind::Openrouter),
+            model_selector: Some(LogicalModelRef::from("qwen3.7-plus")),
+            saved_provider_model: None,
+            base_url_override: Some("https://gateway.example.test/v1".to_string()),
+        })
+        .expect("custom OpenRouter-compatible endpoint should resolve");
+
+    assert_eq!(route.wire_model_id.as_str(), "qwen3.7-plus");
+}
+
+#[test]
+fn opencode_go_resolver_accepts_only_chat_completions_models() {
+    let resolver = RouteResolver::new();
+    let chat_models = crate::OPENCODE_GO_CHAT_MODELS;
+    assert!(chat_models.contains(&"grok-4.5"));
+    assert!(chat_models.contains(&"kimi-k3"));
+
+    for &model in chat_models {
+        for requested in [model.to_string(), format!("opencode-go/{model}")] {
+            let route = resolver
+                .resolve(&req(Some(ProviderKind::OpencodeGo), Some(&requested)))
+                .unwrap_or_else(|error| panic!("{requested} should resolve: {error}"));
+            assert_eq!(route.provider_kind, ProviderKind::OpencodeGo, "{requested}");
+            assert_eq!(route.wire_model_id.as_str(), model, "{requested}");
+        }
+    }
+
+    let automatic = resolver
+        .resolve(&req(Some(ProviderKind::OpencodeGo), Some("auto")))
+        .expect("OpenCode Go auto should resolve to its Chat default");
+    assert_eq!(automatic.wire_model_id.as_str(), "deepseek-v4-pro");
+}
+
+#[test]
+fn opencode_go_resolver_rejects_messages_models_even_on_custom_base_urls() {
+    let resolver = RouteResolver::new();
+    let messages_models = [
+        "minimax-m3",
+        "minimax-m2.7",
+        "minimax-m2.5",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+    ];
+
+    for model in messages_models {
+        for requested in [model.to_string(), format!("opencode-go/{model}")] {
+            for base_url_override in [None, Some("https://go-gateway.example.test/v1".to_string())]
+            {
+                let request = RouteRequest {
+                    explicit_provider: Some(ProviderKind::OpencodeGo),
+                    model_selector: Some(LogicalModelRef::from(requested.as_str())),
+                    saved_provider_model: None,
+                    base_url_override,
+                };
+                assert!(
+                    matches!(
+                        resolver.resolve(&request),
+                        Err(RouteError::ForeignModelForDirectProvider { .. })
+                    ),
+                    "{requested} must not reach OpenCode Go Chat Completions"
+                );
+            }
+        }
+    }
 }
 
 #[test]

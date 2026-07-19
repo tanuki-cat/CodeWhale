@@ -53,6 +53,8 @@ pub mod spec;
 pub mod speech;
 pub mod subagent;
 pub mod tasks;
+#[cfg(not(target_env = "ohos"))]
+pub mod terminal_session;
 pub mod test_runner;
 pub mod todo;
 pub mod tool_result_retrieval;
@@ -63,6 +65,8 @@ pub mod verifier;
 pub mod web_run;
 pub mod web_search;
 pub mod workflow;
+pub mod workflow_plan_approval;
+pub mod workflow_trigger;
 
 pub use registry::{AgentToolSurfaceOptions, ToolRegistry, ToolRegistryBuilder};
 pub use review::ReviewOutput;

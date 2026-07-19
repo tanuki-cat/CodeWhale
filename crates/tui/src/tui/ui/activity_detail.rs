@@ -757,7 +757,7 @@ pub(crate) fn detail_target_label(app: &App, cell_index: usize) -> Option<String
             explore.entries.len(),
             if explore.entries.len() == 1 { "" } else { "s" }
         )),
-        HistoryCell::Tool(ToolCell::PlanUpdate(_)) => Some("update plan".to_string()),
+        HistoryCell::Tool(ToolCell::PlanUpdate(_)) => Some("update Strategy".to_string()),
         HistoryCell::Tool(ToolCell::PatchSummary(patch)) => Some(format!("patch {}", patch.path)),
         HistoryCell::Tool(ToolCell::Review(review)) => {
             let target = one_line_summary(&review.target, 80);
@@ -829,6 +829,7 @@ pub(super) fn open_turn_inspector_pager(app: &mut App) -> bool {
     let handoff = turn_handoff_markdown(app);
     app.view_stack.push(
         PagerView::from_text("Turn Inspector", &text, width.saturating_sub(2))
+            .with_copy_text(text)
             .with_export_markdown(handoff),
     );
     true
@@ -903,7 +904,7 @@ pub(super) fn turn_inspector_text(app: &App) -> String {
         push_section(&mut out, "Selected item", vec![line]);
     }
 
-    push_section(&mut out, "Plan / checklist", turn_plan_lines(app));
+    push_section(&mut out, "Strategy / To-do", turn_plan_lines(app));
     push_section(
         &mut out,
         "Turn timeline",
@@ -925,7 +926,7 @@ pub(super) fn turn_inspector_text(app: &App) -> String {
     push_section(
         &mut out,
         "Final result / status",
-        turn_result_lines(app, start, end),
+        turn_result_lines(app, start, end, ResultDetail::Full),
     );
 
     out.join("\n")
@@ -969,11 +970,11 @@ pub(crate) fn turn_handoff_markdown(app: &App) -> String {
 
     push_md_section(&mut out, "Intent", vec![turn_intent_line(app, start)]);
 
-    // Plan/checklist is optional context: include it only when a plan or todo
-    // list actually ran, to keep the handoff compact.
+    // Strategy / To-do is optional context: include it only when a plan or
+    // To-do tool actually ran, to keep the handoff compact.
     let plan = turn_plan_lines(app);
     if !plan.is_empty() {
-        push_md_section(&mut out, "Plan / checklist", md_bullets(plan));
+        push_md_section(&mut out, "Strategy / To-do", md_bullets(plan));
     }
 
     push_md_section(
@@ -999,7 +1000,7 @@ pub(crate) fn turn_handoff_markdown(app: &App) -> String {
     push_md_section(
         &mut out,
         "Result / status",
-        md_bullets(turn_result_lines(app, start, end)),
+        md_bullets(turn_result_lines(app, start, end, ResultDetail::Compact)),
     );
 
     // Trailing newline keeps the artifact clean when pasted into a PR body.
@@ -1078,7 +1079,7 @@ fn selected_item_context_line(app: &App) -> Option<String> {
     Some(format!("{label}{hint}"))
 }
 
-/// Section 2 — plan and/or checklist state, when a plan/todo tool has run.
+/// Section 2 — Strategy metadata and/or To-do state when those tools ran.
 fn turn_plan_lines(app: &App) -> Vec<String> {
     let mut lines = Vec::new();
 
@@ -1093,13 +1094,16 @@ fn turn_plan_lines(app: &App) -> Vec<String> {
             .map(str::trim)
             .filter(|s: &&str| !s.is_empty());
         if let Some(headline) = headline {
-            lines.push(format!("Plan: {}", truncate_line_to_width(headline, 64)));
+            lines.push(format!(
+                "Strategy: {}",
+                truncate_line_to_width(headline, 64)
+            ));
         }
         let (pending, in_progress, completed) = plan.counts();
         let total = pending + in_progress + completed;
         if total > 0 {
             lines.push(format!(
-                "Steps: {completed}/{total} done ({}%)",
+                "Route steps: {completed}/{total} done ({}%)",
                 plan.progress_percent()
             ));
         }
@@ -1115,7 +1119,7 @@ fn turn_plan_lines(app: &App) -> Vec<String> {
     if let Ok(todos) = app.todos.try_lock() {
         let snapshot = todos.snapshot();
         if !snapshot.items.is_empty() {
-            lines.push(format!("Checklist: {}% complete", snapshot.completion_pct));
+            lines.push(format!("To-do: {}% complete", snapshot.completion_pct));
             for item in &snapshot.items {
                 lines.push(format!(
                     "{} {}",
@@ -1238,7 +1242,7 @@ fn timeline_tool_summary(app: &App, idx: usize, tool: &ToolCell) -> (&'static st
                 if explore.entries.len() == 1 { "" } else { "s" }
             ),
         ),
-        ToolCell::PlanUpdate(_) => ("plan update", "plan/checklist changed".to_string()),
+        ToolCell::PlanUpdate(_) => ("Strategy", "Strategy metadata updated".to_string()),
         ToolCell::PatchSummary(patch) => {
             let summary = one_line_summary(&patch.summary, 72);
             if summary.is_empty() {
@@ -1547,11 +1551,55 @@ fn turn_approvals_lines(app: &App) -> Vec<String> {
 fn turn_route_lines(app: &App) -> Vec<String> {
     let mut lines = Vec::new();
 
-    let (provider, model) = match app.pending_turn_route.as_ref() {
-        Some((provider, model, _passthrough)) => (provider.display_name(), model.clone()),
-        None => (app.api_provider.display_name(), app.model.clone()),
+    let (provider, model) = if let Some(route) = app
+        .active_turn
+        .as_ref()
+        .and_then(|turn| turn.route.as_ref())
+    {
+        let provider = if route.provider == crate::config::ApiProvider::Custom {
+            route.provider_identity.clone()
+        } else {
+            route.provider.display_name().to_string()
+        };
+        (provider, route.model.clone())
+    } else {
+        // Pending and last Auto routes use the same billing-authoritative
+        // display contract as the header; do not fall back to `auto` after the
+        // concrete turn route has resolved.
+        app.effective_route_identity_display()
     };
     lines.push(format!("Route: {provider} · {model}"));
+
+    let auto_receipt = app
+        .active_turn
+        .as_ref()
+        .filter(|turn| turn.route.as_ref().is_some_and(|route| route.auto_model))
+        .and_then(|turn| turn.auto_route_receipt.as_ref())
+        .or_else(|| {
+            app.pending_turn_route
+                .as_ref()
+                .filter(|(_, _, auto_model)| *auto_model)
+                .and(app.pending_auto_route_receipt.as_ref())
+        })
+        .or_else(|| {
+            app.auto_model
+                .then_some(app.last_auto_route_receipt.as_ref())
+                .flatten()
+        });
+    if let Some(receipt) = auto_receipt {
+        lines.push(format!(
+            "Auto decision: {} · {}",
+            receipt.tier.label(),
+            receipt.reason.label()
+        ));
+        let pair = receipt.pair.fast.as_deref().map_or_else(
+            || format!("{} (no runnable fast sibling)", receipt.pair.strong),
+            |fast| format!("{} strong · {fast} fast", receipt.pair.strong),
+        );
+        lines.push(format!("Auto pair: {pair}"));
+        lines.push(format!("Auto scope: {}", receipt.scope.label()));
+        lines.push(format!("Auto data: {}", receipt.data_path.label()));
+    }
 
     let session = &app.session;
     match (session.last_prompt_tokens, session.last_completion_tokens) {
@@ -1570,15 +1618,57 @@ fn turn_route_lines(app: &App) -> Vec<String> {
     }
 
     let cost = app.displayed_session_cost_for_currency(app.cost_currency);
-    if cost > 0.0 {
-        lines.push(format!("Cost (session): {}", app.format_cost_amount(cost)));
+    let chip = crate::route_billing::usage_chip(
+        app.billing_presentation,
+        app.api_provider,
+        &app.model,
+        cost,
+        app.cost_currency,
+        None,
+    );
+    match chip {
+        crate::route_billing::UsageChip::Money(amount) => {
+            lines.push(format!("Cost (session): {amount}"));
+        }
+        crate::route_billing::UsageChip::Allowance { label, used_pct } => {
+            lines.push(match used_pct {
+                Some(pct) => format!("Usage plan: {label} ({pct:.0}% used)"),
+                None => format!("Usage plan: {label}"),
+            });
+        }
+        crate::route_billing::UsageChip::Local => {
+            lines.push("Cost: local".to_string());
+        }
+        crate::route_billing::UsageChip::Unknown => {
+            lines.push("Cost: unknown".to_string());
+        }
+        crate::route_billing::UsageChip::Hidden => {}
     }
 
     lines
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultDetail {
+    /// Pager content is the review surface and must retain the complete final
+    /// response. Width wrapping belongs to `PagerView`, not data assembly.
+    Full,
+    /// The exported handoff is intentionally a compact overview.
+    Compact,
+}
+
+fn cleaned_turn_text(text: &str, detail: ResultDetail, max_width: usize) -> String {
+    if detail == ResultDetail::Compact {
+        return one_line_summary(text, max_width);
+    }
+
+    let mut cleaned = String::with_capacity(text.len());
+    crate::tui::osc8::strip_ansi_into(text, &mut cleaned);
+    cleaned.trim().to_string()
+}
+
 /// Section 9 — final result / current status.
-fn turn_result_lines(app: &App, start: usize, end: usize) -> Vec<String> {
+fn turn_result_lines(app: &App, start: usize, end: usize, detail: ResultDetail) -> Vec<String> {
     let mut lines = Vec::new();
 
     let status = match app.runtime_turn_status.as_deref() {
@@ -1592,8 +1682,8 @@ fn turn_result_lines(app: &App, start: usize, end: usize) -> Vec<String> {
         .rev()
         .find_map(|idx| match app.cell_at_virtual_index(idx) {
             Some(HistoryCell::Assistant { content, .. }) => {
-                let summary = one_line_summary(content, 200);
-                (!summary.is_empty()).then_some(summary)
+                let text = cleaned_turn_text(content, detail, 200);
+                (!text.is_empty()).then_some(text)
             }
             _ => None,
         });
@@ -1609,8 +1699,8 @@ fn turn_result_lines(app: &App, start: usize, end: usize) -> Vec<String> {
         .rev()
         .find_map(|idx| match app.cell_at_virtual_index(idx) {
             Some(HistoryCell::Error { message, .. }) => {
-                let summary = one_line_summary(message, 160);
-                (!summary.is_empty()).then_some(summary)
+                let text = cleaned_turn_text(message, detail, 160);
+                (!text.is_empty()).then_some(text)
             }
             _ => None,
         });
@@ -1681,5 +1771,37 @@ mod tests {
         );
         assert!(joined.contains("Model attempted a repair"), "{joined}");
         assert!(joined.contains("still failing"), "{joined}");
+    }
+
+    #[test]
+    fn turn_route_lines_include_truthful_auto_receipt() {
+        let mut app = test_app();
+        app.auto_model = true;
+        app.last_effective_provider = Some(crate::config::ApiProvider::Zai);
+        app.last_effective_model = Some(crate::config::ZAI_GLM_5_TURBO_MODEL.to_string());
+        app.last_auto_route_receipt = Some(crate::model_routing::AutoRouteReceipt {
+            tier: crate::model_routing::AutoRouteTier::Fast,
+            pair: crate::model_routing::AutoRoutePair {
+                strong: crate::config::ZAI_GLM_5_2_MODEL.to_string(),
+                fast: Some(crate::config::ZAI_GLM_5_TURBO_MODEL.to_string()),
+            },
+            scope: crate::model_routing::AutoRouteScope::RunnableProviders,
+            data_path: crate::model_routing::AutoRouteDataPath::Classifier {
+                provider: crate::config::ApiProvider::Deepseek,
+                model: "deepseek-v4-flash".to_string(),
+            },
+            reason: crate::model_routing::AutoRouteReason::ClassifierRecommendation,
+        });
+
+        let joined = turn_route_lines(&app).join("\n");
+
+        assert!(joined.contains("Route: Zhipu AI / Z.ai · GLM-5-Turbo"));
+        assert!(joined.contains("Auto decision: fast · classifier recommendation"));
+        assert!(joined.contains("GLM-5.2 strong · GLM-5-Turbo fast"));
+        assert!(joined.contains("Auto scope: runnable providers"));
+        assert!(joined.contains(
+            "Auto data: latest request + bounded recent context -> DeepSeek / deepseek-v4-flash"
+        ));
+        assert!(!joined.contains("API_KEY"));
     }
 }

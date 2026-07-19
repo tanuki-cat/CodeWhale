@@ -47,7 +47,7 @@ impl StepStatus {
 }
 
 /// Input representation for a plan item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanItemArg {
     pub step: String,
     pub status: StepStatus,
@@ -136,7 +136,7 @@ impl PlanStep {
 }
 
 /// Serializable snapshot for display
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -348,6 +348,28 @@ impl PlanState {
         }
     }
 
+    /// Restore persisted plan data through the same normalization path used by
+    /// `update_plan`. Timing is intentionally session-local and starts fresh.
+    #[must_use]
+    pub fn from_snapshot(snapshot: &PlanSnapshot) -> Self {
+        let mut state = Self::default();
+        state.update(UpdatePlanArgs {
+            title: snapshot.title.clone(),
+            objective: snapshot.objective.clone(),
+            context_summary: snapshot.context_summary.clone(),
+            explanation: snapshot.explanation.clone(),
+            sources_used: snapshot.sources_used.clone(),
+            critical_files: snapshot.critical_files.clone(),
+            constraints: snapshot.constraints.clone(),
+            recommended_approach: snapshot.recommended_approach.clone(),
+            verification_plan: snapshot.verification_plan.clone(),
+            risks_and_unknowns: snapshot.risks_and_unknowns.clone(),
+            handoff_packet: snapshot.handoff_packet.clone(),
+            plan: snapshot.items.clone(),
+        });
+        state
+    }
+
     pub fn explanation(&self) -> Option<&str> {
         self.explanation.as_deref()
     }
@@ -470,7 +492,7 @@ impl ToolSpec for UpdatePlanTool {
     }
 
     fn description(&self) -> &'static str {
-        "Update optional high-level Strategy metadata for complex initiatives. Use work_update for primary To-do / Work progress; update_plan should capture phase-level approach, context, and route — not a second checklist. Include sources, critical files, constraints, verification, risks, and handoff context when they help the user review or continue the plan. Each strategy step has a description and status (pending, in_progress, completed)."
+        "Update optional high-level Strategy metadata for complex initiatives. Use work_update for primary To-do / Work progress; update_plan should capture approach, context, and route — not a second checklist. Include sources, critical files, constraints, verification, risks, and handoff context when they help the user review or continue the plan. Each strategy step has a description and status (pending, in_progress, completed). Reserve Phase for Workflow stages."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -653,6 +675,12 @@ mod tests {
         assert!(description.contains("Use work_update for primary To-do / Work progress"));
         assert!(description.contains("not a second checklist"));
         assert!(description.contains("Strategy metadata"));
+        assert!(description.contains("approach, context, and route"));
+        assert!(description.contains("Reserve Phase for Workflow stages"));
+        assert!(
+            !description.contains("phase-level"),
+            "Strategy must not reuse Workflow Phase vocabulary: {description}"
+        );
     }
 
     #[test]
@@ -746,6 +774,27 @@ mod tests {
         assert_eq!(snapshot.items.len(), 1);
         assert_eq!(snapshot.items[0].step, "render sections");
         assert_eq!(snapshot.items[0].status, StepStatus::InProgress);
+    }
+
+    #[test]
+    fn plan_state_restores_from_persisted_snapshot() {
+        let snapshot = PlanSnapshot {
+            objective: Some("Restore Work state".to_string()),
+            items: vec![
+                PlanItemArg {
+                    step: "inspect".to_string(),
+                    status: StepStatus::Completed,
+                },
+                PlanItemArg {
+                    step: "verify".to_string(),
+                    status: StepStatus::InProgress,
+                },
+            ],
+            ..PlanSnapshot::default()
+        };
+
+        let restored = PlanState::from_snapshot(&snapshot);
+        assert_eq!(restored.snapshot(), snapshot);
     }
 
     #[test]

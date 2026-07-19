@@ -10,6 +10,7 @@ use regex::Regex;
 use std::fmt::Write;
 use tokio::sync::mpsc::Sender;
 
+use crate::config::ApiProvider;
 use crate::core::events::Event;
 use crate::fast_hash::{FastHashMap, FastHashSet};
 use crate::llm_client::LlmClient;
@@ -532,6 +533,7 @@ pub fn build_purge_tool() -> Tool {
 /// and for replacing the session message list with `PurgeResult.messages`.
 pub async fn run_purge(
     client: &impl LlmClient,
+    provider: ApiProvider,
     messages: &[Message],
     model: &str,
     reasoning_effort: Option<String>,
@@ -573,7 +575,7 @@ pub async fn run_purge(
         .await
         .map_err(|e| format!("Purge API error: {e}"))?;
 
-    crate::cost_status::report(&response.model, &response.usage);
+    crate::cost_status::report(provider, &response.model, &response.usage);
 
     // 5. Find the `purge_context` tool call in the response.
     let tool_input = response.content.iter().find_map(|block| {
@@ -849,7 +851,7 @@ mod tests {
             msg_text("user", "bye"),
         ];
 
-        let result = run_purge(&mock, &messages, "mock", None, 4096)
+        let result = run_purge(&mock, ApiProvider::Deepseek, &messages, "mock", None, 4096)
             .await
             .unwrap();
         assert_eq!(result.removed_count, 1);
@@ -861,7 +863,7 @@ mod tests {
         } else {
             panic!(
                 "expected text block, got {:?}",
-                &result.messages[0].content[0]
+                result.messages[0].content[0]
             );
         }
         if let ContentBlock::Text { text, .. } = &result.messages[1].content[0] {
@@ -869,7 +871,7 @@ mod tests {
         } else {
             panic!(
                 "expected text block, got {:?}",
-                &result.messages[1].content[0]
+                result.messages[1].content[0]
             );
         }
     }
@@ -883,7 +885,7 @@ mod tests {
 
         let messages = vec![msg_text("assistant", "this is very long and verbose text")];
 
-        let result = run_purge(&mock, &messages, "mock", None, 4096)
+        let result = run_purge(&mock, ApiProvider::Deepseek, &messages, "mock", None, 4096)
             .await
             .unwrap();
         assert_eq!(result.removed_count, 0);
@@ -894,7 +896,7 @@ mod tests {
         } else {
             panic!(
                 "expected text block, got {:?}",
-                &result.messages[0].content[0]
+                result.messages[0].content[0]
             );
         }
     }
@@ -905,7 +907,7 @@ mod tests {
         mock.push_message_response(msg_response_without_tool_call("nothing to clean up"));
 
         let messages = vec![msg_text("user", "hi")];
-        let err = run_purge(&mock, &messages, "mock", None, 4096)
+        let err = run_purge(&mock, ApiProvider::Deepseek, &messages, "mock", None, 4096)
             .await
             .unwrap_err();
         assert!(err.contains("did not call purge_context"));
@@ -916,7 +918,7 @@ mod tests {
         // No canned response — MockLlmClient returns an error.
         let mock = MockLlmClient::new(vec![]);
         let messages = vec![msg_text("user", "hi")];
-        let err = run_purge(&mock, &messages, "mock", None, 4096)
+        let err = run_purge(&mock, ApiProvider::Deepseek, &messages, "mock", None, 4096)
             .await
             .unwrap_err();
         assert!(err.contains("Purge API error"));

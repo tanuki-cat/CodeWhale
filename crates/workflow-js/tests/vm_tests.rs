@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codewhale_workflow_js::testing::{FakeDriver, FakeReply};
-use codewhale_workflow_js::{ProgressEvent, WORKFLOW_LIFETIME_CAP, WorkflowJsError, WorkflowVm};
+use codewhale_workflow_js::{
+    ProgressEvent, WORKFLOW_LIFETIME_CAP, WorkflowJsError, WorkflowRunCancel, WorkflowVm,
+};
 use serde_json::json;
 
 async fn run(
@@ -72,6 +74,8 @@ async fn task_round_trip_carries_all_options_and_normalizes_profile() {
             allowedTools: ["read", "grep"],
             maxDepth: 2,
             tokenBudget: 5000,
+            maxSteps: 4,
+            wallTimeSecs: 90,
             label: "L1",
             phase: "P1",
         });
@@ -98,6 +102,8 @@ async fn task_round_trip_carries_all_options_and_normalizes_profile() {
     );
     assert_eq!(request.max_depth, Some(2));
     assert_eq!(request.token_budget, Some(5000));
+    assert_eq!(request.max_steps, Some(4));
+    assert_eq!(request.wall_time_secs, Some(90));
     assert_eq!(request.response_schema, None);
     assert_eq!(request.label.as_deref(), Some("L1"));
     assert_eq!(request.phase.as_deref(), Some("P1"));
@@ -116,6 +122,25 @@ async fn task_accepts_prompt_and_type_aliases() {
     let request = &driver.requests()[0];
     assert_eq!(request.description, "aliased");
     assert_eq!(request.subagent_type.as_deref(), Some("verifier"));
+}
+
+#[tokio::test]
+async fn task_prompt_takes_precedence_over_short_description() {
+    let driver = Arc::new(FakeDriver::new());
+    run(
+        &driver,
+        r#"return await task({
+            description: "Short progress summary",
+            prompt: "Detailed child instructions",
+            label: "fixture-compatible"
+        });"#,
+        json!(null),
+    )
+    .await
+    .unwrap();
+    let request = &driver.requests()[0];
+    assert_eq!(request.description, "Detailed child instructions");
+    assert_eq!(request.label.as_deref(), Some("fixture-compatible"));
 }
 
 #[tokio::test]
@@ -300,12 +325,12 @@ async fn pipeline_surfaces_response_schema_errors_instead_of_null() {
 }
 
 #[tokio::test]
-async fn parallel_enforces_the_4096_item_cap_without_spawning() {
+async fn parallel_enforces_the_1000_item_cap_without_spawning() {
     let driver = Arc::new(FakeDriver::new());
     let value = run(
         &driver,
         r#"
-        const thunks = new Array(4097).fill(() => task({ description: "x" }));
+        const thunks = new Array(1001).fill(() => task({ description: "x" }));
         try {
             await parallel(thunks);
             return "no-throw";
@@ -318,17 +343,17 @@ async fn parallel_enforces_the_4096_item_cap_without_spawning() {
     .await
     .unwrap();
     let text = value.as_str().unwrap();
-    assert!(text.contains("max 4096"), "{text}");
+    assert!(text.contains("max 1000"), "{text}");
     assert_eq!(driver.spawn_count(), 0, "cap must reject before any spawn");
 }
 
 #[tokio::test]
-async fn parallel_accepts_exactly_4096_items() {
+async fn parallel_accepts_exactly_1000_items() {
     let driver = Arc::new(FakeDriver::new());
     let value = run(
         &driver,
         r#"
-        const thunks = new Array(4096).fill(() => Promise.resolve(1));
+        const thunks = new Array(1000).fill(() => Promise.resolve(1));
         const results = await parallel(thunks);
         return results.length;
         "#,
@@ -336,7 +361,7 @@ async fn parallel_accepts_exactly_4096_items() {
     )
     .await
     .unwrap();
-    assert_eq!(value, json!(4096));
+    assert_eq!(value, json!(1000));
 }
 
 #[tokio::test]
@@ -598,6 +623,240 @@ async fn determinism_ban_new_date() {
     assert!(message.contains("unavailable"), "{message}");
 }
 
+/// Explicit product surface for the sandboxed Workflow VM (#4129).
+///
+/// Only these Workflow-owned calls may exist on `globalThis` beyond standard
+/// ECMAScript intrinsics. If a new host global is intentionally added, update
+/// this list in the same PR — the fail-closed inventory test below will break
+/// until the allowlist is extended deliberately.
+const WORKFLOW_ALLOWED_GLOBALS: &[&str] = &[
+    "task", "parallel", "pipeline", "phase", "log", "budget", "args",
+];
+
+/// Host / Node / Deno / browser surfaces that must never leak into the VM.
+///
+/// Standard ECMAScript intrinsics (`Object`, `Function`, `eval`, `Promise`, …)
+/// remain available; this list is only host escape hatches.
+const SANDBOX_BANNED_GLOBALS: &[&str] = &[
+    "process",
+    "require",
+    "module",
+    "exports",
+    "__dirname",
+    "__filename",
+    "Buffer",
+    "fs",
+    "child_process",
+    "os",
+    "path",
+    "net",
+    "http",
+    "https",
+    "fetch",
+    "XMLHttpRequest",
+    "WebSocket",
+    "Deno",
+    "Bun",
+    "Worker",
+];
+
+#[tokio::test]
+async fn sandbox_exposes_only_the_documented_workflow_calls() {
+    let driver = Arc::new(FakeDriver::new());
+    let value = run(
+        &driver,
+        r#"
+        return {
+            task: typeof task,
+            parallel: typeof parallel,
+            pipeline: typeof pipeline,
+            phase: typeof phase,
+            log: typeof log,
+            budget: typeof budget,
+            args: typeof args,
+        };
+        "#,
+        json!({"ok": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "task": "function",
+            "parallel": "function",
+            "pipeline": "function",
+            "phase": "function",
+            "log": "function",
+            "budget": "object",
+            "args": "object",
+        })
+    );
+    // Keep the constant and the live typeof probe in lockstep.
+    assert_eq!(
+        WORKFLOW_ALLOWED_GLOBALS,
+        &[
+            "task", "parallel", "pipeline", "phase", "log", "budget", "args"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn sandbox_blocks_host_filesystem_shell_network_and_env_surfaces() {
+    // Each probe must either throw / reject or resolve to a clearly absent
+    // binding. We never allow a successful host escape.
+    let probes: &[(&str, &str)] = &[
+        (
+            "process.env",
+            r#"
+            if (typeof process !== "undefined") {
+                return process.env;
+            }
+            throw new Error("process is unavailable");
+            "#,
+        ),
+        (
+            "require('fs')",
+            r#"
+            if (typeof require === "function") {
+                return require("fs");
+            }
+            throw new Error("require is unavailable");
+            "#,
+        ),
+        (
+            "import",
+            r#"
+            // Dynamic import is a module-loader surface; the VM has no loader.
+            return await import("fs");
+            "#,
+        ),
+        (
+            "fetch",
+            r#"
+            if (typeof fetch === "function") {
+                return await fetch("https://example.invalid/");
+            }
+            throw new Error("fetch is unavailable");
+            "#,
+        ),
+        (
+            "child_process",
+            r#"
+            if (typeof require === "function") {
+                return require("child_process");
+            }
+            if (typeof child_process !== "undefined") {
+                return child_process;
+            }
+            throw new Error("child_process is unavailable");
+            "#,
+        ),
+        (
+            "Deno.env",
+            r#"
+            if (typeof Deno !== "undefined") {
+                return Deno.env.toObject();
+            }
+            throw new Error("Deno is unavailable");
+            "#,
+        ),
+    ];
+
+    for (label, source) in probes {
+        let driver = Arc::new(FakeDriver::new());
+        let result = run(&driver, source, json!(null)).await;
+        assert!(
+            result.is_err(),
+            "sandbox probe `{label}` must fail closed, got {result:?}"
+        );
+        // No driver side-effect is expected from a sandbox probe.
+        assert_eq!(
+            driver.spawn_count(),
+            0,
+            "probe `{label}` must not spawn tasks"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sandbox_global_inventory_fails_closed_on_new_host_leaks() {
+    let driver = Arc::new(FakeDriver::new());
+    let value = run(
+        &driver,
+        r#"
+        // Own enumerable + non-enumerable names on the global object.
+        // Anything beyond standard ECMAScript + the Workflow allowlist is a
+        // regression that must break this test so new leaks cannot land quietly.
+        const names = Reflect.ownKeys(globalThis)
+            .map((k) => String(k))
+            .sort();
+        return names;
+        "#,
+        json!(null),
+    )
+    .await
+    .unwrap();
+    let names: Vec<String> = serde_json::from_value(value).expect("name list is a JSON array");
+
+    // Fail closed: none of the banned host surfaces may appear.
+    for banned in SANDBOX_BANNED_GLOBALS {
+        assert!(
+            !names.iter().any(|n| n == *banned),
+            "banned global `{banned}` leaked into the Workflow VM: {names:?}"
+        );
+    }
+
+    // Every Workflow-owned call must still be present.
+    for allowed in WORKFLOW_ALLOWED_GLOBALS {
+        assert!(
+            names.iter().any(|n| n == *allowed),
+            "expected Workflow global `{allowed}` missing from inventory: {names:?}"
+        );
+    }
+
+    // Internal host helpers must not be script-visible.
+    for internal in [
+        "__workflow_task",
+        "__workflow_log",
+        "__workflow_phase",
+        "__workflow_budget_total",
+        "__workflow_budget_spent",
+        "__workflow_budget_remaining",
+    ] {
+        assert!(
+            !names.iter().any(|n| n == internal),
+            "internal host binding `{internal}` must stay hidden: {names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sandbox_rejects_commonjs_module_loader_and_eval_style_constructors() {
+    let driver = Arc::new(FakeDriver::new());
+    // `eval` / `Function` are standard ES, but if they are present they must
+    // still be unable to reach host modules. The banned-global inventory above
+    // already fails closed if Node-style loaders appear; this probe documents
+    // the intended product message for module load attempts.
+    let message = script_message(
+        run(
+            &driver,
+            r#"
+            if (typeof require === "function") {
+                return require("node:fs");
+            }
+            throw new Error("require is unavailable");
+            "#,
+            json!(null),
+        )
+        .await,
+    );
+    assert!(
+        message.contains("unavailable") || message.contains("require"),
+        "{message}"
+    );
+}
+
 #[tokio::test]
 async fn dropping_the_run_future_cancels_outstanding_tasks() {
     let driver = Arc::new(FakeDriver::new());
@@ -618,6 +877,51 @@ async fn dropping_the_run_future_cancels_outstanding_tasks() {
         "dropping the run future must cancel outstanding driver tasks"
     );
     assert_eq!(driver.spawn_count(), 1);
+}
+
+#[tokio::test]
+async fn parallel_does_not_continue_after_external_run_cancellation() {
+    let driver = Arc::new(FakeDriver::new());
+    driver.on("hang", FakeReply::Never);
+    let cancel = WorkflowRunCancel::new();
+    let run_cancel = cancel.clone();
+    let run_driver = driver.clone();
+    let handle = tokio::spawn(async move {
+        WorkflowVm::new()
+            .run_script_with_cancel(
+                r#"
+                await parallel([() => task({ description: "hang" })]);
+                phase("unreachable after cancellation");
+                return "wrong";
+                "#,
+                json!(null),
+                run_driver as Arc<dyn codewhale_workflow_js::WorkflowDriver>,
+                run_cancel,
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while driver.spawn_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("task should start");
+    cancel.cancel();
+
+    let result = handle.await.expect("VM task should join");
+    assert!(
+        matches!(result, Err(WorkflowJsError::Cancelled)),
+        "{result:?}"
+    );
+    assert!(
+        !driver.events().iter().any(|event| matches!(
+            event,
+            ProgressEvent::Phase { title } if title == "unreachable after cancellation"
+        )),
+        "parallel() must not downgrade run cancellation into a null slot"
+    );
 }
 
 #[tokio::test]
@@ -712,4 +1016,80 @@ async fn promise_all_of_tasks_resolves_concurrently() {
         started.elapsed()
     );
     assert_eq!(driver.spawn_count(), 2);
+}
+
+#[tokio::test]
+async fn export_default_async_function_runs_with_args() {
+    let driver = Arc::new(FakeDriver::new());
+    let source = r#"
+export default async function (args) {
+  return { doubled: args.n * 2 };
+}
+"#;
+    let value = run(&driver, source, json!({ "n": 21 })).await.unwrap();
+    assert_eq!(value, json!({ "doubled": 42 }));
+}
+
+#[tokio::test]
+async fn export_default_function_result_becomes_run_result() {
+    let driver = Arc::new(FakeDriver::new());
+    let source = r#"
+function helper() {
+  return "from-helper";
+}
+export default function () {
+  return helper();
+}
+"#;
+    let value = run(&driver, source, json!(null)).await.unwrap();
+    assert_eq!(value, json!("from-helper"));
+}
+
+#[tokio::test]
+async fn export_default_non_function_value_is_returned() {
+    let driver = Arc::new(FakeDriver::new());
+    let value = run(&driver, "export default 7;", json!(null))
+        .await
+        .unwrap();
+    assert_eq!(value, json!(7));
+}
+
+#[tokio::test]
+async fn plain_scripts_are_untouched_by_export_desugaring() {
+    let driver = Arc::new(FakeDriver::new());
+    // A string literal mentioning `export default` must not trigger the
+    // module desugaring path.
+    let value = run(
+        &driver,
+        "const note = \"export default docs\";\nreturn note.length;",
+        json!(null),
+    )
+    .await
+    .unwrap();
+    assert_eq!(value, json!(19));
+}
+
+#[tokio::test]
+async fn export_default_examples_inside_multiline_text_are_not_desugared() {
+    let driver = Arc::new(FakeDriver::new());
+    let value = run(
+        &driver,
+        r#"
+const template = `
+export default async function (args) {
+  return args;
+}
+`;
+/*
+export default function () {
+  return "comment example";
+}
+*/
+return template.includes("export default async function");
+"#,
+        json!(null),
+    )
+    .await
+    .unwrap();
+    assert_eq!(value, json!(true));
 }

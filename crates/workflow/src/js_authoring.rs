@@ -2,7 +2,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
-    BranchSpec, BudgetSpec, CondSpec, ExpandSpec, LeafSpec, LoopUntilSpec, ModelPolicy,
+    BranchSpec, BudgetSpec, CondSpec, ExpandSpec, GateSpec, LeafSpec, LoopUntilSpec, ModelPolicy,
     PermissionSpec, PromotionPolicy, ReduceSpec, SequenceSpec, TeacherReviewSpec, WorkflowNode,
     WorkflowSpec, validate_workflow_nodes,
 };
@@ -47,6 +47,7 @@ fn compile_js_like_workflow(
         .map_err(JavascriptWorkflowError::InvalidJson)?;
     let mut workflow = authored.into_workflow();
     normalize_leaf_profiles(&mut workflow.nodes);
+    normalize_gate_roles(&mut workflow.gates);
     if workflow.goal.trim().is_empty() {
         return Err(JavascriptWorkflowError::InvalidNode(
             "workflow goal cannot be empty".to_string(),
@@ -57,12 +58,16 @@ fn compile_js_like_workflow(
     Ok(workflow)
 }
 
-// Profile names are case-insensitive roster keys; the IR stores the canonical
-// lowercase form. Invalid tokens are left as-is so validation reports them.
+// Role/profile names are case-insensitive roster keys; the IR stores the
+// canonical lowercase form. Invalid tokens are left as-is so validation
+// reports them.
 fn normalize_leaf_profiles(nodes: &mut [WorkflowNode]) {
     for node in nodes {
         match node {
             WorkflowNode::Leaf(spec) => {
+                if let Some(role) = spec.role.as_mut() {
+                    *role = role.trim().to_lowercase();
+                }
                 if let Some(profile) = spec.profile.as_mut() {
                     *profile = profile.trim().to_lowercase();
                 }
@@ -80,6 +85,15 @@ fn normalize_leaf_profiles(nodes: &mut [WorkflowNode]) {
                 }
             }
             WorkflowNode::Reduce(_) | WorkflowNode::TeacherReview(_) => {}
+        }
+    }
+}
+
+fn normalize_gate_roles(gates: &mut [GateSpec]) {
+    for gate in gates {
+        gate.role = gate.role.trim().to_lowercase();
+        if let Some(blocks_role) = gate.blocks_role.as_mut() {
+            *blocks_role = blocks_role.trim().to_lowercase();
         }
     }
 }
@@ -192,6 +206,8 @@ struct JsWorkflowSpec {
     #[serde(default)]
     promotion_policy: PromotionPolicy,
     #[serde(default)]
+    gates: Vec<GateSpec>,
+    #[serde(default)]
     nodes: Vec<JsWorkflowNode>,
 }
 
@@ -205,6 +221,7 @@ impl JsWorkflowSpec {
             permissions: self.permissions,
             model_policy: self.model_policy,
             promotion_policy: self.promotion_policy,
+            gates: self.gates,
             nodes: self
                 .nodes
                 .into_iter()
@@ -434,7 +451,10 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentType, WorkflowReplayExecutor};
+    use crate::{
+        AgentType, GateKind, GateOn, GateOnFail, GateOutcome, GateState, LaneGateBoard, TaskMode,
+        WorkflowReplayExecutor,
+    };
 
     #[test]
     fn javascript_workflow_compiles_branch_reduce_to_ir() {
@@ -536,6 +556,259 @@ workflow({
             panic!("second node should be a leaf");
         };
         assert_eq!(scan.profile, None);
+    }
+
+    #[test]
+    fn javascript_workflow_accepts_and_normalizes_agent_role() {
+        let source = r#"
+workflow({
+  "goal": "role routing",
+  "nodes": [
+    { "agent": { "id": "scout-issue", "prompt": "Investigate #4090. Read-only.", "role": " Scout " } },
+    { "agent": { "id": "fix-it", "prompt": "Apply minimal fix.", "role": "implementer" } }
+  ]
+});
+"#;
+
+        let workflow = compile_javascript_workflow("role.workflow.js", source)
+            .expect("role-carrying workflow should compile");
+
+        let WorkflowNode::Leaf(scout) = &workflow.nodes[0] else {
+            panic!("first node should be a leaf");
+        };
+        assert_eq!(scout.role.as_deref(), Some("scout"));
+        assert_eq!(scout.profile, None);
+        // Provider/model are not required identity fields on role steps.
+        assert_eq!(scout.model_policy.provider, None);
+        assert_eq!(scout.model_policy.model, None);
+
+        let WorkflowNode::Leaf(fix) = &workflow.nodes[1] else {
+            panic!("second node should be a leaf");
+        };
+        assert_eq!(fix.role.as_deref(), Some("implementer"));
+    }
+
+    #[test]
+    fn javascript_workflow_accepts_gate_specs() {
+        let source = r#"
+workflow({
+  "goal": "role gates",
+  "gates": [
+    {
+      "id": "scout-findings",
+      "role": " Scout ",
+      "on": "role_complete",
+      "gate": "approve",
+      "on_fail": "block",
+      "blocks_role": " Implementer ",
+      "artifact_kind": "findings"
+    }
+  ],
+  "nodes": [
+    { "agent": { "id": "scout", "prompt": "Find risk.", "role": "scout" } },
+    { "agent": { "id": "fix", "prompt": "Use findings.", "role": "implementer" } }
+  ]
+});
+"#;
+
+        let workflow =
+            compile_javascript_workflow("gates.workflow.js", source).expect("compile gates");
+
+        assert_eq!(workflow.gates.len(), 1);
+        let gate = &workflow.gates[0];
+        assert_eq!(gate.id, "scout-findings");
+        assert_eq!(gate.role, "scout");
+        assert_eq!(gate.on, GateOn::RoleComplete);
+        assert_eq!(gate.gate, GateKind::Approve);
+        assert_eq!(gate.on_fail, GateOnFail::Block);
+        assert_eq!(gate.blocks_role.as_deref(), Some("implementer"));
+        assert_eq!(gate.artifact_kind.as_deref(), Some("findings"));
+    }
+
+    #[test]
+    fn stopship_acceptance_fixture_is_read_only_and_gate_complete() {
+        let source = include_str!("../../../workflows/stopship.workflow.js");
+        let workflow = compile_javascript_workflow("stopship.workflow.js", source)
+            .expect("compile stopship acceptance fixture");
+
+        assert_eq!(workflow.id.as_deref(), Some("stopship-release-acceptance"));
+        let WorkflowNode::Sequence(sequence) = &workflow.nodes[0] else {
+            panic!("acceptance fixture should begin with one ordered role chain");
+        };
+        let expected_children = [
+            ("scout", 6, 480, 96_000),
+            ("implementer", 4, 420, 72_000),
+            ("reviewer", 4, 420, 72_000),
+            ("verifier", 4, 420, 72_000),
+            ("release_lead", 3, 300, 48_000),
+        ];
+        let mut aggregate_token_cap = 0_u64;
+        assert_eq!(sequence.children.len(), expected_children.len());
+        for (node, (expected_role, max_steps, timeout_secs, max_tokens)) in
+            sequence.children.iter().zip(expected_children)
+        {
+            let WorkflowNode::Leaf(leaf) = node else {
+                panic!("acceptance role chain must contain only agent leaves");
+            };
+            assert_eq!(leaf.role.as_deref(), Some(expected_role));
+            assert_eq!(leaf.mode, TaskMode::ReadOnly);
+            assert!(!leaf.permissions.allow_write);
+            assert!(leaf.permissions.allowed_tools.is_empty());
+            assert_eq!(
+                leaf.permissions.deny_all_tools,
+                expected_role != "scout",
+                "only the source-gathering scout should receive tools"
+            );
+            assert!(
+                leaf.prompt.contains(
+                    "first non-empty line of your response must be exactly APPROVE or exactly BLOCK"
+                ),
+                "{expected_role} must declare the host-readable verdict contract"
+            );
+            assert!(
+                leaf.prompt
+                    .contains("Do not put any words before that verdict")
+                    && leaf.prompt.contains("Here is the verdict"),
+                "{expected_role} must reject verdict preambles that the host cannot parse"
+            );
+            if expected_role == "scout" {
+                assert!(
+                    leaf.prompt.contains("exactly one `grep_files` call")
+                        && leaf
+                            .prompt
+                            .contains("Do not call `grep_files` more than once")
+                        && leaf.prompt.contains("do not call `read_file`"),
+                    "the scout must finish discovery in one bounded tool round"
+                );
+                assert_eq!(
+                    leaf.file_scope
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    vec![
+                        "fleets/stopship.toml",
+                        "crates/cli/src/lib.rs",
+                        "crates/workflow/src/role_resolve.rs",
+                        "crates/tui/src/tools/workflow.rs",
+                        "crates/lane/src/runtime.rs",
+                    ],
+                    "the scout grep must not include its own authored prompt"
+                );
+                assert!(
+                    leaf.prompt.contains(
+                        "`include` set exactly to [`fleets/stopship.toml`, `crates/cli/src/lib.rs`, `crates/workflow/src/role_resolve.rs`, `crates/tui/src/tools/workflow.rs`, `crates/lane/src/runtime.rs`]"
+                    ) && leaf.prompt.contains("Matches outside that exact include list do not count"),
+                    "the one grep must constrain the actual tool input, not only File scope metadata"
+                );
+                assert!(
+                    leaf.prompt.contains("if you can populate all seven")
+                        && leaf
+                            .prompt
+                            .contains("never return BLOCK after citing all seven")
+                        && leaf
+                            .prompt
+                            .contains("identify each missing owner as MISSING"),
+                    "the scout verdict must follow its own complete evidence artifact"
+                );
+            } else {
+                assert!(
+                    leaf.prompt.contains("Tools are intentionally unavailable")
+                        && leaf.prompt.contains("promoted handoff")
+                        && leaf.prompt.contains("all seven owners")
+                        && leaf.prompt.contains("one concise row per owner"),
+                    "{expected_role} must consume promoted evidence without reopening discovery"
+                );
+            }
+            assert_eq!(
+                leaf.file_scope
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                vec![
+                    "fleets/stopship.toml",
+                    "crates/cli/src/lib.rs",
+                    "crates/workflow/src/role_resolve.rs",
+                    "crates/tui/src/tools/workflow.rs",
+                    "crates/lane/src/runtime.rs",
+                ],
+                "every acceptance role must carry the same promoted evidence boundary"
+            );
+            assert_eq!(leaf.budget.max_steps, Some(max_steps), "{expected_role}");
+            let response_budget = match max_steps {
+                6 => "at most six model responses",
+                4 => "at most four model responses",
+                3 => "at most three model responses",
+                _ => unreachable!("unexpected stopship model-response budget"),
+            };
+            assert!(
+                leaf.prompt.contains(response_budget) && leaf.prompt.contains("with no tool calls"),
+                "{expected_role} must reserve a response for its explicit verdict"
+            );
+            assert_eq!(
+                leaf.budget.timeout_secs,
+                Some(timeout_secs),
+                "{expected_role}"
+            );
+            assert_eq!(leaf.budget.max_tokens, Some(max_tokens), "{expected_role}");
+            assert!(
+                max_tokens < u64::from(max_steps) * 24_000,
+                "{expected_role} verdict reserve must not raise its token ceiling"
+            );
+            aggregate_token_cap = aggregate_token_cap.saturating_add(max_tokens);
+            assert!(
+                leaf.profile.is_none(),
+                "Fleet must resolve the declared role"
+            );
+        }
+        assert_eq!(
+            aggregate_token_cap, 360_000,
+            "the fixture must stay globally bounded when no shared override is supplied"
+        );
+
+        let expected_gates = [
+            ("scout", Some("implementer"), "source_evidence"),
+            ("implementer", Some("reviewer"), "verification_plan"),
+            ("reviewer", Some("verifier"), "review_report"),
+            ("verifier", Some("release_lead"), "verification_report"),
+            ("release_lead", None, "final_receipt"),
+        ];
+        assert_eq!(workflow.gates.len(), expected_gates.len());
+        for (gate, (role, blocked_role, artifact_kind)) in workflow.gates.iter().zip(expected_gates)
+        {
+            assert_eq!(gate.role, role);
+            assert_eq!(gate.on, GateOn::RoleComplete);
+            assert_eq!(gate.on_fail, GateOnFail::Block);
+            assert_eq!(gate.blocks_role.as_deref(), blocked_role);
+            assert_eq!(gate.max_retries, 0);
+            assert_eq!(gate.artifact_kind.as_deref(), Some(artifact_kind));
+            assert!(
+                gate.require_explicit_verdict,
+                "{role} gate must fail closed when its verdict is missing or malformed"
+            );
+        }
+
+        let mut board = LaneGateBoard::new("lane-fixture-contract");
+        board.install_gates(&workflow.gates);
+        assert_eq!(
+            board
+                .evaluate(&workflow.gates[0], GateOutcome::Pass)
+                .expect("successful role promotes its gate"),
+            GateState::Passed
+        );
+        let failure = board
+            .evaluate(
+                &workflow.gates[3],
+                GateOutcome::Fail {
+                    reason: "verifier receipt missing".to_string(),
+                },
+            )
+            .expect("failed verifier updates its gate");
+        assert!(matches!(failure, GateState::Blocked { .. }));
+        assert!(
+            board
+                .role_is_blocked(&workflow.gates, "release_lead")
+                .is_some()
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::deepseek_theme::Theme;
 use crate::models::{ContentBlock, Message};
 use crate::palette;
 use crate::tools::plan::{PlanSnapshot, StepStatus};
+use crate::tui::ui_text::{line_to_plain, slice_text, text_display_width};
 use ratatui::style::Modifier;
 use std::time::{Duration, Instant};
 
@@ -89,6 +90,31 @@ fn workflow_tool_renders_run_card_instead_of_generic_oneliner() {
         "workflow_goal": "audit the FLEET and WORKFLOW docs",
         "child_ids": ["a1", "a2", "a3"],
         "progress": ["phase: Scan", "log: 3 findings"],
+        "events": [
+            {
+                "type": "task_started",
+                "task_id": "a1",
+                "label": "scan-docs",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_phase_id": "Scan",
+                "workflow_task_label": "scan-docs",
+                "workflow_child_index": 0,
+            },
+            {
+                "type": "task_started",
+                "task_id": "a2",
+                "workflow_task_label": "check-fleet",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_child_index": 1,
+            },
+            {
+                "type": "task_started",
+                "task_id": "a3",
+                "label": "summarize",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_child_index": 2,
+            },
+        ],
         "schema_errors": [],
     })
     .to_string();
@@ -107,19 +133,108 @@ fn workflow_tool_renders_run_card_instead_of_generic_oneliner() {
         .iter()
         .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
         .collect();
-    assert!(joined.contains("workflow_2400c600"), "run_id: {joined:?}");
-    // Copy dedupe (Wave 5c #7): the header owns the lifecycle label; the body
-    // no longer repeats it as a `status:` KV row.
-    assert!(joined.contains("done"), "header lifecycle: {joined:?}");
+    // Compact (#4122): lifecycle, children, phases, failures, elapsed.
+    assert!(
+        joined.contains("3 children") || joined.contains("children"),
+        "child count: {joined:?}"
+    );
+    assert!(
+        joined.contains("success") || joined.contains("done"),
+        "header lifecycle: {joined:?}"
+    );
+    assert!(joined.contains("phase"), "phase count: {joined:?}");
+    assert!(joined.contains("fail"), "failure count present: {joined:?}");
+    assert!(
+        joined.contains('s') || joined.contains('m'),
+        "elapsed: {joined:?}"
+    );
     assert!(
         !joined.contains("status:"),
         "body must not repeat the header lifecycle: {joined:?}"
     );
-    assert!(joined.contains("audit the FLEET"), "goal: {joined:?}");
-    assert!(joined.contains("children: 3"), "child count: {joined:?}");
+}
+
+#[test]
+fn workflow_tool_expanded_card_shows_phase_child_result_and_failures() {
+    let output = serde_json::json!({
+        "run_id": "workflow_exp",
+        "status": "failed",
+        "workflow_goal": "ship v0.8.68",
+        "started_at_ms": 1000,
+        "completed_at_ms": 5000,
+        "source_path": "workflows/demo.workflow.js",
+        "error": "phase Verify failed",
+        "result": {"summary": "2 of 3 children ok"},
+        "events": [
+            {
+                "type": "run_started",
+                "at_ms": 1000,
+                "run_id": "workflow_exp",
+                "workflow_goal": "ship v0.8.68"
+            },
+            {"type": "phase_started", "at_ms": 1100, "title": "Verify"},
+            {
+                "type": "task_started",
+                "at_ms": 1200,
+                "task_id": "t1",
+                "label": "run tests",
+                "workflow_task_label": "run tests",
+                "profile": "implementer"
+            },
+            {
+                "type": "task_completed",
+                "at_ms": 4000,
+                "task_id": "t1",
+                "status": "failed"
+            },
+            {
+                "type": "run_completed",
+                "at_ms": 5000,
+                "status": "failed",
+                "error": "phase Verify failed"
+            }
+        ]
+    })
+    .to_string();
+    let cell = GenericToolCell {
+        name: "workflow".to_string(),
+        status: ToolStatus::Failed,
+        input_summary: Some("action: run".to_string()),
+        output: Some(output),
+        prompts: None,
+        spillover_path: Some(std::path::PathBuf::from("/tmp/wf-artifact.json")),
+        output_summary: None,
+        is_diff: false,
+    };
+    let joined: String = cell
+        .lines_with_mode(140, true, super::RenderMode::Transcript)
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("ship v0.8.68"), "goal: {joined}");
     assert!(
-        joined.contains("log: 3 findings"),
-        "last progress: {joined:?}"
+        joined.contains("phases:") || joined.contains("Verify"),
+        "phase: {joined}"
+    );
+    assert!(
+        joined.contains("children:") || joined.contains("child"),
+        "child: {joined}"
+    );
+    assert!(joined.contains("run tests"), "child label: {joined}");
+    assert!(
+        joined.contains("result:") || joined.contains("2 of 3"),
+        "final result: {joined}"
+    );
+    assert!(
+        joined.contains("artifact:")
+            || joined.contains("source:")
+            || joined.contains("transcript:"),
+        "links: {joined}"
+    );
+    assert!(
+        joined.contains("error:") || joined.contains("phase Verify failed"),
+        "failure details: {joined}"
     );
 }
 
@@ -915,7 +1030,12 @@ fn tool_lines_with_options_respects_low_motion_in_default_path() {
     // platforms with coarse timer resolution (Windows ≈ 15.6 ms) and
     // gives several frame intervals of headroom before the index could
     // wrap back to 0.
-    let started_at = Some(Instant::now() - Duration::from_millis(TOOL_STATUS_SYMBOL_MS * 2));
+    let started_at = Some(
+        Instant::now()
+            - Duration::from_millis(
+                crate::tui::spinner::LIVE_MARKER_DELAY_MS + TOOL_STATUS_SYMBOL_MS * 2,
+            ),
+    );
     let cell = HistoryCell::Tool(ToolCell::Exec(ExecCell {
         command: "echo hi".to_string(),
         status: ToolStatus::Running,
@@ -944,8 +1064,9 @@ fn tool_lines_with_options_respects_low_motion_in_default_path() {
     let animated_symbol = animated[0].spans[1].content.trim();
     let low_motion_symbol = low_motion[0].spans[1].content.trim();
 
-    // low_motion always pins to the first (static) frame.
-    assert_eq!(low_motion_symbol, TOOL_RUNNING_SYMBOLS[0]);
+    // Reduced motion freezes at a filled, legible bubble rather than an
+    // invisible blank braille cell.
+    assert_eq!(low_motion_symbol, "⣤");
     // The animated path should be on a different frame (index 2).
     assert_ne!(animated_symbol, TOOL_RUNNING_SYMBOLS[0]);
 }
@@ -1062,6 +1183,134 @@ fn assistant_cell_renders_with_bullet_glyph_not_literal_label() {
     );
     assert!(visible.contains("ready"));
     assert_ne!(head.style.bg, Some(palette::SURFACE_ELEVATED));
+}
+
+#[test]
+fn copy_metadata_strips_tool_receipt_chrome_but_keeps_text() {
+    let cell = HistoryCell::Tool(ToolCell::Exec(ExecCell {
+        command: "printf 'receipt'".to_string(),
+        status: ToolStatus::Success,
+        output: Some("receipt".to_string()),
+        live_output: None,
+        shell_task_id: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        started_at: None,
+        duration_ms: None,
+        source: ExecSource::Assistant,
+        interaction: None,
+        output_summary: None,
+    }));
+    let rendered = cell.lines_with_copy_metadata(80, TranscriptRenderOptions::default());
+    let header = rendered.first().expect("tool receipt header");
+    assert!(
+        header.copy_prefix_width >= 4,
+        "missing status/family chrome width"
+    );
+    assert!(
+        header
+            .line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("receipt")),
+        "receipt text must remain in the rendered copy source"
+    );
+    let header_text = line_to_plain(&ratatui::text::Line::from(
+        header
+            .line
+            .spans
+            .iter()
+            .skip(1)
+            .cloned()
+            .collect::<Vec<_>>(),
+    ));
+    let copied = slice_text(
+        &header_text,
+        header.copy_prefix_width,
+        text_display_width(&header_text),
+    );
+    assert!(
+        !copied.contains('✓'),
+        "status chrome leaked into copy: {copied:?}"
+    );
+    assert!(
+        !copied.contains('●'),
+        "family chrome leaked into copy: {copied:?}"
+    );
+    assert!(
+        copied.contains("run done"),
+        "receipt text was clipped: {copied:?}"
+    );
+}
+
+#[test]
+fn copy_metadata_tracks_wrapped_assistant_code_prefix_in_display_columns() {
+    let cell = HistoryCell::Assistant {
+        content: "```text\n  中文 = 1\n```".to_string(),
+        streaming: false,
+    };
+    let rendered = cell.lines_with_copy_metadata(24, TranscriptRenderOptions::default());
+    let code_line = rendered
+        .iter()
+        .find(|line| {
+            line.line
+                .spans
+                .iter()
+                .any(|span| span.content.contains("中文"))
+        })
+        .expect("wrapped fenced code line");
+    assert_eq!(
+        code_line.copy_prefix_width, 2,
+        "code continuation prefix uses the role marker's two display columns"
+    );
+    let code = line_to_plain(&code_line.line);
+    let copied = slice_text(
+        &code,
+        code_line.copy_prefix_width,
+        text_display_width(&code),
+    );
+    assert!(
+        copied.contains("中文 = 1"),
+        "code text was clipped: {copied:?}"
+    );
+    assert!(
+        copied.starts_with("    中文"),
+        "code indentation or visual prefix was wrong: {copied:?}"
+    );
+}
+
+#[test]
+fn copy_metadata_keeps_fenced_code_indentation_after_prefix_removal() {
+    let cell = HistoryCell::Assistant {
+        content: "```rust\n    let answer = 42;\n```".to_string(),
+        streaming: false,
+    };
+    let rendered = cell.lines_with_copy_metadata(40, TranscriptRenderOptions::default());
+    let code_line = rendered
+        .iter()
+        .find(|line| {
+            line.line
+                .spans
+                .iter()
+                .any(|span| span.content.contains("answer"))
+        })
+        .expect("fenced code body");
+    let text = line_to_plain(&code_line.line);
+    let content = slice_text(
+        &text,
+        code_line.copy_prefix_width,
+        text_display_width(&text),
+    );
+    assert!(
+        content.contains("    let answer = 42;"),
+        "code indentation was not preserved: {content:?}"
+    );
+    for glyph in ['╎', '▎', '●', '│', '┃'] {
+        assert!(
+            !content.contains(glyph),
+            "decorative glyph leaked: {content:?}"
+        );
+    }
 }
 
 #[test]
@@ -1657,7 +1906,7 @@ fn plan_update_cell_renders_rich_artifact_metadata() {
             context_summary: Some("Grounded in issue #2691".to_string()),
             sources_used: vec!["gh issue view 2691".to_string()],
             critical_files: vec!["crates/tui/src/tools/plan.rs".to_string()],
-            constraints: vec!["Keep checklist primary".to_string()],
+            constraints: vec!["Keep To-do primary".to_string()],
             recommended_approach: Some(
                 "Enrich update_plan without breaking legacy calls".to_string(),
             ),

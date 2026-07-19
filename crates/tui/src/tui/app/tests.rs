@@ -4,7 +4,7 @@ use crate::settings::Settings;
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
 use crate::tools::todo::TodoStatus;
-use crate::tui::clipboard::PastedImage;
+use crate::tui::clipboard::{ClipboardHandler, PastedImage};
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
 
 fn test_options(yolo: bool) -> TuiOptions {
@@ -41,19 +41,6 @@ fn create_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::
 #[cfg(windows)]
 fn create_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_dir(target, link)
-}
-
-#[test]
-fn feature_intro_content_centers_constitution_follow_up() {
-    let content = App::feature_intro_content();
-    assert!(content.contains("Your CodeWhale setup is ready."));
-    assert!(content.contains("Constitution"));
-    assert!(content.contains("/constitution"));
-    assert!(content.contains("/setup"));
-    assert!(content.contains("/provider") && content.contains("/model"));
-    assert!(content.contains("Optional later"));
-    assert!(content.contains("/hotbar") && content.contains("/hotbar off"));
-    assert!(content.contains("Fleet") && content.contains("/fleet setup"));
 }
 
 #[test]
@@ -104,22 +91,11 @@ fn feature_intro_shows_once_persists_then_is_idempotent() {
     let before = app.history.len();
 
     app.maybe_show_feature_intro();
-    assert_eq!(
-        app.history.len(),
-        before + 1,
-        "intro should be added on the first call"
-    );
-    let content = match app.history.last() {
-        Some(HistoryCell::System { content }) => content.clone(),
-        other => panic!("expected a System intro cell, got {other:?}"),
-    };
+    assert_eq!(app.history.len(), before, "intro must not hide empty state");
     assert!(
-        content.contains("Hotbar") && content.contains("/hotbar off"),
-        "intro should explain Hotbar + the disable path: {content:?}"
-    );
-    assert!(
-        content.contains("Fleet") && content.contains("/fleet setup"),
-        "intro should explain Fleet setup: {content:?}"
+        app.status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Fleet") && message.contains("/fleet setup"))
     );
 
     // Persisted flag now set → a second call is a no-op.
@@ -132,7 +108,7 @@ fn feature_intro_shows_once_persists_then_is_idempotent() {
     app.maybe_show_feature_intro();
     assert_eq!(
         app.history.len(),
-        before + 1,
+        before,
         "intro must not repeat once the flag is persisted"
     );
 
@@ -244,7 +220,13 @@ fn move_cursor_line_start_already_at_start() {
 
 #[test]
 fn test_trust_mode_follows_yolo_on_startup() {
-    let app = App::new(test_options(true), &Config::default());
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let mut options = test_options(true);
+    options.config_path = Some(config_path);
+    let app = App::new(options, &Config::default());
     assert!(app.trust_mode);
 }
 
@@ -317,6 +299,34 @@ fn mode_and_thinking_are_locked_while_a_turn_is_running() {
 }
 
 #[test]
+fn cycle_effort_updates_effort_status_and_compaction() {
+    // Ctrl+T parity with the hotbar's `reasoning.cycle` action: cycling the
+    // effort must surface a status message and refresh the compaction budget,
+    // not just silently flip the setting.
+    let mut app = App::new(test_options(false), &Config::default());
+    app.api_provider = ApiProvider::Deepseek;
+    app.auto_model = false;
+    app.reasoning_effort = ReasoningEffort::Off;
+    // Sentinel so the test can observe update_model_compaction_budget().
+    app.compact_threshold = 0;
+
+    app.cycle_effort();
+
+    assert_eq!(app.reasoning_effort, ReasoningEffort::High);
+    assert!(app.reasoning_effort_explicit);
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Reasoning effort: high"),
+        "Ctrl+T must give visible feedback like the hotbar action"
+    );
+    assert_ne!(
+        app.compact_threshold, 0,
+        "cycling effort must refresh the compaction budget"
+    );
+    assert!(app.needs_redraw);
+}
+
+#[test]
 fn reasoning_effort_api_values_are_provider_aware_for_codex() {
     assert_eq!(
         ReasoningEffort::Off.normalize_for_provider(ApiProvider::OpenaiCodex),
@@ -341,6 +351,56 @@ fn reasoning_effort_api_values_are_provider_aware_for_codex() {
     assert_eq!(
         ReasoningEffort::from_setting("ultracode"),
         ReasoningEffort::Max
+    );
+}
+
+#[test]
+fn reasoning_effort_uses_one_strict_alias_table_and_legacy_fallback() {
+    for raw in ["off", "none", "disabled", "false"] {
+        assert_eq!(ReasoningEffort::parse_strict(raw), Ok(ReasoningEffort::Off));
+    }
+    for raw in ["low", "minimum", "minimal", "light"] {
+        assert_eq!(ReasoningEffort::parse_strict(raw), Ok(ReasoningEffort::Low));
+    }
+    for raw in ["medium", "mid"] {
+        assert_eq!(
+            ReasoningEffort::parse_strict(raw),
+            Ok(ReasoningEffort::Medium)
+        );
+    }
+    for raw in ["xhigh", "ultra", "max", "maximum", "ultracode"] {
+        assert_eq!(ReasoningEffort::parse_strict(raw), Ok(ReasoningEffort::Max));
+    }
+    assert!(ReasoningEffort::parse_strict("surprise").is_err());
+    assert_eq!(
+        ReasoningEffort::from_setting("surprise"),
+        ReasoningEffort::Max
+    );
+}
+
+#[test]
+fn reasoning_effort_preserves_kimi_code_low_and_medium_only_on_exact_route() {
+    let kimi_base = crate::config::DEFAULT_KIMI_CODE_BASE_URL;
+    let moonshot_base = crate::config::DEFAULT_MOONSHOT_BASE_URL;
+    assert_eq!(
+        ReasoningEffort::Low.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Low
+    );
+    assert_eq!(
+        ReasoningEffort::Medium.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Medium
+    );
+    assert_eq!(
+        ReasoningEffort::Low.normalize_for_route(ApiProvider::Moonshot, moonshot_base, "k3"),
+        ReasoningEffort::High
+    );
+    assert_eq!(
+        ReasoningEffort::Medium.normalize_for_route(
+            ApiProvider::Moonshot,
+            kimi_base,
+            "kimi-for-coding",
+        ),
+        ReasoningEffort::High
     );
 }
 
@@ -393,6 +453,62 @@ fn app_new_normalizes_saved_codex_reasoning_effort() {
         assert_eq!(app.reasoning_effort, expected, "raw setting {raw}");
         assert_eq!(app.reasoning_effort_display_label(), display);
     }
+}
+
+#[test]
+fn codex_startup_threads_fresh_roster_context_into_active_route_limits() {
+    let _lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let codex_home = tmp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home).expect("Codex home");
+    std::fs::write(
+        codex_home.join("models_cache.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "fetched_at": chrono::Utc::now(),
+            "models": [{
+                "slug": crate::config::DEFAULT_OPENAI_CODEX_MODEL,
+                "priority": 1,
+                "context_window": 128000,
+                "supported_reasoning_levels": [{"effort": "high"}]
+            }]
+        }))
+        .expect("serialize cache"),
+    )
+    .expect("write cache");
+    let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+    let _token = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-codex-startup-token");
+    let config = Config {
+        provider: Some("openai-codex".to_string()),
+        providers: Some(ProvidersConfig {
+            openai_codex: ProviderConfig {
+                model: Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string()),
+                ..ProviderConfig::default()
+            },
+            ..ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+
+    let mut options = test_options(false);
+    options.model = crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string();
+    let app = App::new(options, &config);
+
+    assert_eq!(app.api_provider, ApiProvider::OpenaiCodex);
+    assert_eq!(
+        app.active_route_limits
+            .and_then(|limits| limits.context_tokens),
+        Some(128_000)
+    );
+    assert_eq!(
+        crate::route_budget::route_context_window_tokens(
+            app.api_provider,
+            &app.model,
+            app.active_route_limits,
+        ),
+        128_000
+    );
 }
 
 #[test]
@@ -482,7 +598,7 @@ fn app_new_defaults_auto_compact_on_for_256k_class_models_when_unset() {
     assert!(app.auto_compact);
     assert!(!app.auto_compact_user_configured);
     assert_eq!(app.auto_compact_threshold_percent, 80.0);
-    assert_eq!(app.compact_threshold, 209_715);
+    assert_eq!(app.compact_threshold, 156_467);
 }
 
 #[test]
@@ -499,7 +615,7 @@ fn app_new_defaults_auto_compact_on_for_v4_class_models_when_unset() {
     assert!(app.auto_compact);
     assert!(!app.auto_compact_user_configured);
     assert_eq!(app.auto_compact_threshold_percent, 80.0);
-    assert_eq!(app.compact_threshold, 800_000);
+    assert_eq!(app.compact_threshold, 589_466);
 }
 
 #[test]
@@ -516,7 +632,7 @@ fn app_new_respects_explicit_auto_compact_false_for_256k_class_models() {
 
     assert!(!app.auto_compact);
     assert!(app.auto_compact_user_configured);
-    assert_eq!(app.compact_threshold, 209_715);
+    assert_eq!(app.compact_threshold, 156_467);
 }
 
 #[test]
@@ -533,7 +649,7 @@ fn app_new_respects_explicit_auto_compact_false_for_v4_class_models() {
 
     assert!(!app.auto_compact);
     assert!(app.auto_compact_user_configured);
-    assert_eq!(app.compact_threshold, 800_000);
+    assert_eq!(app.compact_threshold, 589_466);
 }
 
 #[test]
@@ -565,13 +681,25 @@ fn cny_display_keeps_cny_when_costs_have_cny_rates() {
 }
 
 #[test]
+fn subscription_route_hides_stale_session_dollars_in_footer() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.accrue_session_cost_estimate(CostEstimate::usd_only(12.34));
+    app.billing_presentation =
+        crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
+    assert!(crate::tui::footer_ui::footer_cost_spans(&app).is_empty());
+}
+
+#[test]
 fn cny_cache_savings_falls_back_to_usd_for_usd_only_models() {
     let mut app = App::new(test_options(false), &Config::default());
     app.cost_currency = CostCurrency::Cny;
+    app.api_provider = ApiProvider::Moonshot;
     app.model = "kimi-k2.6".to_string();
     app.session.last_prompt_cache_hit_tokens = Some(1_000_000);
 
-    assert_eq!(app.last_turn_cache_savings(), Some(0.34));
+    // 1M cache-hit tokens save (input 0.95 - cache-read 0.16) = $0.79.
+    let savings = app.last_turn_cache_savings().expect("kimi-k2.6 is priced");
+    assert!((savings - 0.79).abs() < 1e-9, "got {savings}");
 }
 
 #[test]
@@ -582,6 +710,9 @@ fn sidebar_focus_accepts_pinned_and_maps_legacy_trackers_to_pinned() {
     assert_eq!(SidebarFocus::from_setting("plan"), SidebarFocus::Pinned);
     assert_eq!(SidebarFocus::from_setting("todos"), SidebarFocus::Pinned);
     assert_eq!(SidebarFocus::from_setting("tasks"), SidebarFocus::Tasks);
+    assert_eq!(SidebarFocus::from_setting("activity"), SidebarFocus::Tasks);
+    assert_eq!(SidebarFocus::from_setting("live"), SidebarFocus::Tasks);
+    assert_eq!(SidebarFocus::from_setting("running"), SidebarFocus::Tasks);
     assert_eq!(SidebarFocus::from_setting("agents"), SidebarFocus::Agents);
     assert_eq!(SidebarFocus::from_setting("context"), SidebarFocus::Context);
     assert_eq!(SidebarFocus::from_setting("hidden"), SidebarFocus::Hidden);
@@ -898,7 +1029,7 @@ fn composer_keeps_legitimate_closing_bracket_digit_text() {
 
 // initial_onboarding_state tests
 // These pin the logic that decides whether the TUI shows the
-// onboarding flow (Welcome → Language → ApiKey → …) or goes
+// onboarding flow (Welcome → Language → Provider setup → …) or goes
 // straight to the chat view.  Getting this wrong either locks
 // first-run users out of the API-key prompt or nags returning
 // users whose key is already configured.
@@ -924,15 +1055,15 @@ fn fully_configured_returning_user_skips_onboarding() {
 }
 
 #[test]
-fn returning_user_missing_api_key_goes_to_api_key_screen() {
+fn returning_user_missing_api_key_goes_to_canonical_provider_setup() {
     assert_eq!(
         initial_onboarding_state(false, true, true, false),
-        OnboardingState::ApiKey
+        OnboardingState::Provider
     );
     // workspace trust doesn't affect the api-key gate
     assert_eq!(
         initial_onboarding_state(false, true, true, true),
-        OnboardingState::ApiKey
+        OnboardingState::Provider
     );
 }
 
@@ -1488,6 +1619,63 @@ fn clear_todos_resets_plan_state() {
 }
 
 #[test]
+fn work_state_snapshot_round_trips_todos_and_plan() {
+    let app = App::new(test_options(false), &Config::default());
+    {
+        let mut todos = app.todos.try_lock().expect("todos lock");
+        todos.add("inspect".to_string(), TodoStatus::Completed);
+        todos.add("patch".to_string(), TodoStatus::InProgress);
+    }
+    {
+        let mut plan = app.plan_state.try_lock().expect("plan lock");
+        plan.update(UpdatePlanArgs {
+            objective: Some("Keep Work durable".to_string()),
+            plan: vec![PlanItemArg {
+                step: "verify".to_string(),
+                status: StepStatus::InProgress,
+            }],
+            ..UpdatePlanArgs::default()
+        });
+    }
+    let state = app
+        .work_state_snapshot()
+        .expect("snapshot locks")
+        .expect("non-empty state");
+
+    let mut restored = App::new(test_options(false), &Config::default());
+    restored
+        .restore_work_state(Some(&state))
+        .expect("restore Work state");
+    assert_eq!(
+        restored.work_state_snapshot().expect("snapshot"),
+        Some(state)
+    );
+}
+
+#[test]
+fn clear_todos_is_atomic_and_invalidates_cached_work_summary() {
+    let mut app = App::new(test_options(false), &Config::default());
+    {
+        let mut todos = app.todos.try_lock().expect("todos lock");
+        todos.add("clear me".to_string(), TodoStatus::Pending);
+    }
+    app.cached_work_summary = Some(SidebarWorkSummary::default());
+
+    assert!(app.clear_todos());
+    assert!(app.cached_work_summary.is_none());
+    assert_eq!(app.work_state_snapshot().expect("snapshot"), None);
+}
+
+#[test]
+fn entering_operate_preserves_user_sidebar_focus() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.sidebar_focus = SidebarFocus::Tasks;
+
+    assert!(app.set_mode(AppMode::Operate));
+    assert_eq!(app.sidebar_focus, SidebarFocus::Tasks);
+}
+
+#[test]
 fn app_mode_helpers_centralize_parse_labels_and_cycle_order() {
     assert_eq!(AppMode::parse("agent"), Some(AppMode::Agent));
     assert_eq!(AppMode::parse("act"), Some(AppMode::Agent));
@@ -1516,10 +1704,6 @@ fn app_mode_helpers_centralize_parse_labels_and_cycle_order() {
     assert_eq!(AppMode::Yolo.number(), '1');
     assert_eq!(AppMode::Operate.number(), '3');
     assert_eq!(
-        AppMode::CHOICES,
-        [AppMode::Agent, AppMode::Plan, AppMode::Operate]
-    );
-    assert_eq!(
         AppMode::CYCLE,
         [AppMode::Plan, AppMode::Agent, AppMode::Operate]
     );
@@ -1543,6 +1727,25 @@ fn test_cycle_mode_transitions() {
     app.cycle_mode();
     // Mode should have changed
     assert_ne!(app.mode, initial_mode);
+}
+
+#[test]
+fn effective_route_display_tracks_inflight_and_last_auto_provider() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.auto_model = true;
+    app.pending_turn_route = Some((ApiProvider::Zai, "glm-5.2".to_string(), true));
+    assert_eq!(
+        app.effective_route_display(),
+        (ApiProvider::Zai, "glm-5.2".to_string())
+    );
+
+    app.pending_turn_route = None;
+    app.last_effective_provider = Some(ApiProvider::Xai);
+    app.last_effective_model = Some("grok-4.5".to_string());
+    assert_eq!(
+        app.effective_route_display(),
+        (ApiProvider::Xai, "grok-4.5".to_string())
+    );
 }
 
 #[test]
@@ -1649,6 +1852,7 @@ fn test_remove_queued_message_invalid_index() {
 #[test]
 fn test_set_mode_updates_state() {
     let mut app = App::new(test_options(false), &Config::default());
+    app.yolo_compat_notified = true;
     app.set_mode(AppMode::Plan);
     assert_eq!(app.mode, AppMode::Plan);
     // The deprecated YOLO alias remaps to Agent (M6 back-compat shim).
@@ -1679,6 +1883,7 @@ fn set_mode_yolo_restores_previous_policies_on_exit() {
     app.allow_shell = false;
     app.trust_mode = false;
     app.approval_mode = ApprovalMode::Never;
+    app.yolo_compat_notified = true;
 
     app.set_mode(AppMode::Yolo);
     assert!(app.allow_shell);
@@ -1720,6 +1925,7 @@ fn set_mode_plan_to_yolo_keeps_yolo_permissions_and_restores_agent_baseline() {
     app.allow_shell = false;
     app.trust_mode = false;
     app.approval_mode = ApprovalMode::Never;
+    app.yolo_compat_notified = true;
 
     app.set_mode(AppMode::Plan);
     app.approval_mode = ApprovalMode::Suggest;
@@ -1770,6 +1976,9 @@ fn base_policy_for_mode_projects_the_mode_permission_table() {
 
     // Operate uses the Agent baseline.
     let operate = base_policy_for_mode(AppMode::Operate, &prefs);
+    assert_eq!(operate.mode, AppMode::Operate);
+    assert_eq!(operate.allow_shell, agent.allow_shell);
+    assert_eq!(operate.trust_mode, agent.trust_mode);
     assert_eq!(operate.approval_mode, ApprovalMode::Never);
 
     // YOLO: full authority is represented by Bypass, not a separate
@@ -1790,12 +1999,21 @@ fn base_policy_for_mode_projects_the_mode_permission_table() {
     assert!(!agent_min.allow_shell);
     assert!(!agent_min.trust_mode);
     assert_eq!(agent_min.approval_mode, ApprovalMode::Suggest);
+    let operate_min = base_policy_for_mode(AppMode::Operate, &minimal);
+    assert!(!operate_min.allow_shell);
+    assert!(!operate_min.trust_mode);
+    assert_eq!(operate_min.approval_mode, ApprovalMode::Suggest);
 }
 
 #[test]
 fn cycle_approval_posture_cycles_suggest_auto_bypass() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
     let mut options = test_options(false);
     options.start_in_agent_mode = true;
+    options.config_path = Some(config_path);
     let mut app = App::new(options, &Config::default());
     app.approval_mode = ApprovalMode::Suggest;
 
@@ -1807,12 +2025,19 @@ fn cycle_approval_posture_cycles_suggest_auto_bypass() {
 
     assert!(app.cycle_approval_posture());
     assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    let persisted = std::fs::read_to_string(tmp.path().join("settings.toml")).expect("settings");
+    assert!(persisted.contains("permission_posture = \"ask\""));
 }
 
 #[test]
 fn cycle_approval_posture_emits_rebinding_notice_once() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
     let mut options = test_options(false);
     options.start_in_agent_mode = true;
+    options.config_path = Some(config_path);
     let mut app = App::new(options, &Config::default());
 
     assert!(app.cycle_approval_posture());
@@ -1833,6 +2058,244 @@ fn cycle_approval_posture_emits_rebinding_notice_once() {
 }
 
 #[test]
+fn plan_permission_cycle_is_rejected_without_mutating_agent_baseline() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let mut options = test_options(false);
+    options.config_path = Some(config_path);
+    let mut app = App::new(options, &Config::default());
+    app.set_agent_approval_posture(ApprovalMode::Auto);
+    app.set_mode(AppMode::Plan);
+
+    assert!(!app.cycle_approval_posture());
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    assert_eq!(app.mode_prefs.agent_approval_mode, ApprovalMode::Auto);
+    assert!(!tmp.path().join("settings.toml").exists());
+    assert!(
+        app.status_toasts
+            .iter()
+            .any(|toast| toast.text.contains("Read Only"))
+    );
+
+    app.set_mode(AppMode::Operate);
+    assert_eq!(app.approval_mode, ApprovalMode::Auto);
+}
+
+#[test]
+fn busy_permission_cycle_changes_neither_runtime_nor_persistence() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let mut options = test_options(false);
+    options.config_path = Some(config_path);
+    let mut app = App::new(options, &Config::default());
+    let before = app.approval_mode;
+    app.is_loading = true;
+
+    assert!(!app.cycle_approval_posture());
+    assert_eq!(app.approval_mode, before);
+    assert_eq!(app.mode_prefs.agent_approval_mode, before);
+    assert!(!tmp.path().join("settings.toml").exists());
+    assert!(
+        app.status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("locked"))
+    );
+}
+
+#[test]
+fn permission_postures_persist_across_restart() {
+    let _env_lock = lock_test_env();
+    for (cycles, expected) in [
+        (1, ApprovalMode::Auto),
+        (2, ApprovalMode::Bypass),
+        (3, ApprovalMode::Suggest),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        let config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &path);
+        let mut options = test_options(false);
+        options.start_in_agent_mode = true;
+        options.config_path = Some(path.clone());
+        let mut app = App::new(options.clone(), &Config::default());
+        for _ in 0..cycles {
+            assert!(app.cycle_approval_posture());
+        }
+        assert_eq!(app.approval_mode, expected);
+
+        let restarted = App::new(options, &Config::default());
+        assert_eq!(restarted.approval_mode, expected);
+        assert_eq!(restarted.mode_prefs.agent_approval_mode, expected);
+        drop(config_env);
+    }
+}
+
+#[test]
+fn shift_tab_migrates_user_root_policy_to_durable_tui_posture() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let settings_path = tmp.path().join("settings.toml");
+    std::fs::write(&config_path, "# keep\napproval_policy = \"on-request\"\n")
+        .expect("root config");
+    std::fs::write(&settings_path, "permission_posture = \"full-access\"\n").expect("settings");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let _approval_env = EnvVarGuard::remove("DEEPSEEK_APPROVAL_POLICY");
+    let config = Config::load(Some(config_path.clone()), None).expect("load config");
+    let mut options = test_options(false);
+    options.start_in_agent_mode = true;
+    options.config_path = Some(config_path.clone());
+
+    let mut app = App::new(options.clone(), &config);
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    assert!(app.approval_policy_locked());
+
+    assert!(app.cycle_root_approval_posture());
+    assert_eq!(app.approval_mode, ApprovalMode::Auto);
+    assert!(!app.approval_policy_locked());
+    let saved_config = std::fs::read_to_string(&config_path).expect("saved config");
+    assert!(saved_config.contains("# keep"));
+    assert!(!saved_config.contains("approval_policy"));
+    let saved_settings = std::fs::read_to_string(&settings_path).expect("saved settings");
+    assert!(saved_settings.contains("permission_posture = \"auto-review\""));
+
+    let restarted_config = Config::load(Some(config_path), None).expect("reload config");
+    let restarted = App::new(options, &restarted_config);
+    assert_eq!(restarted.approval_mode, ApprovalMode::Auto);
+    assert!(!restarted.approval_policy_locked());
+}
+
+#[test]
+fn legacy_yolo_migrates_root_policy_to_agent_full_access() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let settings_path = tmp.path().join("settings.toml");
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(&config_path, "# keep\napproval_policy = \"on-request\"\n")
+        .expect("legacy config");
+    std::fs::write(&settings_path, "default_mode = \"yolo\"\n").expect("legacy settings");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let _approval_env = EnvVarGuard::remove("DEEPSEEK_APPROVAL_POLICY");
+    let config = Config::load(Some(config_path.clone()), None).expect("load config");
+    let mut options = test_options(false);
+    options.start_in_agent_mode = false;
+    options.workspace = workspace;
+    options.config_path = Some(config_path.clone());
+
+    let app = App::new(options.clone(), &config);
+
+    assert_eq!(app.mode, AppMode::Agent);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
+    assert!(!app.approval_policy_locked());
+    let saved_config = std::fs::read_to_string(&config_path).expect("saved config");
+    assert!(saved_config.contains("# keep"));
+    assert!(!saved_config.contains("approval_policy"));
+    let saved_settings = std::fs::read_to_string(&settings_path).expect("saved settings");
+    assert!(saved_settings.contains("default_mode = \"agent\""));
+    assert!(saved_settings.contains("permission_posture = \"full-access\""));
+
+    let restarted_config = Config::load(Some(config_path), None).expect("reload config");
+    let restarted = App::new(options, &restarted_config);
+    assert_eq!(restarted.mode, AppMode::Agent);
+    assert_eq!(restarted.approval_mode, ApprovalMode::Bypass);
+    assert!(!restarted.approval_policy_locked());
+}
+
+#[test]
+fn legacy_yolo_migrates_the_actual_fallback_config_not_a_missing_env_path() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let home_config_dir = home.join(codewhale_config::CODEWHALE_APP_DIR);
+    let override_dir = tmp.path().join("missing-override");
+    let missing_override = override_dir.join("config.toml");
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&home_config_dir).expect("home config dir");
+    std::fs::create_dir_all(&override_dir).expect("override dir");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let home_config = home_config_dir.join("config.toml");
+    std::fs::write(
+        &home_config,
+        "# actual fallback\napproval_policy = \"on-request\"\n",
+    )
+    .expect("home config");
+    let override_settings = override_dir.join("settings.toml");
+    std::fs::write(&override_settings, "default_mode = \"yolo\"\n").expect("legacy settings");
+
+    let _home = EnvVarGuard::set("HOME", &home);
+    let _user_profile = EnvVarGuard::set("USERPROFILE", &home);
+    let _codewhale_home = EnvVarGuard::remove("CODEWHALE_HOME");
+    let _codewhale_config = EnvVarGuard::remove("CODEWHALE_CONFIG_PATH");
+    let _deepseek_config = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &missing_override);
+    let _approval_env = EnvVarGuard::remove("DEEPSEEK_APPROVAL_POLICY");
+
+    let config = Config::load(None, None).expect("load fallback config");
+    assert_eq!(config.approval_policy.as_deref(), Some("on-request"));
+    let mut options = test_options(false);
+    options.start_in_agent_mode = false;
+    options.workspace = workspace;
+    options.config_path = None;
+
+    let app = App::new(options, &config);
+
+    assert_eq!(app.mode, AppMode::Agent);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
+    assert!(!app.approval_policy_locked());
+    assert!(
+        !missing_override.exists(),
+        "migration must not create the missing DEEPSEEK_CONFIG_PATH target"
+    );
+    let saved_home_config = std::fs::read_to_string(&home_config).expect("saved fallback config");
+    assert!(saved_home_config.contains("# actual fallback"));
+    assert!(!saved_home_config.contains("approval_policy"));
+    let saved_settings =
+        std::fs::read_to_string(&override_settings).expect("normalized override settings");
+    assert!(saved_settings.contains("default_mode = \"agent\""));
+    assert!(saved_settings.contains("permission_posture = \"full-access\""));
+}
+
+#[test]
+fn managed_requirements_ignore_saved_full_access_and_lock_changes() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let requirements_path = tmp.path().join("requirements.toml");
+    std::fs::write(
+        tmp.path().join("settings.toml"),
+        "permission_posture = \"full-access\"\n",
+    )
+    .expect("settings");
+    std::fs::write(
+        &requirements_path,
+        "allowed_approval_policies = [\"on-request\"]\n",
+    )
+    .expect("requirements");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let config = Config {
+        requirements_path: Some(requirements_path.to_string_lossy().into_owned()),
+        ..Config::default()
+    };
+
+    let mut app = App::new(test_options(false), &config);
+
+    assert!(app.approval_policy_locked());
+    assert!(app.approval_policy_requirements_managed());
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    assert!(!app.cycle_approval_posture());
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    assert!(
+        app.status_toasts
+            .iter()
+            .any(|toast| toast.text.contains("controlled"))
+    );
+}
+
+#[test]
 fn set_mode_agent_to_yolo_to_agent_restores_baseline_without_yolo_leak() {
     // Round-trip Agent -> YOLO -> Agent must not leave YOLO's elevated authority
     // (shell/trust/Auto) bleeding into the restored Agent surface (#3386).
@@ -1844,6 +2307,7 @@ fn set_mode_agent_to_yolo_to_agent_restores_baseline_without_yolo_leak() {
     app.allow_shell = true;
     app.trust_mode = false;
     app.approval_mode = ApprovalMode::Suggest;
+    app.yolo_compat_notified = true;
 
     app.set_mode(AppMode::Yolo);
     assert!(app.allow_shell);
@@ -1877,6 +2341,7 @@ fn set_mode_plan_to_yolo_to_agent_does_not_bleed_yolo_into_agent() {
     app.allow_shell = false;
     app.trust_mode = false;
     app.approval_mode = ApprovalMode::Never;
+    app.yolo_compat_notified = true;
 
     app.set_mode(AppMode::Plan);
     // Plan is read-only regardless of the baseline.
@@ -1905,6 +2370,8 @@ fn set_mode_captures_agent_edits_as_the_durable_baseline() {
     options.start_in_agent_mode = true;
     let mut app = App::new(options, &Config::default());
     assert_eq!(app.mode, AppMode::Agent);
+    app.allow_shell = false;
+    app.set_agent_approval_posture(ApprovalMode::Suggest);
 
     // Initial baseline restores to no-shell / Suggest.
     app.set_mode(AppMode::Plan);
@@ -1926,7 +2393,13 @@ fn set_mode_captures_agent_edits_as_the_durable_baseline() {
 
 #[test]
 fn yolo_start_with_default_config_restores_interactive_agent_shell_baseline() {
-    let mut app = App::new(test_options(true), &Config::default());
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let mut options = test_options(true);
+    options.config_path = Some(config_path);
+    let mut app = App::new(options, &Config::default());
     // --yolo starts in Agent mode with the full-access compat shim (M6).
     assert_eq!(app.mode, AppMode::Agent);
     assert!(app.yolo);
@@ -1945,12 +2418,18 @@ fn yolo_start_with_default_config_restores_interactive_agent_shell_baseline() {
 
 #[test]
 fn leaving_yolo_after_startup_restores_baseline_policies() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
     let config = Config {
         allow_shell: Some(false),
         ..Default::default()
     };
 
-    let mut app = App::new(test_options(true), &config);
+    let mut options = test_options(true);
+    options.config_path = Some(config_path);
+    let mut app = App::new(options, &config);
     // --yolo starts in Agent mode with the full-access compat shim (M6).
     assert_eq!(app.mode, AppMode::Agent);
     assert!(app.yolo);
@@ -2148,6 +2627,7 @@ fn test_update_model_compaction_budget() {
     // depend on the developer's local `auto_compact_threshold_percent`
     // setting (App::new loads real settings) or on auto-model resolution.
     app.auto_model = false;
+    app.api_provider = ApiProvider::Deepseek;
     app.active_route_limits = None;
     app.active_context_window_override = None;
     app.auto_compact_threshold_percent = 80.0;
@@ -2539,6 +3019,34 @@ fn clipboard_text_paste_matches_bracketed_paste_state() {
     assert_eq!(clipboard.cursor_position, bracketed.cursor_position);
     assert_eq!(clipboard.slash_menu_hidden, bracketed.slash_menu_hidden);
     assert_eq!(clipboard.mention_menu_hidden, bracketed.mention_menu_hidden);
+}
+
+#[test]
+fn ssh_direct_clipboard_paste_points_to_terminal_owned_bracketed_paste() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "keep this draft".to_string();
+    app.cursor_position = app.input.chars().count();
+    app.clipboard = ClipboardHandler::for_test(true, true);
+
+    assert!(!app.paste_from_clipboard());
+    assert_eq!(app.input, "keep this draft");
+    let hint = app
+        .status_message
+        .as_deref()
+        .expect("remote paste hint")
+        .to_string();
+    assert!(hint.contains("SSH paste uses your local terminal"));
+    assert!(hint.contains("Cmd+V on macOS"));
+    assert!(hint.contains("Ctrl+Shift+V on Linux/Windows"));
+
+    app.ui_locale = Locale::Ja;
+    app.status_message = None;
+    assert!(!app.paste_api_key_from_clipboard());
+    assert!(app.api_key_input.is_empty());
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some(tr(Locale::Ja, MessageId::ClipboardSshPasteHint).as_ref())
+    );
 }
 
 #[test]
@@ -3378,6 +3886,91 @@ fn advance_fallback_all_unready_exhausts_with_clear_reason() {
 }
 
 #[test]
+fn startup_and_fallback_skip_inactive_external_only_routes_without_io() {
+    let _lock = lock_test_env();
+    let temp = tempfile::tempdir().expect("external fallback fixtures");
+    let codex_path = temp.path().join("codex-auth.json");
+    let grok_path = temp.path().join("grok-auth.json");
+    let codex_raw = "inactive Codex bytes must not be read";
+    let grok_raw = "inactive Grok bytes must not be read";
+    std::fs::write(&codex_path, codex_raw).expect("write Codex trap");
+    std::fs::write(&grok_path, grok_raw).expect("write Grok trap");
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", temp.path().join("owned-home"));
+    let _codex_path = EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &codex_path);
+    let _grok_path = EnvVarGuard::set("GROK_AUTH_PATH", &grok_path);
+    let _codex_access = EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+    let _legacy_codex_access = EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+    let _xai_key = EnvVarGuard::remove("XAI_API_KEY");
+    let _cli_key = EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+    let _cli_source = EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+
+    let config = Config {
+        provider: Some(ApiProvider::Deepseek.as_str().to_string()),
+        api_key: Some("active-deepseek-key".to_string()),
+        fallback_providers: vec![
+            codewhale_config::ProviderKind::OpenaiCodex,
+            codewhale_config::ProviderKind::Xai,
+        ],
+        providers: Some(ProvidersConfig {
+            openai_codex: ProviderConfig {
+                auth_mode: Some("oauth".to_string()),
+                external_credentials: Some(
+                    codewhale_config::ExternalCredentialConsentToml::read_only(
+                        codewhale_config::ProviderKind::OpenaiCodex,
+                        codewhale_config::ExternalCredentialSource::CodexCli,
+                        codex_path.clone(),
+                    ),
+                ),
+                ..Default::default()
+            },
+            xai: ProviderConfig {
+                auth_mode: Some("oauth".to_string()),
+                external_credentials: Some(
+                    codewhale_config::ExternalCredentialConsentToml::read_only(
+                        codewhale_config::ProviderKind::Xai,
+                        codewhale_config::ExternalCredentialSource::GrokCli,
+                        grok_path.clone(),
+                    ),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut options = test_options(false);
+    options.skip_onboarding = true;
+
+    crate::external_credentials::reset_side_effect_trap();
+    let mut app = App::new(options, &config);
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0),
+        "startup readiness must not inspect inactive external credentials"
+    );
+    assert_eq!(app.advance_fallback("active route unavailable"), None);
+    assert_eq!(
+        crate::external_credentials::side_effect_trap_counts(),
+        (0, 0),
+        "fallback selection must skip external-only inactive routes without inspection"
+    );
+    let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("skipped openai-codex: needs auth"),
+        "{reason}"
+    );
+    assert!(reason.contains("skipped xai: needs auth"), "{reason}");
+    assert_eq!(
+        std::fs::read_to_string(&codex_path).expect("Codex trap unchanged"),
+        codex_raw
+    );
+    assert_eq!(
+        std::fs::read_to_string(&grok_path).expect("Grok trap unchanged"),
+        grok_raw
+    );
+}
+
+#[test]
 fn advance_fallback_local_primary_does_not_fall_back_to_cloud() {
     let _lock = lock_test_env();
     let _openai = EnvVarGuard::remove("OPENAI_API_KEY");
@@ -3488,6 +4081,41 @@ fn status_classifier_does_not_paint_negated_success_green() {
     assert_eq!(level, StatusToastLevel::Warning);
     let (level, _, _) = App::classify_status_text("Turn cancelled");
     assert_eq!(level, StatusToastLevel::Warning);
+}
+
+#[test]
+fn status_toasts_expire_even_behind_a_persistent_entry() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.status_message = None;
+    app.last_status_message_seen = None;
+    app.status_toasts.clear();
+    app.sticky_status = None;
+
+    app.push_status_toast("persistent", StatusToastLevel::Info, None);
+    app.push_status_toast("expired-list", StatusToastLevel::Warning, Some(1));
+    app.status_toasts
+        .back_mut()
+        .expect("temporary toast")
+        .created_at = Instant::now() - std::time::Duration::from_millis(2);
+
+    let visible = app.active_status_toasts(3);
+    assert_eq!(
+        visible
+            .iter()
+            .map(|toast| toast.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["persistent"]
+    );
+
+    app.push_status_toast("expired-single", StatusToastLevel::Warning, Some(1));
+    app.status_toasts
+        .back_mut()
+        .expect("temporary toast")
+        .created_at = Instant::now() - std::time::Duration::from_millis(2);
+
+    let active = app.active_status_toast().expect("persistent toast remains");
+    assert_eq!(active.text, "persistent");
+    assert_eq!(app.status_toasts.len(), 1);
 }
 
 #[test]

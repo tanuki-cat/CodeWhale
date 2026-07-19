@@ -25,19 +25,24 @@ use crate::error::DriverError;
 
 /// One `task()` invocation, fully resolved and validated on the VM side.
 ///
-/// Field semantics mirror the `agent` tool's spawn options; `profile` is the
-/// Fleet roster profile token, already trimmed + lowercased and checked
-/// against the same token rule as `crates/workflow`'s leaf profiles. Roster
-/// membership is resolved by the driver (tui) at spawn time — this crate
-/// never sees the saved Fleet roster.
+/// Field semantics mirror the `agent` tool's spawn options.
+///
+/// Step identity is fleet `role` (preferred) and/or `profile` (#4177). Both
+/// tokens are normalized (trimmed + lowercased) with the same rule as
+/// `crates/workflow` leaf profiles. Roster membership is resolved by the
+/// driver (tui) at spawn time — this crate never sees the saved Fleet roster.
+/// Provider/model remain optional overrides, not required identity fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskRequest {
-    /// The child prompt (JS `description` or `prompt`; required).
+    /// The child prompt (JS `prompt`, falling back to `description`; required).
     pub description: String,
-    /// Subagent role (JS `subagentType` or `type`); `None` lets the driver
+    /// Subagent type (JS `subagentType` or `type`); `None` lets the driver
     /// apply its default (`general`).
     pub subagent_type: Option<String>,
+    /// Fleet role name (JS `role`), e.g. `scout` / `implementer` (#4177).
+    pub role: Option<String>,
     /// Fleet profile token, normalized (trimmed, lowercased) and validated.
+    /// Explicit profile wins over role mapping at spawn time.
     pub profile: Option<String>,
     /// Explicit model override; always wins over `model_strength`.
     pub model: Option<String>,
@@ -54,6 +59,10 @@ pub struct TaskRequest {
     /// Explicit token budget: forks an isolated pool on the driver side.
     /// Omit it so the child inherits (and debits) the shared run pool.
     pub token_budget: Option<u64>,
+    /// Maximum model turns for this child (driver clamps to its ceiling).
+    pub max_steps: Option<u32>,
+    /// Hard wall-clock limit for this child in seconds.
+    pub wall_time_secs: Option<u64>,
     /// JSON schema the reply must satisfy; validated in the VM after the
     /// driver returns the raw text (see [`crate`] docs for decode rules).
     pub response_schema: Option<serde_json::Value>,

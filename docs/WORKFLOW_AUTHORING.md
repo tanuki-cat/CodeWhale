@@ -1,12 +1,47 @@
 # Workflow Authoring
 
+> **Ordinary multi-agent work does not require this file.** In Operate, send
+> normal messages; Codewhale can work directly or prefer background workers
+> when parallelism, isolation, or duration makes delegation useful. Use Workflow
+> when ordered phases, gates, shared budgets, replay, or deterministic fan-in
+> matter; Act/Agent may also use optional soft-auto launch. See
+> [Automatic Workflows](AUTOMATIC_WORKFLOWS.md).
+
 Workflow has one runtime boundary: authored source lowers to typed
 Rust `WorkflowSpec`, Rust validates the IR, and the scheduler/headless worker
 runtime executes leaves. Authoring languages do not get hidden authority to own
 files, shell, network, providers, cancellation, or TUI state.
 
+Compatibility launch paths on the `workflow` tool:
+
+| Input | When to use |
+|-------|-------------|
+| `plan` | Structured goal / phases / children (preferred agent path) |
+| `script` | Short inline JS the model owns |
+| `source_path` | Checked-in `.workflow.js` / `.workflow.ts` in the workspace |
+
 For a guided walkthrough from Fleet task specs to Workflow authoring and
 monitoring, see [Fleet + Workflow Tutorial](FLEET_WORKFLOW_TUTORIAL.md).
+
+
+## Access model
+
+The Workflow script is a **coordinator only**. It has no filesystem or shell of
+its own. Real work happens in sub-agents the script launches.
+
+| Layer | What it can access |
+|-------|--------------------|
+| Workflow script (JS VM) | Script variables, branching/loops, `task()` / `parallel()` / `pipeline()`, `phase` / `log`, `budget` / `args`. **No** direct FS, shell, network, env, imports, clock, or randomness. |
+| Workflow-spawned sub-agents | Normal tool surface (read/search/edit/write, shell, web, MCP) subject to role posture, allowlists, and parent policy. File edits for write-capable roles auto-accept under Workflow; shell / web / MCP still require parent auto-approve or fail closed. |
+| Parent session | Working directory, configured tools/MCP, permission mode, sandbox/network rules. |
+
+### Scale
+
+- Up to **16 concurrent** live agents in one run (additional spawns wait for a slot).
+- Up to **1_000 agents per run** (VM lifetime spawn cap).
+- Soft auto-launch still uses a lower child soft-cap (`auto_start_child_limit`).
+
+See the Workflow JS sandbox tests for the fail-closed host surface inventory.
 
 ## Language Choice
 

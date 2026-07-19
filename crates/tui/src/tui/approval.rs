@@ -29,12 +29,15 @@
 
 use crate::localization::{Locale, MessageId, tr};
 use crate::sandbox::SandboxPolicy;
+use crate::tools::apply_patch::{NormalizedApplyPatchInput, normalize_apply_patch_input};
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 use crate::tui::widgets::{ApprovalWidget, ElevationWidget, Renderable};
 use codewhale_config::ToolAskRule;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use serde_json::Value;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -73,10 +76,12 @@ impl ApprovalMode {
 
     pub fn from_config_value(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Some(ApprovalMode::Auto),
+            "auto" | "auto-review" | "auto_review" => Some(ApprovalMode::Auto),
             "bypass" | "yolo" | "dontask" | "dont_ask" | "bypass-permissions"
-            | "bypasspermissions" => Some(ApprovalMode::Bypass),
-            "suggest" | "suggested" | "on-request" | "untrusted" => Some(ApprovalMode::Suggest),
+            | "bypasspermissions" | "full-access" | "full" => Some(ApprovalMode::Bypass),
+            "suggest" | "suggested" | "on-request" | "untrusted" | "ask" => {
+                Some(ApprovalMode::Suggest)
+            }
             "never" | "deny" | "denied" => Some(ApprovalMode::Never),
             _ => None,
         }
@@ -179,6 +184,15 @@ impl AskRuleSavePreview {
 const ASK_RULE_SAVE_PREVIEW_MAX_ENTRIES: usize = 4;
 
 impl ApprovalRequest {
+    /// Mechanical repo-law asks are a distinct authority boundary, not an
+    /// ordinary risk prompt. The engine stamps this stable prefix when a
+    /// `.codewhale/constitution.json` ask rule forces review.
+    #[must_use]
+    pub fn is_repo_law_prompt(&self) -> bool {
+        self.description.starts_with("Repo law holds this write:")
+            && self.description.contains(".codewhale/constitution.json")
+    }
+
     /// Presentation stakes for this request (see [`ApprovalStakes`]).
     #[must_use]
     pub fn stakes(&self) -> ApprovalStakes {
@@ -528,6 +542,11 @@ fn build_impact_summary(tool_name: &str, category: ToolCategory, params: &Value)
             }
             impacts
         }
+        ToolCategory::Agent if tool_name == "workflow" => {
+            // #4126: elevated Workflow plan card — goal, children, capability flags, budget.
+            crate::tools::workflow_plan_approval::analyze_workflow_plan_approval(params)
+                .approval_impacts()
+        }
         ToolCategory::Agent => {
             let mut impacts = vec![
                 "Starts or inspects a child agent task; the child's own tool gates still apply."
@@ -695,6 +714,18 @@ fn build_prominent_details(
                 });
             }
         }
+        ToolCategory::Agent if tool_name == "workflow" => {
+            // #4126: elevated Workflow plan card fields.
+            let summary =
+                crate::tools::workflow_plan_approval::analyze_workflow_plan_approval(params);
+            for (label, value) in summary.card_fields() {
+                details.push(ApprovalDetail {
+                    label: label.to_string(),
+                    value,
+                    shell_lines: None,
+                });
+            }
+        }
         ToolCategory::Agent => {
             if let Some(action) = param_preview(params, &["action"], 40) {
                 details.push(ApprovalDetail {
@@ -754,16 +785,13 @@ fn file_write_preview_lines(tool_name: &str, params: &Value) -> Option<Vec<Strin
             lines.extend(prefixed_preview_lines("with this", "+ ", &replace, 3));
             Some(lines)
         }
-        "apply_patch" => params
-            .get("patch")
-            .and_then(Value::as_str)
-            .and_then(apply_patch_preview_lines)
-            .or_else(|| {
-                params
-                    .get("changes")
-                    .and_then(Value::as_array)
-                    .and_then(|changes| changes_preview_lines(changes))
-            }),
+        "apply_patch" => match normalize_apply_patch_input(params) {
+            Ok(NormalizedApplyPatchInput::Patch(patch)) => apply_patch_preview_lines(patch),
+            Ok(NormalizedApplyPatchInput::Replacement { entries, .. }) => {
+                changes_preview_lines(entries)
+            }
+            Err(_) => None,
+        },
         _ => None,
     }
     .filter(|lines| !lines.is_empty())
@@ -929,6 +957,12 @@ fn localize_detail_label(label: &str, locale: Locale) -> Cow<'static, str> {
             "Action" => tr(locale, MessageId::ApprovalLabelAction),
             "Type" => tr(locale, MessageId::ApprovalLabelType),
             "Prompt" => tr(locale, MessageId::ApprovalLabelPrompt),
+            "Goal" => "目标".into(),
+            "Children" => "子任务".into(),
+            "Writes" => "写入".into(),
+            "Shell" => "Shell".into(),
+            "Network" => "网络".into(),
+            "Budget" => "预算".into(),
             _ => label.to_string().into(),
         },
         _ => label.to_string().into(),
@@ -1143,21 +1177,40 @@ impl ApprovalOption {
         ApprovalOption::Abort,
     ];
 
-    fn from_index(idx: usize) -> ApprovalOption {
-        Self::ORDER.get(idx).copied().unwrap_or(Self::Abort)
+    /// Workflow elevated-plan card (#4126): Approve / Edit plan / Cancel.
+    const WORKFLOW_ORDER: [ApprovalOption; 3] = [
+        ApprovalOption::ApproveOnce,
+        ApprovalOption::Deny,
+        ApprovalOption::Abort,
+    ];
+
+    fn order_for(tool_name: &str) -> &'static [ApprovalOption] {
+        if tool_name == "workflow" {
+            &Self::WORKFLOW_ORDER
+        } else {
+            &Self::ORDER
+        }
     }
 
-    fn index(self) -> usize {
-        Self::ORDER
+    fn from_index_for(tool_name: &str, idx: usize) -> ApprovalOption {
+        Self::order_for(tool_name)
+            .get(idx)
+            .copied()
+            .unwrap_or(Self::Abort)
+    }
+
+    fn index_for(self, tool_name: &str) -> usize {
+        Self::order_for(tool_name)
             .iter()
             .position(|o| *o == self)
-            .unwrap_or(Self::ORDER.len() - 1)
+            .unwrap_or(Self::order_for(tool_name).len().saturating_sub(1))
     }
 
     fn decision(self) -> ReviewDecision {
         match self {
             ApprovalOption::ApproveOnce => ReviewDecision::Approved,
             ApprovalOption::ApproveAlways => ReviewDecision::ApprovedForSession,
+            // Workflow maps Deny → "Edit plan" (model revises plan).
             ApprovalOption::Deny => ReviewDecision::Denied,
             ApprovalOption::Abort => ReviewDecision::Abort,
         }
@@ -1169,6 +1222,7 @@ impl ApprovalOption {
 pub struct ApprovalView {
     request: ApprovalRequest,
     selected: usize,
+    row_hitboxes: RefCell<Vec<Rect>>,
     locale: Locale,
     timeout: Option<Duration>,
     requested_at: Instant,
@@ -1186,6 +1240,7 @@ impl ApprovalView {
         Self {
             request,
             selected: 0,
+            row_hitboxes: RefCell::new(Vec::new()),
             locale,
             timeout: None,
             requested_at: Instant::now(),
@@ -1198,11 +1253,20 @@ impl ApprovalView {
     }
 
     fn select_next(&mut self) {
-        self.selected = (self.selected + 1).min(ApprovalOption::ORDER.len() - 1);
+        let max = ApprovalOption::order_for(&self.request.tool_name)
+            .len()
+            .saturating_sub(1);
+        self.selected = (self.selected + 1).min(max);
     }
 
     fn current_option(&self) -> ApprovalOption {
-        ApprovalOption::from_index(self.selected)
+        ApprovalOption::from_index_for(&self.request.tool_name, self.selected)
+    }
+
+    /// Whether this approval is the elevated Workflow plan card (#4126).
+    #[must_use]
+    pub fn is_workflow_plan_approval(&self) -> bool {
+        self.request.tool_name == "workflow"
     }
 
     /// Test-only accessor for the selected option's decision.
@@ -1214,6 +1278,10 @@ impl ApprovalView {
     /// Selected option for the renderer (used by the widget tests too).
     pub fn selected(&self) -> usize {
         self.selected
+    }
+
+    pub(crate) fn set_mouse_hitboxes(&self, hitboxes: Vec<Rect>) {
+        *self.row_hitboxes.borrow_mut() = hitboxes;
     }
 
     /// Risk level for the renderer's accent picking.
@@ -1228,7 +1296,7 @@ impl ApprovalView {
 
     /// Commit the given option and close the approval modal.
     fn commit_option(&mut self, option: ApprovalOption) -> ViewAction {
-        self.selected = option.index();
+        self.selected = option.index_for(&self.request.tool_name);
         self.emit_decision(option.decision(), false)
     }
 
@@ -1316,8 +1384,16 @@ impl ModalView for ApprovalView {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('1') => {
                 self.commit_option(ApprovalOption::ApproveOnce)
             }
-            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('2') => {
+            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('2')
+                if !self.is_workflow_plan_approval() =>
+            {
                 self.commit_option(ApprovalOption::ApproveAlways)
+            }
+            // Workflow plan card (#4126): [2/e] Edit plan, [3/n/d] Cancel.
+            KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Char('2')
+                if self.is_workflow_plan_approval() =>
+            {
+                self.commit_option(ApprovalOption::Deny)
             }
             KeyCode::Char('s') | KeyCode::Char('S') if self.request.can_save_ask_rule() => self
                 .emit_decision_with_rules(
@@ -1329,9 +1405,42 @@ impl ModalView for ApprovalView {
             | KeyCode::Char('N')
             | KeyCode::Char('d')
             | KeyCode::Char('D')
-            | KeyCode::Char('3') => self.commit_option(ApprovalOption::Deny),
+            | KeyCode::Char('3') => {
+                if self.is_workflow_plan_approval() {
+                    // Cancel (abort turn) rather than session-deny.
+                    self.commit_option(ApprovalOption::Abort)
+                } else {
+                    self.commit_option(ApprovalOption::Deny)
+                }
+            }
             KeyCode::Char('v') | KeyCode::Char('V') => self.emit_params_pager(),
             KeyCode::Esc => self.emit_decision(ReviewDecision::Abort, false),
+            _ => ViewAction::None,
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.select_prev();
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.select_next();
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self.row_hitboxes.borrow().iter().position(|rect| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                });
+                if let Some(index) = clicked {
+                    return self.commit_option(ApprovalOption::from_index_for(
+                        &self.request.tool_name,
+                        index,
+                    ));
+                }
+                ViewAction::None
+            }
             _ => ViewAction::None,
         }
     }
@@ -1520,6 +1629,7 @@ pub struct ElevationView {
     request: ElevationRequest,
     selected: usize,
     locale: Locale,
+    row_hitboxes: RefCell<Vec<Rect>>,
 }
 
 impl ElevationView {
@@ -1528,6 +1638,7 @@ impl ElevationView {
             request,
             selected: 0,
             locale,
+            row_hitboxes: RefCell::new(Vec::new()),
         }
     }
 
@@ -1601,8 +1712,36 @@ impl ModalView for ElevationView {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.select_prev();
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.select_next();
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self.row_hitboxes.borrow().iter().position(|rect| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                });
+                if let Some(index) = clicked {
+                    return self.emit_decision(self.request.options[index].clone());
+                }
+                ViewAction::None
+            }
+            _ => ViewAction::None,
+        }
+    }
+
     fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
-        let elevation_widget = ElevationWidget::new(&self.request, self.selected, self.locale);
+        let elevation_widget = ElevationWidget::new_with_hitboxes(
+            &self.request,
+            self.selected,
+            self.locale,
+            &self.row_hitboxes,
+        );
         elevation_widget.render(area, buf);
     }
 }
@@ -1614,7 +1753,8 @@ impl ModalView for ElevationView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
 
     fn create_key_event(code: KeyCode) -> KeyEvent {
@@ -2019,7 +2159,7 @@ mod tests {
             "apply_patch",
             "Apply a patch",
             &json!({
-                "changes": [
+                "replace": [
                     {
                         "path": "src/lib.rs",
                         "content": "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight"
@@ -2056,13 +2196,39 @@ mod tests {
     }
 
     #[test]
+    fn prominent_details_apply_patch_legacy_changes_includes_preview() {
+        let request = ApprovalRequest::new(
+            "test-id",
+            "apply_patch",
+            "Apply a patch",
+            &json!({
+                "changes": [{
+                    "path": "src/lib.rs",
+                    "content": "fn legacy() {}\n"
+                }]
+            }),
+            "tool:apply_patch",
+        );
+
+        let details = request.prominent_detail_items(Locale::En);
+        let preview = details
+            .iter()
+            .find(|detail| detail.label == "Preview")
+            .and_then(|detail| detail.shell_lines.as_ref())
+            .expect("legacy changes preview");
+
+        assert!(preview.iter().any(|line| line == "file: src/lib.rs"));
+        assert!(preview.iter().any(|line| line == "+ fn legacy() {}"));
+    }
+
+    #[test]
     fn apply_patch_changes_array_preview_reports_second_file_when_first_fills_buffer() {
         let request = ApprovalRequest::new(
             "test-id",
             "apply_patch",
             "Apply a patch",
             &json!({
-                "changes": [
+                "replace": [
                     {
                         "path": "src/lib.rs",
                         "content": "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight"
@@ -2396,7 +2562,7 @@ diff --git a/src/b.rs b/src/b.rs
             "apply_patch",
             "Apply a patch",
             &json!({
-                "changes": [
+                "replace": [
                     { "path": "src/a.rs", "content": "one" },
                     { "path": "/workspace/src/a.rs", "content": "two" }
                 ]
@@ -2465,7 +2631,7 @@ diff --git a/src/b.rs b/src/b.rs
             "apply_patch",
             "Apply a patch",
             &json!({
-                "changes": [
+                "replace": [
                     { "path": "src/a.rs", "content": "safe" },
                     { "path": "../escape.rs", "content": "unsafe" }
                 ]
@@ -2645,6 +2811,29 @@ diff --git a/src/b.rs b/src/b.rs
     fn benign_enter_approves_in_one_step() {
         let mut view = ApprovalView::new(benign_request());
         let action = view.handle_key(create_key_event(KeyCode::Enter));
+        assert!(matches!(
+            action,
+            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+                decision: ReviewDecision::Approved,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn mouse_click_renders_and_approves_inline_option() {
+        let mut view = ApprovalView::new(benign_request());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        terminal
+            .draw(|frame| view.render(frame.area(), frame.buffer_mut()))
+            .expect("render approval prompt");
+        let rect = view.row_hitboxes.borrow()[0];
+        let action = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
         assert!(matches!(
             action,
             ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
@@ -3027,7 +3216,7 @@ diff --git a/src/b.rs b/src/b.rs
         // The selection prose moved into the per-option key badges; the footer
         // keeps only the escape-hatch hints.
         assert!(
-            joined.contains("full params"),
+            joined.contains("Pg↑/↓ review"),
             "footer controls hint missing:\n{joined}"
         );
         assert!(joined.contains("read_file"));
@@ -3035,7 +3224,7 @@ diff --git a/src/b.rs b/src/b.rs
 
     #[test]
     fn approval_footer_hints_use_muted_contrast_tier() {
-        // #3380: the footer key hints ("v: full params · Esc: abort") must
+        // #3380: the footer key hints ("Pg↑/↓ review · v details · Esc abort") must
         // render one contrast tier above TEXT_HINT — TEXT_MUTED, the same
         // color the app-wide ActionHint modal footers use for labels.
         use crate::palette;
@@ -3047,7 +3236,7 @@ diff --git a/src/b.rs b/src/b.rs
         let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
         ModalView::render(&view, Rect::new(0, 0, w, h), &mut buf);
 
-        let target: Vec<String> = "full params".chars().map(|c| c.to_string()).collect();
+        let target: Vec<String> = "Pg↑/↓ review".chars().map(|c| c.to_string()).collect();
         let mut found = None;
         for y in 0..h {
             let symbols: Vec<String> = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
@@ -3080,7 +3269,7 @@ diff --git a/src/b.rs b/src/b.rs
         );
         assert_approval_key_badges_visible(&joined);
         assert!(
-            joined.contains("full params"),
+            joined.contains("Pg↑/↓ review"),
             "footer controls hint missing:\n{joined}"
         );
         assert!(
@@ -3135,7 +3324,7 @@ diff --git a/src/b.rs b/src/b.rs
             "routine write must not use the destructive zh badge:\n{joined}"
         );
         assert!(
-            joined.contains("v：完整参数"),
+            joined.contains("Pg↑/↓回看"),
             "missing zh footer controls hint:\n{joined}"
         );
         assert!(
@@ -3146,6 +3335,31 @@ diff --git a/src/b.rs b/src/b.rs
             joined.contains("仅本次批准"),
             "missing zh approve option:\n{joined}"
         );
+    }
+
+    #[test]
+    fn approval_review_and_save_hints_stay_on_one_row_at_80_columns() {
+        for &locale in Locale::shipped() {
+            let view = ApprovalView::new_for_locale(destructive_request(), locale);
+            let lines = render_lines(&view, 80, 40);
+            let review_rows = lines
+                .iter()
+                .filter(|line| line.contains("Pg↑/↓"))
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                review_rows.len(),
+                1,
+                "expected one approval review-hint row for {locale:?}:\n{}",
+                lines.join("\n")
+            );
+            let controls = review_rows[0];
+            assert!(
+                controls.contains("Esc") && controls.contains(" s "),
+                "review, abort, and save-rule hints wrapped for {locale:?}:\n{}",
+                lines.join("\n")
+            );
+        }
     }
 
     #[test]
@@ -3576,6 +3790,121 @@ diff --git a/src/b.rs b/src/b.rs
                 .iter()
                 .any(|o| matches!(o, ElevationOption::Abort))
         );
+    }
+
+    // ========================================================================
+    // Workflow elevated plan approval card (#4126)
+    // ========================================================================
+
+    #[test]
+    fn workflow_tool_is_agent_category_and_shows_plan_card_fields() {
+        assert_eq!(get_tool_category("workflow"), ToolCategory::Agent);
+        let request = ApprovalRequest::new(
+            "wf-1",
+            "workflow",
+            "Launch workflow",
+            &json!({
+                "action": "start",
+                "plan": {
+                    "goal": "ship the fix",
+                    "risk": "writes",
+                    "token_budget": 80_000,
+                    "children": [
+                        {
+                            "id": "impl",
+                            "label": "builder",
+                            "prompt": "edit files",
+                            "type": "implementer",
+                            "mode": "read_write"
+                        }
+                    ]
+                }
+            }),
+            "tool:workflow",
+        );
+        assert_eq!(request.category, ToolCategory::Agent);
+        let details = request.prominent_detail_items(Locale::En);
+        let labels: Vec<_> = details.iter().map(|d| d.label.as_str()).collect();
+        assert!(labels.contains(&"Goal"), "{labels:?}");
+        assert!(labels.contains(&"Children"), "{labels:?}");
+        assert!(labels.contains(&"Writes"), "{labels:?}");
+        assert!(labels.contains(&"Shell"), "{labels:?}");
+        assert!(labels.contains(&"Network"), "{labels:?}");
+        assert!(labels.contains(&"Budget"), "{labels:?}");
+        assert!(
+            details
+                .iter()
+                .any(|d| d.label == "Goal" && d.value.contains("ship the fix")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.label == "Writes" && d.value == "yes"),
+            "{details:?}"
+        );
+        assert!(
+            request
+                .impacts
+                .iter()
+                .any(|i| i.contains("Approve to launch")),
+            "{:?}",
+            request.impacts
+        );
+
+        let view = ApprovalView::new(request);
+        assert!(view.is_workflow_plan_approval());
+        assert_eq!(view.current_decision(), ReviewDecision::Approved);
+    }
+
+    #[test]
+    fn workflow_plan_card_edit_plan_and_cancel_keys() {
+        let request = ApprovalRequest::new(
+            "wf-2",
+            "workflow",
+            "Launch workflow",
+            &json!({
+                "action": "start",
+                "plan": {
+                    "goal": "risky",
+                    "risk": "elevated",
+                    "children": [{ "prompt": "go", "type": "implementer" }]
+                }
+            }),
+            "tool:workflow",
+        );
+        let mut view = ApprovalView::new(request);
+        // [2 / e] → Edit plan → Denied
+        let action = view.handle_key(create_key_event(KeyCode::Char('e')));
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision { decision, .. }) => {
+                assert_eq!(decision, ReviewDecision::Denied);
+            }
+            other => panic!("expected edit-plan denial, got {other:?}"),
+        }
+
+        let request = ApprovalRequest::new(
+            "wf-3",
+            "workflow",
+            "Launch workflow",
+            &json!({
+                "action": "start",
+                "plan": {
+                    "goal": "risky",
+                    "risk": "elevated",
+                    "children": [{ "prompt": "go", "type": "implementer" }]
+                }
+            }),
+            "tool:workflow",
+        );
+        let mut view = ApprovalView::new(request);
+        let action = view.handle_key(create_key_event(KeyCode::Char('3')));
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision { decision, .. }) => {
+                assert_eq!(decision, ReviewDecision::Abort);
+            }
+            other => panic!("expected cancel abort, got {other:?}"),
+        }
     }
 
     // ========================================================================

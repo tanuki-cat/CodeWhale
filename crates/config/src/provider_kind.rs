@@ -99,12 +99,31 @@ pub enum ProviderKind {
     Stepfun,
     #[serde(alias = "mini-max", alias = "mini_max", alias = "minimax")]
     Minimax,
+    #[serde(
+        alias = "minimax_anthropic",
+        alias = "mini-max-anthropic",
+        alias = "mini_max_anthropic"
+    )]
+    MinimaxAnthropic,
     #[serde(alias = "deep-infra", alias = "deep_infra")]
     Deepinfra,
     #[serde(alias = "sakana-ai", alias = "sakana_ai", alias = "fugu")]
     Sakana,
     #[serde(alias = "long-cat", alias = "meituan-longcat", alias = "meituan")]
     LongCat,
+    #[serde(alias = "opencode_go", alias = "opencodego")]
+    OpencodeGo,
+    #[serde(
+        alias = "meta-ai",
+        alias = "meta_ai",
+        alias = "meta-model-api",
+        alias = "meta_model_api",
+        alias = "muse",
+        alias = "muse-spark"
+    )]
+    Meta,
+    #[serde(alias = "x-ai", alias = "x_ai", alias = "grok")]
+    Xai,
     /// User-defined OpenAI-compatible endpoint (#1519).
     ///
     /// A single dynamic identity for arbitrary `[providers.<name>]
@@ -116,7 +135,7 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 35] = [
         Self::Deepseek,
         Self::DeepseekAnthropic,
         Self::NvidiaNim,
@@ -144,9 +163,13 @@ impl ProviderKind {
         Self::Zai,
         Self::Stepfun,
         Self::Minimax,
+        Self::MinimaxAnthropic,
         Self::Deepinfra,
         Self::Sakana,
         Self::LongCat,
+        Self::OpencodeGo,
+        Self::Meta,
+        Self::Xai,
         Self::Custom,
     ];
 

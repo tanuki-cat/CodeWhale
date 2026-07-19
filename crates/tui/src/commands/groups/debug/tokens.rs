@@ -2,7 +2,7 @@
 
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::localization::{Locale, MessageId, tr};
-use crate::models::{SystemPrompt, context_window_for_model};
+use crate::models::SystemPrompt;
 use crate::tui::app::{App, AppAction};
 
 use super::CommandResult;
@@ -17,18 +17,17 @@ fn token_count(value: Option<u32>, locale: Locale) -> String {
 fn active_context_summary(app: &App, locale: Locale) -> String {
     let estimated =
         estimate_input_tokens_conservative(&app.api_messages, app.system_prompt.as_ref());
-    match context_window_for_model(&app.model) {
-        Some(window) => {
-            let used = estimated.min(window as usize);
-            let percent = (used as f64 / f64::from(window) * 100.0).clamp(0.0, 100.0);
-            tr(locale, MessageId::CmdTokensContextWithWindow)
-                .replace("{used}", &used.to_string())
-                .replace("{window}", &window.to_string())
-                .replace("{percent}", &format!("{percent:.1}"))
-        }
-        None => tr(locale, MessageId::CmdTokensContextUnknownWindow)
-            .replace("{estimated}", &estimated.to_string()),
-    }
+    let window = crate::route_budget::route_context_window_tokens(
+        app.api_provider,
+        app.effective_model_for_budget(),
+        app.active_route_limits,
+    );
+    let used = estimated.min(window as usize);
+    let percent = (used as f64 / f64::from(window) * 100.0).clamp(0.0, 100.0);
+    tr(locale, MessageId::CmdTokensContextWithWindow)
+        .replace("{used}", &used.to_string())
+        .replace("{window}", &window.to_string())
+        .replace("{percent}", &format!("{percent:.1}"))
 }
 
 fn cache_summary(app: &App, locale: Locale) -> String {

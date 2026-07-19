@@ -164,7 +164,16 @@ fn mentions_mode_word(lower: &str) -> bool {
         .any(|word| word == "mode" || word == "modes")
 }
 
+#[cfg(test)]
 pub(super) fn format_tool_error(err: &ToolError, tool_name: &str) -> String {
+    format_tool_error_with_schema(err, tool_name, None)
+}
+
+pub(super) fn format_tool_error_with_schema(
+    err: &ToolError,
+    tool_name: &str,
+    input_schema: Option<&serde_json::Value>,
+) -> String {
     let message = match err {
         ToolError::InvalidInput { message } => {
             format!("Invalid input for tool '{tool_name}': {message}")
@@ -185,7 +194,7 @@ pub(super) fn format_tool_error(err: &ToolError, tool_name: &str) -> String {
             // #3020: Pass through self-explanatory messages that already name the
             // cause (mode switch, allow_shell, feature flag).  Avoids appending a
             // conflicting "Check mode, feature flags" suffix on top of
-            // "switch to Agent or YOLO mode" which already gives the recovery path.
+            // "switch to Act mode" which already gives the recovery path.
             if lower.contains("current tool catalog")
                 || lower.contains("did you mean:")
                 || mentions_mode_word(&lower)
@@ -215,7 +224,28 @@ pub(super) fn format_tool_error(err: &ToolError, tool_name: &str) -> String {
         }
     };
 
-    with_transient_tool_fallback_hint(message, err, tool_name)
+    let message = with_transient_tool_fallback_hint(message, err, tool_name);
+    let (category, bad_field) = match err {
+        ToolError::InvalidInput { .. } => ("invalid_input", None),
+        ToolError::MissingField { field } => ("missing_field", Some(field.as_str())),
+        ToolError::PathEscape { .. } => ("path_escape", Some("path")),
+        ToolError::NotAvailable { .. } => ("tool_not_available", Some("tool_name")),
+        _ => return message,
+    };
+    let valid_shape = input_schema.cloned().unwrap_or_else(|| {
+        serde_json::json!({
+            "type": "object",
+            "guidance": format!("Use the advertised input schema for '{tool_name}'")
+        })
+    });
+    let feedback = serde_json::json!({
+        "category": category,
+        "bad_field": bad_field,
+        "valid_shape": valid_shape,
+        "retryable": true,
+        "side_effect_status": "not_started"
+    });
+    format!("{message}\nTool validation feedback: {feedback}")
 }
 
 fn with_transient_tool_fallback_hint(message: String, err: &ToolError, tool_name: &str) -> String {

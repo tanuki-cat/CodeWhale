@@ -14,6 +14,7 @@ use crate::tools::plan::PlanSnapshot;
 use crate::tools::review::ReviewOutput;
 use crate::tui::app::TranscriptSpacing;
 use crate::tui::diff_render;
+use crate::tui::ui_text::CopyLineSeparator;
 
 mod agent_activity;
 mod archived_context;
@@ -241,6 +242,7 @@ impl HistoryCell {
         }
     }
 
+    #[allow(dead_code)] // retained for focused/detail renderers and direct rendering tests
     pub fn lines_with_options(
         &self,
         width: u16,
@@ -359,6 +361,19 @@ impl HistoryCell {
                     width,
                 )
             }
+            HistoryCell::Tool(_) => self
+                .lines_with_options_folded(width, options, folded)
+                .into_iter()
+                .map(|line| {
+                    let copy_prefix_width = tool_copy_prefix_width(&line);
+                    RenderedTranscriptLine {
+                        line,
+                        links: Vec::new(),
+                        copy_prefix_width,
+                        copy_separator_after: CopyLineSeparator::Newline,
+                    }
+                })
+                .collect(),
             _ => hard_break_copy_lines(self.lines_with_options_folded(width, options, folded)),
         }
     }
@@ -432,6 +447,12 @@ impl HistoryCell {
 /// Convert a message into history cells for rendering.
 #[must_use]
 pub fn history_cells_from_message(msg: &Message) -> Vec<HistoryCell> {
+    if let Some(display) = crate::runtime_handoff::restored_subagent_checkpoint_display(msg) {
+        return vec![HistoryCell::System {
+            content: display.to_string(),
+        }];
+    }
+
     let mut cells = Vec::new();
 
     for block in &msg.content {
@@ -1037,7 +1058,7 @@ impl ReviewCell {
         lines.push(Line::from(Span::styled(
             "Issues",
             Style::default()
-                .fg(palette::WHALE_ACCENT_PRIMARY)
+                .fg(palette::WHALE_ACTION)
                 .add_modifier(Modifier::BOLD),
         )));
         if output.issues.is_empty() {
@@ -1071,7 +1092,7 @@ impl ReviewCell {
         lines.push(Line::from(Span::styled(
             "Suggestions",
             Style::default()
-                .fg(palette::WHALE_ACCENT_PRIMARY)
+                .fg(palette::WHALE_ACTION)
                 .add_modifier(Modifier::BOLD),
         )));
         if output.suggestions.is_empty() {
@@ -1311,10 +1332,9 @@ impl GenericToolCell {
             return lines;
         }
 
-        // #4038: give the `workflow` tool a purpose-built run card (run_id,
-        // status, goal, children, progress, schema errors) instead of
-        // collapsing to a one-line generic header or dumping raw JSON.
-        if let Some(lines) = self.try_render_as_workflow(width, low_motion) {
+        // #4038 / #4122: purpose-built workflow run card (compact in live,
+        // expanded in transcript) shared with the WorkflowPanel state machine.
+        if let Some(lines) = self.try_render_as_workflow(width, low_motion, mode) {
             return lines;
         }
 
@@ -1518,15 +1538,17 @@ impl GenericToolCell {
         ))
     }
 
-    /// Render the `workflow` tool as a compact run card rather than the
-    /// generic one-line header (live) or a large JSON dump (transcript).
-    /// Fields are parsed defensively from the tool's JSON output, which is
-    /// either a single `WorkflowRunRecord` or a `{action:"status",
-    /// runs:[...]}` list; anything that does not parse falls back to the
-    /// generic renderer. The header owns the lifecycle label (Wave 5c #7);
-    /// the body deliberately carries no `status:` KV. Full live overlay
-    /// (#4038) is future work.
-    fn try_render_as_workflow(&self, width: u16, low_motion: bool) -> Option<Vec<Line<'static>>> {
+    /// Render the `workflow` tool via the shared WorkflowPanel history-card
+    /// renderer (#4122). Live mode stays compact (lifecycle, children, phases,
+    /// failures, elapsed); transcript mode expands phase/child summaries,
+    /// artifact/transcript links, final result, and failure details.
+    /// Status-list payloads keep a multi-run summary card.
+    fn try_render_as_workflow(
+        &self,
+        width: u16,
+        low_motion: bool,
+        mode: RenderMode,
+    ) -> Option<Vec<Line<'static>>> {
         if self.name != "workflow" {
             return None;
         }
@@ -1585,85 +1607,67 @@ impl GenericToolCell {
             return Some(wrap_card_rail(lines));
         }
 
-        let run_id = value
-            .get("run_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("workflow");
+        use crate::tui::widgets::workflow_panel::{WorkflowHistoryExtras, WorkflowPanel};
+        let panel = WorkflowPanel::from_run_json(&value)?;
+        // Prefer the panel's lifecycle-aware status label when the tool cell
+        // is still marked running but the snapshot already terminal (or vice
+        // versa during live streaming).
+        let header_status = match panel.lifecycle {
+            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Failed
+            | crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Cancelled => {
+                ToolStatus::Failed
+            }
+            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Succeeded => {
+                ToolStatus::Success
+            }
+            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Pending
+            | crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Running => {
+                if self.status == ToolStatus::Failed {
+                    ToolStatus::Failed
+                } else if self.status == ToolStatus::Success {
+                    ToolStatus::Success
+                } else {
+                    ToolStatus::Running
+                }
+            }
+        };
+        let summary = panel.history_header_summary(usize::from(width).saturating_sub(18));
         lines.push(render_tool_header_with_family_and_summary(
             family,
-            Some(run_id),
-            tool_status_label(self.status),
-            self.status,
+            Some(summary.as_str()),
+            tool_status_label(header_status),
+            header_status,
             None,
             low_motion,
         ));
-        if let Some(goal) = value
-            .get("workflow_goal")
-            .and_then(serde_json::Value::as_str)
-            && !goal.trim().is_empty()
-        {
-            lines.extend(render_card_detail_line(
-                Some("goal"),
-                &truncate_text(goal.trim(), 200),
-                tool_value_style(),
-                width,
-            ));
-        }
-        let child_count = value
-            .get("child_ids")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| a.len())
-            .unwrap_or(0);
-        lines.extend(render_compact_kv(
-            "children",
-            &child_count.to_string(),
-            tool_value_style(),
-            width,
-        ));
-        if let Some(progress) = value.get("progress").and_then(serde_json::Value::as_array)
-            && let Some(last) = progress.last().and_then(serde_json::Value::as_str)
-        {
-            lines.extend(render_card_detail_line(
-                Some("progress"),
-                &format!("{} ({} events)", truncate_text(last, 160), progress.len()),
-                tool_value_style(),
-                width,
-            ));
-        }
-        if let Some(verification) = value.get("verification")
-            && let Some(summary) = verification
-                .get("summary")
-                .and_then(serde_json::Value::as_str)
-        {
-            lines.extend(render_card_detail_line(
-                Some("verification"),
-                &truncate_text(summary, 200),
-                tool_value_style(),
-                width,
-            ));
-        }
-        let schema_error_count = value
-            .get("schema_errors")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| a.len())
-            .unwrap_or(0);
-        if schema_error_count > 0 {
-            lines.extend(render_card_detail_line(
-                Some("schema errors"),
-                &schema_error_count.to_string(),
-                tool_value_style(),
-                width,
-            ));
-        }
-        if let Some(error) = value.get("error").and_then(serde_json::Value::as_str)
-            && !error.trim().is_empty()
-        {
-            lines.extend(render_card_detail_line(
-                Some("error"),
-                &truncate_text(error.trim(), 200),
-                tool_value_style(),
-                width,
-            ));
+        let expanded = matches!(mode, RenderMode::Transcript);
+        if expanded {
+            let extras = WorkflowHistoryExtras {
+                result_summary: panel.result_summary.clone(),
+                source_path: panel.source_path.clone().or_else(|| {
+                    value
+                        .get("source_path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(std::path::PathBuf::from)
+                }),
+                spillover_path: self.spillover_path.clone(),
+                verification_summary: value
+                    .get("verification")
+                    .and_then(|v| v.get("summary"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            };
+            for detail in panel.history_expanded_lines(width, &extras) {
+                // history_expanded_lines omit the leading indent; re-use the
+                // card detail path so rails and spacing stay consistent.
+                let text: String = detail.spans.iter().map(|s| s.content.as_ref()).collect();
+                lines.extend(render_card_detail_line(
+                    None,
+                    &text,
+                    tool_value_style(),
+                    width,
+                ));
+            }
         }
         Some(wrap_card_rail(lines))
     }
@@ -1784,6 +1788,69 @@ fn wrap_card_rail(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     lines
 }
 
+/// Return the width of tool-cell chrome that remains after the transcript
+/// cache removes the cell-local card rail. Tool headers have two additional
+/// visual tokens (`✓`/spinner and the family glyph); detail rows have the
+/// thin transcript rail. Keeping this width with the rendered line avoids
+/// making selection copy infer chrome from glyph ranges, which can consume
+/// real code or CJK text that happens to begin with a box-drawing character.
+fn tool_copy_prefix_width(line: &Line<'static>) -> usize {
+    let spans = line.spans.as_slice();
+    let mut index = 0;
+
+    // The cache removes these exact local card rails before flattening.
+    if spans
+        .first()
+        .is_some_and(|span| matches!(span.content.as_ref(), "─ " | "╭ " | "│ " | "╰ "))
+    {
+        index = 1;
+    }
+
+    // Detail rows and pager affordances use the transcript rail as their
+    // first span. The live transcript's general rail accounting removes it;
+    // do not report it again as cell-local copy chrome.
+    if spans
+        .get(index)
+        .is_some_and(|span| span.content.as_ref() == TRANSCRIPT_RAIL)
+    {
+        return 0;
+    }
+
+    // A tool header starts with `<status> <family> `. Only consume this
+    // pair when both tokens are present, so output beginning with `✓` or a
+    // braille character remains copyable content.
+    let Some(status) = spans.get(index).map(|span| span.content.as_ref()) else {
+        return 0;
+    };
+    let Some(family) = spans.get(index + 1).map(|span| span.content.as_ref()) else {
+        return 0;
+    };
+    if !status.ends_with(' ')
+        || !is_tool_status_glyph(status.trim_end())
+        || !family.ends_with(' ')
+        || UnicodeWidthStr::width(family.trim_end()) != 1
+    {
+        return 0;
+    }
+
+    UnicodeWidthStr::width(status) + UnicodeWidthStr::width(family)
+}
+
+fn is_tool_status_glyph(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(ch) = chars.next() else {
+        return false;
+    };
+    chars.next().is_none()
+        && matches!(
+            ch,
+            '\u{2713}' // ✓
+                | '\u{2715}' // ✕
+                | '\u{00B7}' // ·
+                | '\u{2800}'..='\u{28FF}' // braille spinner frames
+        )
+}
+
 fn review_severity_color(severity: &str) -> Color {
     match severity {
         "error" => palette::STATUS_ERROR,
@@ -1813,7 +1880,7 @@ fn is_cycle_boundary(content: &str) -> bool {
 /// horizontal rule above for visual separation.
 fn render_cycle_boundary(content: &str, width: u16) -> Vec<Line<'static>> {
     let style = Style::default()
-        .fg(palette::WHALE_ACCENT_PRIMARY)
+        .fg(palette::WHALE_ACTION)
         .add_modifier(Modifier::BOLD);
     let rule_style = Style::default().fg(palette::TEXT_DIM);
     let content_width = usize::from(width.saturating_sub(2).max(1));
@@ -1838,8 +1905,16 @@ fn render_cycle_boundary(content: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn status_symbol(started_at: Option<Instant>, status: ToolStatus, low_motion: bool) -> String {
+fn status_symbol(
+    started_at: Option<Instant>,
+    status: ToolStatus,
+    low_motion: bool,
+    family: crate::tui::widgets::tool_card::ToolFamily,
+) -> String {
     match status {
+        ToolStatus::Running if family == crate::tui::widgets::tool_card::ToolFamily::Verify => {
+            crate::tui::spinner::verification_tick_frame(started_at, low_motion).to_string()
+        }
         ToolStatus::Running => {
             crate::tui::spinner::braille_spinner_frame(started_at, low_motion).to_string()
         }
@@ -1968,7 +2043,7 @@ fn render_tool_header_with_family_and_summary(
 
     let mut spans = vec![
         Span::styled(
-            format!("{} ", status_symbol(started_at, status, low_motion)),
+            format!("{} ", status_symbol(started_at, status, low_motion, family)),
             Style::default().fg(tool_state_color(status)),
         ),
         Span::styled(

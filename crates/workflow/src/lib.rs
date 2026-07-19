@@ -4,9 +4,13 @@
 //! exposure, worktree application, replay, and model execution are layered on
 //! top only after their cancellation and evidence semantics are proven.
 
+mod elevation;
+mod gates;
 mod js_authoring;
 mod model_policy;
+mod named_fleet;
 mod replay;
+mod role_resolve;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -14,14 +18,32 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use elevation::{
+    DEFAULT_HIGH_BUDGET_THRESHOLD, ElevationOptions, PlanRiskHint, WorkflowPlanElevation,
+    assess_plan_risk_string, assess_workflow_elevation,
+};
+pub use gates::{
+    GateError, GateKind, GateOn, GateOnFail, GateOutcome, GateSpec, GateState, GateStatusLine,
+    HandoffArtifact, LaneGateBoard, stopship_gate_pipeline,
+};
 pub use js_authoring::{
     JavascriptWorkflowError, JavascriptWorkflowResult, compile_javascript_workflow,
     compile_typescript_workflow,
 };
 pub use model_policy::*;
+pub use named_fleet::{
+    NamedFleet, NamedFleetError, STOPSHIP_REQUIRED_ROLES, load_named_fleet, load_named_fleet_file,
+    parse_named_fleet,
+};
 pub use replay::*;
+pub use role_resolve::{
+    FleetRoleMap, FleetRoleResolveError, ResolvedWorkflowAgent, normalize_token,
+    resolve_workflow_agent, validate_role_token,
+};
 
-pub const DEFAULT_FLEET_WORKFLOW_MAX_AGENTS: usize = 100;
+/// Default hard ceiling on total agents a Fleet-shaped Workflow plan may launch.
+/// Matches the imperative VM lifetime cap (1_000 agents per run).
+pub const DEFAULT_FLEET_WORKFLOW_MAX_AGENTS: usize = 1000;
 pub const DEFAULT_FLEET_WORKFLOW_MAX_DEPTH: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +82,10 @@ pub struct WorkflowSpec {
     pub model_policy: ModelPolicy,
     #[serde(default)]
     pub promotion_policy: PromotionPolicy,
+    /// Workflow-owned role gates and handoffs (#4179). Fleet supplies roles;
+    /// gate semantics stay attached to the Workflow definition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gates: Vec<GateSpec>,
     #[serde(default)]
     pub nodes: Vec<WorkflowNode>,
 }
@@ -128,10 +154,18 @@ pub struct LeafSpec {
     pub prompt: String,
     #[serde(default)]
     pub agent_type: AgentType,
+    /// Fleet role this step should run as (e.g. `scout`, `implementer`).
+    /// Resolved via the fleet roster at dispatch time (#4177). Preferred
+    /// identity field for workflow steps; `profile` remains an explicit
+    /// AgentProfile override. Provider/model live on [`ModelPolicy`] as
+    /// optional overrides — they are **not** required identity fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// Named Fleet roster profile this agent should run as. Resolved against
     /// the saved Fleet roster at dispatch time; unknown names fail validation
     /// before any spawn. When set, role/model/loadout defaults come from the
     /// roster member; explicit fields on this spec override the profile.
+    /// Precedence over `role` when both are set (#4177 / #4111).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     #[serde(default)]
@@ -224,6 +258,10 @@ pub struct PermissionSpec {
     pub allow_write: bool,
     #[serde(default)]
     pub allow_network: bool,
+    /// Expose no tools to the child. This is distinct from an empty
+    /// `allowed_tools` list, which preserves the role's default tool surface.
+    #[serde(default)]
+    pub deny_all_tools: bool,
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     #[serde(default)]
@@ -471,9 +509,57 @@ pub enum TaskMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IsolationMode {
+    /// Runtime chooses isolation.
+    ///
+    /// Parallel write-capable children resolve to [`IsolationMode::Worktree`]
+    /// so concurrent writers do not collide in the parent checkout. Explicit
+    /// [`IsolationMode::Shared`] is the plan-level same-worktree override.
     #[default]
+    Auto,
+    /// Share the parent checkout (same-worktree).
     Shared,
+    /// Dedicated git worktree / branch.
     Worktree,
+}
+
+impl IsolationMode {
+    /// Resolve [`IsolationMode::Auto`] for a leaf.
+    ///
+    /// When `parallel_write` is true (leaf is write-capable inside a parallel
+    /// branch), Auto becomes Worktree. Otherwise Auto becomes Shared.
+    #[must_use]
+    pub fn resolve(self, parallel_write: bool) -> Self {
+        match self {
+            Self::Auto if parallel_write => Self::Worktree,
+            Self::Auto => Self::Shared,
+            other => other,
+        }
+    }
+
+    /// Whether the resolved mode provisions a dedicated worktree.
+    #[must_use]
+    pub fn wants_worktree(self, parallel_write: bool) -> bool {
+        matches!(self.resolve(parallel_write), Self::Worktree)
+    }
+}
+
+/// A leaf is write-capable when it can mutate the workspace.
+///
+/// Authority comes from the declared mode and permissions, not the agent's
+/// role identity. In particular, an implementer may be deliberately confined
+/// to a read-only verification task. Used by workflow lowering to decide the
+/// default isolation for parallel children (#4120).
+#[must_use]
+pub fn leaf_is_write_capable(spec: &LeafSpec) -> bool {
+    spec.mode == TaskMode::ReadWrite || spec.permissions.allow_write
+}
+
+/// Effective worktree flag for a leaf given whether it is being lowered inside
+/// a parallel branch.
+#[must_use]
+pub fn leaf_wants_worktree(spec: &LeafSpec, parallel: bool) -> bool {
+    let parallel_write = parallel && leaf_is_write_capable(spec);
+    spec.isolation.wants_worktree(parallel_write)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -495,6 +581,9 @@ pub struct BranchResult {
 pub struct LeafResult {
     pub leaf_id: String,
     pub task_id: String,
+    /// Fleet role the leaf was declared to run as, if any (#4177).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// Fleet roster profile the leaf was declared to run as, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
@@ -875,6 +964,7 @@ impl MockWorkflowExecutor {
         execution.leaf_results.push(LeafResult {
             leaf_id: spec.id.clone(),
             task_id: spec.id.clone(),
+            role: spec.role.clone(),
             profile: spec.profile.clone(),
             status: outcome.status,
             usage: outcome.usage,
@@ -1514,6 +1604,10 @@ pub enum WorkflowExecutionError {
         "leaf `{leaf}` profile `{profile}` must be a non-empty token without whitespace, quotes, or `=`"
     )]
     InvalidLeafProfile { leaf: String, profile: String },
+    #[error(
+        "leaf `{leaf}` role `{role}` must be a non-empty token without whitespace, quotes, or `=`"
+    )]
+    InvalidLeafRole { leaf: String, role: String },
     #[error("duplicate workflow node `{node}`")]
     DuplicateNodeId { node: String },
     #[error("workflow node `{node}` has unknown {field} reference `{reference}`")]
@@ -1698,6 +1792,9 @@ fn validate_workflow_nodes_inner(
                         leaf: spec.id.clone(),
                     });
                 }
+                if let Some(role) = spec.role.as_deref() {
+                    validate_leaf_role(&spec.id, role)?;
+                }
                 if let Some(profile) = spec.profile.as_deref() {
                     validate_leaf_profile(&spec.id, profile)?;
                 }
@@ -1769,6 +1866,16 @@ fn validate_leaf_profile(leaf: &str, profile: &str) -> Result<(), WorkflowExecut
         return Err(WorkflowExecutionError::InvalidLeafProfile {
             leaf: leaf.to_string(),
             profile: profile.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_leaf_role(leaf: &str, role: &str) -> Result<(), WorkflowExecutionError> {
+    if validate_role_token(role).is_err() {
+        return Err(WorkflowExecutionError::InvalidLeafRole {
+            leaf: leaf.to_string(),
+            role: role.to_string(),
         });
     }
     Ok(())
@@ -2027,6 +2134,7 @@ mod tests {
             id: id.to_string(),
             prompt: format!("run {id}"),
             agent_type: AgentType::General,
+            role: None,
             profile: None,
             mode: TaskMode::ReadOnly,
             isolation: IsolationMode::Shared,
@@ -2043,6 +2151,7 @@ mod tests {
             id: id.to_string(),
             prompt: format!("run {id}"),
             agent_type: AgentType::General,
+            role: None,
             profile: None,
             mode: TaskMode::ReadOnly,
             isolation: IsolationMode::Shared,
@@ -2059,6 +2168,7 @@ mod tests {
             id: id.to_string(),
             prompt: " ".to_string(),
             agent_type: AgentType::General,
+            role: None,
             profile: None,
             mode: TaskMode::ReadOnly,
             isolation: IsolationMode::Shared,
@@ -2079,6 +2189,7 @@ mod tests {
             permissions: PermissionSpec::default(),
             model_policy: ModelPolicy::default(),
             promotion_policy: PromotionPolicy::default(),
+            gates: Vec::new(),
             nodes,
         }
     }
@@ -2360,11 +2471,84 @@ mod tests {
     }
 
     #[test]
+    fn isolation_auto_defaults_parallel_write_to_worktree() {
+        assert_eq!(IsolationMode::default(), IsolationMode::Auto);
+        assert_eq!(
+            IsolationMode::Auto.resolve(/* parallel_write */ true),
+            IsolationMode::Worktree
+        );
+        assert_eq!(
+            IsolationMode::Auto.resolve(/* parallel_write */ false),
+            IsolationMode::Shared
+        );
+        // Explicit shared is the approved same-worktree override.
+        assert_eq!(
+            IsolationMode::Shared.resolve(/* parallel_write */ true),
+            IsolationMode::Shared
+        );
+        assert!(IsolationMode::Worktree.wants_worktree(false));
+        assert!(!IsolationMode::Shared.wants_worktree(true));
+    }
+
+    #[test]
+    fn leaf_write_capable_and_worktree_defaults() {
+        let read_only = LeafSpec {
+            id: "ro".to_string(),
+            prompt: "inspect".to_string(),
+            agent_type: AgentType::Explore,
+            role: None,
+            profile: None,
+            mode: TaskMode::ReadOnly,
+            isolation: IsolationMode::Auto,
+            file_scope: Vec::new(),
+            depends_on_results: Vec::new(),
+            budget: BudgetSpec::default(),
+            permissions: PermissionSpec::default(),
+            model_policy: ModelPolicy::default(),
+        };
+        assert!(!leaf_is_write_capable(&read_only));
+        assert!(!leaf_wants_worktree(&read_only, true));
+
+        let mut read_only_implementer = read_only.clone();
+        read_only_implementer.id = "ro-implementer".to_string();
+        read_only_implementer.agent_type = AgentType::Implementer;
+        assert!(
+            !leaf_is_write_capable(&read_only_implementer),
+            "role identity must not grant write authority"
+        );
+        assert!(
+            !leaf_wants_worktree(&read_only_implementer, true),
+            "parallel read-only implementers stay shared under auto isolation"
+        );
+
+        let mut write = read_only.clone();
+        write.id = "rw".to_string();
+        write.mode = TaskMode::ReadWrite;
+        write.agent_type = AgentType::Implementer;
+        assert!(leaf_is_write_capable(&write));
+        // Parallel write-capable + Auto → worktree by default.
+        assert!(leaf_wants_worktree(&write, true));
+        // Sequential write-capable stays shared unless isolation is worktree.
+        assert!(!leaf_wants_worktree(&write, false));
+
+        write.isolation = IsolationMode::Shared;
+        assert!(
+            !leaf_wants_worktree(&write, true),
+            "explicit shared is the same-worktree override"
+        );
+
+        write.isolation = IsolationMode::Worktree;
+        assert!(leaf_wants_worktree(&write, true));
+        assert!(leaf_wants_worktree(&write, false));
+    }
+
+    #[test]
     fn workflow_ir_roundtrip() {
         let discover_leaf = LeafSpec {
             id: "scan-readme".to_string(),
             prompt: "Inspect README setup gaps".to_string(),
             agent_type: AgentType::Explore,
+            role: None,
             profile: Some("scout".to_string()),
             mode: TaskMode::ReadOnly,
             isolation: IsolationMode::Shared,
@@ -2396,6 +2580,7 @@ mod tests {
             permissions: PermissionSpec {
                 allow_write: false,
                 allow_network: false,
+                deny_all_tools: false,
                 allowed_tools: vec!["rg".to_string()],
                 file_scope: vec!["README.md".to_string()],
             },
@@ -2410,6 +2595,7 @@ mod tests {
                 min_successful_branches: Some(1),
                 promotion_gate: PromotionGate::default(),
             },
+            gates: Vec::new(),
             nodes: vec![
                 WorkflowNode::BranchSet(BranchSpec {
                     id: "discover".to_string(),
@@ -2457,6 +2643,7 @@ mod tests {
                             id: "followup-template".to_string(),
                             prompt: "Patch one independent gap".to_string(),
                             agent_type: AgentType::Implementer,
+                            role: None,
                             profile: None,
                             mode: TaskMode::ReadWrite,
                             isolation: IsolationMode::Worktree,
@@ -2466,6 +2653,7 @@ mod tests {
                             permissions: PermissionSpec {
                                 allow_write: true,
                                 allow_network: false,
+                                deny_all_tools: false,
                                 allowed_tools: Vec::new(),
                                 file_scope: vec!["README.md".to_string()],
                             },
@@ -2684,6 +2872,7 @@ mod tests {
         let result = LeafResult {
             leaf_id: "scan-readme".to_string(),
             task_id: "scan".to_string(),
+            role: None,
             profile: Some("reviewer".to_string()),
             status: WorkflowRunStatus::Failed,
             usage: WorkflowUsage {
@@ -2807,6 +2996,69 @@ mod tests {
             Some("reviewer")
         );
         assert_eq!(execution.leaf_results[1].profile, None);
+    }
+
+    #[test]
+    fn mock_executor_surfaces_leaf_role() {
+        let mut role_leaf = match leaf_node("scout-issue") {
+            WorkflowNode::Leaf(leaf) => leaf,
+            _ => unreachable!("leaf helper returns a leaf"),
+        };
+        role_leaf.role = Some("scout".to_string());
+        let workflow = workflow_spec(vec![WorkflowNode::Leaf(role_leaf)]);
+
+        let execution = MockWorkflowExecutor::new()
+            .run(&workflow)
+            .expect("mock workflow should run");
+
+        assert_eq!(execution.leaf_results[0].role.as_deref(), Some("scout"));
+    }
+
+    #[test]
+    fn leaf_role_token_rule_rejects_invalid_names() {
+        for bad in ["", "has space", "role=scout"] {
+            let mut leaf = match leaf_node("scan") {
+                WorkflowNode::Leaf(leaf) => leaf,
+                _ => unreachable!("leaf helper returns a leaf"),
+            };
+            leaf.role = Some(bad.to_string());
+            let workflow = workflow_spec(vec![WorkflowNode::Leaf(leaf)]);
+
+            let err = MockWorkflowExecutor::new()
+                .run(&workflow)
+                .expect_err("invalid role token should fail validation");
+
+            assert!(
+                matches!(&err, WorkflowExecutionError::InvalidLeafRole { role, .. } if role == bad),
+                "role `{bad}` should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaf_role_roundtrips_without_required_provider_model() {
+        let leaf = LeafSpec {
+            id: "scout-1".to_string(),
+            prompt: "Investigate #4090. Read-only.".to_string(),
+            agent_type: AgentType::Explore,
+            role: Some("scout".to_string()),
+            profile: None,
+            mode: TaskMode::ReadOnly,
+            isolation: IsolationMode::Shared,
+            file_scope: Vec::new(),
+            depends_on_results: Vec::new(),
+            budget: BudgetSpec::default(),
+            permissions: PermissionSpec::default(),
+            model_policy: ModelPolicy::default(),
+        };
+        let json = serde_json::to_string(&leaf).expect("serialize");
+        assert!(json.contains("\"role\":\"scout\""));
+        let parsed: LeafSpec = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed.role.as_deref(), Some("scout"));
+        // Provider/model are optional overrides, not required identity fields.
+        assert_eq!(parsed.model_policy.provider, None);
+        assert_eq!(parsed.model_policy.model, None);
+        assert_eq!(parsed.model_policy, ModelPolicy::default());
     }
 
     #[test]
@@ -3527,6 +3779,7 @@ mod tests {
             leaf_results: vec![LeafResult {
                 leaf_id: "verify-failure".to_string(),
                 task_id: "verify-failure".to_string(),
+                role: None,
                 profile: None,
                 status: WorkflowRunStatus::Failed,
                 usage: WorkflowUsage::default(),

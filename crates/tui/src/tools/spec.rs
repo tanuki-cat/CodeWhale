@@ -118,7 +118,7 @@ pub struct FileReadTracker {
 
 pub type SharedFileReadTracker = Arc<Mutex<FileReadTracker>>;
 
-fn new_shared_file_read_tracker() -> SharedFileReadTracker {
+pub(crate) fn new_shared_file_read_tracker() -> SharedFileReadTracker {
     Arc::new(Mutex::new(FileReadTracker::default()))
 }
 
@@ -170,6 +170,8 @@ pub struct ToolContext {
     pub skills_dir: Option<PathBuf>,
     /// Restrict skill discovery to CodeWhale-owned roots plus `skills_dir`.
     pub skills_scan_codewhale_only: bool,
+    /// Immutable registry snapshot for this workspace/engine context.
+    pub plugin_registry: Option<Arc<crate::plugins::PluginRegistry>>,
     /// Elevated sandbox policy override (used when retrying after sandbox denial).
     /// This overrides the default sandbox behavior for shell commands.
     pub elevated_sandbox_policy: Option<crate::sandbox::SandboxPolicy>,
@@ -274,6 +276,7 @@ impl ToolContext {
             mcp_config_path,
             skills_dir: None,
             skills_scan_codewhale_only: false,
+            plugin_registry: None,
             elevated_sandbox_policy: None,
             shell_network_denied_hint: None,
             auto_approve: false,
@@ -319,6 +322,7 @@ impl ToolContext {
             mcp_config_path: mcp_config_path.into(),
             skills_dir: None,
             skills_scan_codewhale_only: false,
+            plugin_registry: None,
             elevated_sandbox_policy: None,
             shell_network_denied_hint: None,
             auto_approve: false,
@@ -364,6 +368,7 @@ impl ToolContext {
             mcp_config_path: mcp_config_path.into(),
             skills_dir: None,
             skills_scan_codewhale_only: false,
+            plugin_registry: None,
             elevated_sandbox_policy: None,
             shell_network_denied_hint: None,
             auto_approve,
@@ -425,6 +430,12 @@ impl ToolContext {
     ) -> Self {
         self.skills_dir = Some(skills_dir.into());
         self.skills_scan_codewhale_only = scan_codewhale_only;
+        self
+    }
+
+    #[must_use]
+    pub fn with_plugin_registry(mut self, registry: Arc<crate::plugins::PluginRegistry>) -> Self {
+        self.plugin_registry = Some(registry);
         self
     }
 
@@ -742,6 +753,14 @@ impl ToolContext {
     /// Override the shared shell manager.
     pub fn with_shell_manager(mut self, shell_manager: SharedShellManager) -> Self {
         self.shell_manager = shell_manager;
+        self
+    }
+
+    /// Reuse the engine's session-scoped read snapshots across tool-context
+    /// rebuilds. A fresh context is assembled for each turn, but successful
+    /// reads must remain authoritative until the observed file changes.
+    pub fn with_file_read_tracker(mut self, tracker: SharedFileReadTracker) -> Self {
+        self.file_read_tracker = tracker;
         self
     }
 

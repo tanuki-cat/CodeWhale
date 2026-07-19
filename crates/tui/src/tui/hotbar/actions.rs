@@ -527,6 +527,16 @@ impl HotbarActionRegistry {
         self.register_source(&SkillHotbarActionSource { skills });
     }
 
+    /// Atomically replace the Skill-derived action source while retaining
+    /// built-ins, configured routes, slash commands, and live MCP actions.
+    /// Plugin lifecycle changes call this from the same cache refresh that
+    /// updates command dispatch, preventing stale revoked bindings.
+    pub(crate) fn replace_skills(&mut self, skills: &[(String, String)]) {
+        self.actions
+            .retain(|_, action| action.category() != HotbarActionCategory::Skill.as_str());
+        self.register_skills(skills);
+    }
+
     /// Replace the MCP-tool hotbar actions with the tools in `snapshot`.
     ///
     /// Called when a live MCP discovery snapshot lands (or is refreshed) so
@@ -571,21 +581,21 @@ impl HotbarActionSource for BuiltinHotbarActionSource {
             "mode.plan",
             "plan",
             "Plan mode",
-            "Switch the conversation into Plan mode.",
+            "Think through a plan before acting.",
             AppHotbarKind::Mode(AppMode::Plan),
         ));
         registry.register(AppHotbarAction::new(
             "mode.agent",
             "agent",
             "Act mode",
-            "Switch the conversation into Act (Agent) mode.",
+            "Do direct work in the current session.",
             AppHotbarKind::Mode(AppMode::Agent),
         ));
         registry.register(AppHotbarAction::new(
             "mode.operate",
             "operate",
             "Operate mode",
-            "Coordinate workflows, spawn workers, wait, and dispatch more work.",
+            "Send tasks while Fleet workers run in parallel.",
             AppHotbarKind::Mode(AppMode::Operate),
         ));
         registry.register(AppHotbarAction::new(
@@ -908,7 +918,8 @@ impl AppHotbarAction {
             AppHotbarKind::Mode(AppMode::Plan) => MessageId::HotbarActionModePlanName,
             AppHotbarKind::Mode(AppMode::Agent) => MessageId::HotbarActionModeAgentName,
             AppHotbarKind::Mode(AppMode::Yolo) => MessageId::HotbarActionModeYoloName,
-            AppHotbarKind::Mode(AppMode::Auto | AppMode::Operate) => {
+            AppHotbarKind::Mode(AppMode::Operate) => MessageId::HotbarActionModeOperateName,
+            AppHotbarKind::Mode(AppMode::Auto) => {
                 return None;
             }
             AppHotbarKind::ReasoningCycle => MessageId::HotbarActionReasoningCycleName,
@@ -926,7 +937,8 @@ impl AppHotbarAction {
             AppHotbarKind::Mode(AppMode::Plan) => MessageId::HotbarActionModePlanDescription,
             AppHotbarKind::Mode(AppMode::Agent) => MessageId::HotbarActionModeAgentDescription,
             AppHotbarKind::Mode(AppMode::Yolo) => MessageId::HotbarActionModeYoloDescription,
-            AppHotbarKind::Mode(AppMode::Auto | AppMode::Operate) => {
+            AppHotbarKind::Mode(AppMode::Operate) => MessageId::HotbarActionModeOperateDescription,
+            AppHotbarKind::Mode(AppMode::Auto) => {
                 return None;
             }
             AppHotbarKind::ReasoningCycle => MessageId::HotbarActionReasoningCycleDescription,
@@ -1018,16 +1030,7 @@ impl HotbarAction for AppHotbarAction {
                 if app.auto_model {
                     bail!("Reasoning effort is controlled by auto model routing.");
                 }
-                app.reasoning_effort = app
-                    .reasoning_effort
-                    .cycle_next_for_provider(app.api_provider);
-                app.last_effective_reasoning_effort = None;
-                app.update_model_compaction_budget();
-                app.status_message = Some(format!(
-                    "Reasoning effort: {}",
-                    app.reasoning_effort
-                        .display_label_for_provider(app.api_provider)
-                ));
+                app.apply_reasoning_effort_cycle();
                 Ok(HotbarDispatch::AppAction(AppAction::UpdateCompaction(
                     app.compaction_config(),
                 )))
@@ -1055,15 +1058,17 @@ impl HotbarAction for AppHotbarAction {
                 Ok(HotbarDispatch::Handled)
             }
             AppHotbarKind::PaletteOpen => {
-                app.view_stack
-                    .push(CommandPaletteView::new(build_command_palette_entries(
+                app.view_stack.push(CommandPaletteView::new_for_locale(
+                    app.ui_locale,
+                    build_command_palette_entries(
                         app.ui_locale,
                         &app.skills_dir,
                         app.skills_scan_codewhale_only,
                         &app.workspace,
                         &app.mcp_config_path,
                         app.mcp_snapshot.as_ref(),
-                    )));
+                    ),
+                ));
                 Ok(HotbarDispatch::Handled)
             }
             AppHotbarKind::TrustToggle => {
@@ -1442,7 +1447,11 @@ mod tests {
 
     use super::*;
 
-    fn test_app_with_paths(workspace: PathBuf, skills_dir: PathBuf) -> App {
+    fn test_app_with_paths_and_config(
+        workspace: PathBuf,
+        skills_dir: PathBuf,
+        config: &Config,
+    ) -> App {
         let options = TuiOptions {
             model: "deepseek-v4-pro".to_string(),
             workspace,
@@ -1464,9 +1473,13 @@ mod tests {
             resume_session_id: None,
             initial_input: None,
         };
-        let mut app = App::new(options, &Config::default());
+        let mut app = App::new(options, config);
         app.ui_locale = crate::localization::Locale::En;
         app
+    }
+
+    fn test_app_with_paths(workspace: PathBuf, skills_dir: PathBuf) -> App {
+        test_app_with_paths_and_config(workspace, skills_dir, &Config::default())
     }
 
     fn test_app() -> App {
@@ -2178,6 +2191,36 @@ mod tests {
     }
 
     #[test]
+    fn replacing_skills_removes_stale_plugin_actions_atomically() {
+        let mut registry = HotbarActionRegistry::with_builtins();
+        registry.register_skills(&[
+            ("native".to_string(), "native Skill".to_string()),
+            (
+                "demo:review".to_string(),
+                "reviewed plugin Skill".to_string(),
+            ),
+        ]);
+        assert!(registry.get("skill.demo:review").is_some());
+        let builtin_count = registry
+            .iter()
+            .filter(|action| action.category() != HotbarActionCategory::Skill.as_str())
+            .count();
+
+        registry.replace_skills(&[("native".to_string(), "refreshed".to_string())]);
+
+        assert!(registry.get("skill.demo:review").is_none());
+        assert!(registry.get("skill.native").is_some());
+        assert_eq!(
+            registry
+                .iter()
+                .filter(|action| action.category() != HotbarActionCategory::Skill.as_str())
+                .count(),
+            builtin_count,
+            "refresh must preserve every non-Skill action source"
+        );
+    }
+
+    #[test]
     fn skill_hotbar_action_activates_skill_through_dollar_alias() {
         let workspace = tempfile::TempDir::new().expect("workspace");
         let skills_dir = tempfile::TempDir::new().expect("skills dir");
@@ -2188,9 +2231,14 @@ mod tests {
             "---\nname: hotbar-demo-skill\ndescription: Demo skill for hotbar tests\n---\n\nFollow the demo instructions.\n",
         )
         .expect("write SKILL.md");
-        let mut app = test_app_with_paths(
+        let config = Config {
+            skills_dir: Some(skills_dir.path().to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        let mut app = test_app_with_paths_and_config(
             workspace.path().to_path_buf(),
             skills_dir.path().to_path_buf(),
+            &config,
         );
 
         let action = app

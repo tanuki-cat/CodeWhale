@@ -14,6 +14,7 @@ pub const DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS: u32 = 1_000_000;
 /// models resolve to their own scaled value via
 /// [`compaction_threshold_for_model`] (#664).
 pub const DEFAULT_COMPACTION_TOKEN_THRESHOLD: usize = 102_400;
+#[cfg(test)]
 const COMPACTION_THRESHOLD_PERCENT: u32 = 80;
 pub const DEFAULT_AUTO_COMPACT_MAX_CONTEXT_WINDOW_TOKENS: u32 = DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS;
 
@@ -212,6 +213,10 @@ pub struct Usage {
     pub prompt_cache_hit_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_miss_tokens: Option<u32>,
+    /// Cache-creation / cache-write tokens (Anthropic `cache_creation_input_tokens`).
+    /// Billed at the cache-write rate when the pricing row publishes one (#4318).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_write_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u32>,
     /// Approximate input tokens spent re-sending prior `reasoning_content`
@@ -249,7 +254,7 @@ pub fn context_window_for_model(model: &str) -> Option<u32> {
         }
         return Some(LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS);
     }
-    if is_openai_gpt_55_api_model(&lower) {
+    if is_openai_gpt_55_api_model(&lower) || is_openai_gpt_56_api_model(&lower) {
         return Some(1_050_000);
     }
     if is_openai_codex_model(&lower) {
@@ -275,7 +280,9 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         // https://developers.openai.com/api/docs/models/gpt-5.3-codex
         "gpt-5-codex" | "gpt-5.3-codex" => Some(400_000),
         // Anthropic 4.6+ models carry a 1M window; Haiku stays at 200K (#3014).
-        "claude-opus-4-8" | "claude-sonnet-4-6" => Some(1_000_000),
+        "claude-opus-4-8" | "claude-sonnet-4-6" | "claude-sonnet-5" | "claude-fable-5" => {
+            Some(1_000_000)
+        }
         "claude-haiku-4-5" => Some(200_000),
         "trinity-mini" => Some(128_000),
         "arcee-ai/trinity-large-thinking" | "trinity-large-thinking" | "trinity-large-preview" => {
@@ -323,6 +330,12 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         | "mimo-v2.5-tts-voicedesign"
         | "mimo-v2.5-tts-voiceclone"
         | "mimo-v2-tts" => Some(8_000),
+        "grok-4.5" => Some(500_000),
+        "grok-4.3" => Some(1_000_000),
+        "grok-build" => Some(512_000),
+        "grok-composer-2.5-fast" => Some(200_000),
+        "grok-4.20-0309-reasoning" | "grok-4.20-0309-non-reasoning" => Some(2_000_000),
+        "muse-spark-1.1" => Some(1_000_000),
         _ => None,
     }
 }
@@ -336,23 +349,39 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
     if lower.contains("deepseek") && lower.contains("v4") {
         return Some(384_000);
     }
-    if is_openai_gpt_55_api_model(&lower) || is_openai_codex_model(&lower) {
+    if is_openai_gpt_55_api_model(&lower)
+        || is_openai_gpt_56_api_model(&lower)
+        || is_openai_codex_model(&lower)
+    {
         return Some(128_000);
     }
     match lower.as_str() {
         "gpt-5-codex" | "gpt-5.3-codex" => Some(128_000),
-        "claude-opus-4-8" => Some(128_000),
-        "claude-sonnet-4-6" | "claude-haiku-4-5" => Some(64_000),
-        "arcee-ai/trinity-large-thinking"
-        | "trinity-large-thinking"
-        | "moonshotai/kimi-k2.7-code"
+        // claude-sonnet-4-6 max output raised 64K -> 128K per
+        // https://platform.claude.com/docs/en/about-claude/models/overview
+        // (2026-07-09 audit).
+        "claude-opus-4-8" | "claude-sonnet-4-6" | "claude-sonnet-5" | "claude-fable-5" => {
+            Some(128_000)
+        }
+        "claude-haiku-4-5" => Some(64_000),
+        "arcee-ai/trinity-large-thinking" | "trinity-large-thinking" => Some(262_144),
+        // Kimi K2.7 Code has a 256K context window but its documented default
+        // maximum generation is 32K. Keeping those separate prevents the
+        // input budget from collapsing to the 1K emergency floor (#4368).
+        "moonshotai/kimi-k2.7-code"
         | "moonshotai/kimi-k2.6"
         | "kimi-k2.7-code"
         | "kimi-k2.6"
-        | "kimi-for-coding" => Some(262_144),
+        | "kimi-for-coding" => Some(32_768),
         "minimax/minimax-m3" | "minimax-m3" => Some(524_288),
-        "qwen/qwen3.6-35b-a3b" | "qwen/qwen3.6-27b" => Some(262_140),
-        "qwen/qwen3.6-flash" | "qwen/qwen3.6-max-preview" | "qwen/qwen3.6-plus" => Some(65_536),
+        // Alibaba's published limit is 65,536 output tokens; the earlier
+        // 262,140 mirrored the context window (data-entry smell flagged by
+        // MODEL_PROVIDER_AUDIT A2/D-7, vendor-verified 2026-07-12).
+        "qwen/qwen3.6-35b-a3b"
+        | "qwen/qwen3.6-27b"
+        | "qwen/qwen3.6-flash"
+        | "qwen/qwen3.6-max-preview"
+        | "qwen/qwen3.6-plus" => Some(65_536),
         "z-ai/glm-5.1" | "z-ai/glm-5.2" | "z-ai/glm-5-turbo" | "glm-5.1" | "glm-5.2"
         | "glm-5-turbo" => Some(131_072),
         "xiaomi/mimo-v2.5-pro"
@@ -370,6 +399,7 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
         "nvidia/nemotron-3-ultra-550b-a55b:free" => Some(65_536),
         "google/gemma-4-31b-it" => Some(16_384),
         "google/gemma-4-31b-it:free" | "google/gemma-4-26b-a4b-it:free" => Some(32_768),
+        "muse-spark-1.1" => Some(32_000),
         _ => None,
     }
 }
@@ -393,10 +423,14 @@ pub fn model_supports_reasoning(model: &str) -> bool {
         lower.as_str(),
         "claude-opus-4-8"
             | "claude-sonnet-4-6"
+            | "claude-sonnet-5"
+            | "claude-fable-5"
             | "gpt-5-codex"
             | "gpt-5.3-codex"
+            | "trinity-mini"
             | "arcee-ai/trinity-large-thinking"
             | "trinity-large-thinking"
+            | "thinkingmachines/inkling"
             | "google/gemma-4-31b-it"
             | "google/gemma-4-31b-it:free"
             | "google/gemma-4-26b-a4b-it"
@@ -425,6 +459,7 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "qwen/qwen3.6-max-preview"
             | "qwen/qwen3.6-27b"
             | "qwen/qwen3.6-plus"
+            | "qwen/qwen3.7-plus"
             | "tencent/hy3-preview"
             | "xiaomi/mimo-v2.5-pro"
             | "xiaomi/mimo-v2.5"
@@ -437,20 +472,35 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "glm-5.1"
             | "glm-5.2"
             | "glm-5-turbo"
+            | "grok-4.5"
+            | "grok-4.3"
+            | "grok-build"
+            | "grok-4.20-0309-reasoning"
+            | "muse-spark-1.1"
     ) || is_openai_gpt_55_api_model(&lower)
+        || is_openai_gpt_56_api_model(&lower)
         || is_openai_codex_model(&lower)
 }
 
 #[must_use]
 pub(crate) fn model_is_openai_reasoning_family(model: &str) -> bool {
     let lower = model.to_lowercase();
-    is_openai_gpt_55_api_model(&lower) || is_openai_codex_model(&lower)
+    is_openai_gpt_55_api_model(&lower)
+        || is_openai_gpt_56_api_model(&lower)
+        || is_openai_codex_model(&lower)
 }
 
 fn is_openai_gpt_55_api_model(model_lower: &str) -> bool {
     matches!(model_lower, "gpt-5.5" | "gpt-5.5-pro")
         || has_date_snapshot_suffix(model_lower, "gpt-5.5-")
         || has_date_snapshot_suffix(model_lower, "gpt-5.5-pro-")
+}
+
+pub(crate) fn is_openai_gpt_56_api_model(model_lower: &str) -> bool {
+    matches!(
+        model_lower,
+        "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    )
 }
 
 fn is_openai_codex_model(model_lower: &str) -> bool {
@@ -471,7 +521,7 @@ fn is_openai_codex_model(model_lower: &str) -> bool {
     )
 }
 
-fn has_date_snapshot_suffix(model_lower: &str, prefix: &str) -> bool {
+pub(crate) fn has_date_snapshot_suffix(model_lower: &str, prefix: &str) -> bool {
     let Some(rest) = model_lower.strip_prefix(prefix) else {
         return false;
     };
@@ -521,6 +571,7 @@ fn explicit_context_window_hint(model_lower: &str) -> Option<u32> {
 /// Derive a compaction token threshold from model context and a caller-supplied
 /// percentage.
 #[must_use]
+#[cfg(test)]
 pub fn compaction_threshold_for_model_at_percent(model: &str, percent: f64) -> usize {
     let Some(window) = context_window_for_model(model) else {
         return DEFAULT_COMPACTION_TOKEN_THRESHOLD;
@@ -540,6 +591,7 @@ pub fn compaction_threshold_for_model_at_percent(model: &str, percent: f64) -> u
 /// configure it. v0.8.64 defaults automatic continuity on for known model
 /// windows up to the V4 1M class while keeping unknown model ids opt-in.
 #[must_use]
+#[cfg(test)]
 pub fn auto_compact_default_for_model(model: &str) -> bool {
     context_window_for_model(model)
         .is_some_and(|window| window <= DEFAULT_AUTO_COMPACT_MAX_CONTEXT_WINDOW_TOKENS)
@@ -702,6 +754,16 @@ mod tests {
 
     #[test]
     fn openai_api_and_codex_models_have_verified_context_metadata() {
+        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(context_window_for_model(model), Some(1_050_000));
+            assert_eq!(max_output_tokens_for_model(model), Some(128_000));
+            assert!(model_supports_reasoning(model));
+            assert_eq!(
+                compaction_threshold_for_model_at_percent(model, 80.0),
+                840_000
+            );
+        }
+
         for model in [
             "gpt-5.5",
             "gpt-5.5-pro",
@@ -741,6 +803,51 @@ mod tests {
         assert_eq!(context_window_for_model("gpt-5.5-nano"), None);
         assert_eq!(max_output_tokens_for_model("gpt-5.5-nano"), None);
         assert!(!model_supports_reasoning("gpt-5.5-nano"));
+    }
+
+    #[test]
+    fn anthropic_stepfun_and_sakana_limits_match_2026_07_09_audit() {
+        // Sonnet 4.6 output cap raised 64K -> 128K per
+        // https://platform.claude.com/docs/en/about-claude/models/overview;
+        // Haiku stays at 64K.
+        assert_eq!(
+            max_output_tokens_for_model("claude-sonnet-4-6"),
+            Some(128_000)
+        );
+        assert_eq!(
+            max_output_tokens_for_model("claude-haiku-4-5"),
+            Some(64_000)
+        );
+        // step-3.7-flash max output is third-party sourced (models.dev +
+        // Artificial Analysis; the official StepFun page is silent):
+        // https://models.dev/models/stepfun/step-3.7-flash/
+        assert_eq!(max_output_tokens_for_model("step-3.7-flash"), Some(256_000));
+        assert_eq!(context_window_for_model("step-3.7-flash"), Some(256_000));
+        // fugu-ultra limits are third-party sourced (Requesty; Sakana's own
+        // >272K price tier at https://console.sakana.ai/pricing confirms the
+        // context window exceeds 272K).
+        for model in ["fugu-ultra", "fugu-ultra-20260615"] {
+            assert_eq!(context_window_for_model(model), Some(1_000_000), "{model}");
+            assert_eq!(max_output_tokens_for_model(model), Some(131_000), "{model}");
+        }
+    }
+
+    #[test]
+    fn claude_fable_5_and_sonnet_5_have_verified_metadata() {
+        // 1M context / 128K output per
+        // https://platform.claude.com/docs/en/about-claude/pricing (2026-07-09).
+        for model in ["claude-fable-5", "claude-sonnet-5"] {
+            assert_eq!(context_window_for_model(model), Some(1_000_000), "{model}");
+            assert_eq!(max_output_tokens_for_model(model), Some(128_000), "{model}");
+            assert!(model_supports_reasoning(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn muse_spark_has_verified_context_and_reasoning_metadata() {
+        assert_eq!(context_window_for_model("muse-spark-1.1"), Some(1_000_000));
+        assert_eq!(max_output_tokens_for_model("muse-spark-1.1"), Some(32_000));
+        assert!(model_supports_reasoning("muse-spark-1.1"));
     }
 
     #[test]
@@ -792,14 +899,40 @@ mod tests {
     }
 
     #[test]
-    fn arcee_direct_models_have_static_windows_without_reasoning_flag() {
+    fn xai_grok_models_have_static_context_metadata() {
+        for (model, expected_window, supports_reasoning) in [
+            ("grok-4.5", 500_000, true),
+            ("grok-4.3", 1_000_000, true),
+            ("grok-build", 512_000, true),
+            ("grok-composer-2.5-fast", 200_000, false),
+            ("grok-4.20-0309-reasoning", 2_000_000, true),
+            ("grok-4.20-0309-non-reasoning", 2_000_000, false),
+        ] {
+            assert_eq!(context_window_for_model(model), Some(expected_window));
+            assert_eq!(max_output_tokens_for_model(model), None);
+            assert_eq!(model_supports_reasoning(model), supports_reasoning);
+        }
+    }
+
+    #[test]
+    fn arcee_direct_models_preserve_verified_capabilities_only() {
         assert_eq!(
             context_window_for_model("trinity-large-preview"),
             Some(262_144)
         );
         assert!(!model_supports_reasoning("trinity-large-preview"));
         assert_eq!(context_window_for_model("trinity-mini"), Some(128_000));
-        assert!(!model_supports_reasoning("trinity-mini"));
+        assert_eq!(max_output_tokens_for_model("trinity-mini"), None);
+        assert!(model_supports_reasoning("trinity-mini"));
+    }
+
+    #[test]
+    fn qwen37_plus_and_inkling_reasoning_do_not_invent_limits() {
+        for model in ["qwen/qwen3.7-plus", "thinkingmachines/inkling"] {
+            assert_eq!(context_window_for_model(model), None, "{model}");
+            assert_eq!(max_output_tokens_for_model(model), None, "{model}");
+            assert!(model_supports_reasoning(model), "{model}");
+        }
     }
 
     #[test]
@@ -853,6 +986,7 @@ mod tests {
         // ids without the OpenRouter vendor prefix; both spellings must
         // resolve identical metadata (#1310 ride-along on #3023).
         for (model, expected_window) in [
+            ("kimi-k3", 1_048_576),
             ("kimi-k2.7-code", 262_144),
             ("kimi-k2.6", 262_144),
             ("minimax-m3", 1_000_000),
@@ -874,12 +1008,14 @@ mod tests {
         // vision model): same compact window as 5.1 but reasoning-capable.
         assert_eq!(context_window_for_model("z-ai/glm-5-turbo"), Some(202_752));
         assert!(model_supports_reasoning("z-ai/glm-5-turbo"));
-        assert_eq!(max_output_tokens_for_model("kimi-k2.7-code"), Some(262_144));
-        assert_eq!(max_output_tokens_for_model("kimi-k2.6"), Some(262_144));
         assert_eq!(
-            max_output_tokens_for_model("kimi-for-coding"),
-            Some(262_144)
+            crate::model_catalog::resolved_max_output("kimi-k2.7-code"),
+            Some(32_768)
         );
+        assert_eq!(max_output_tokens_for_model("kimi-k2.7-code"), Some(32_768));
+        assert_eq!(max_output_tokens_for_model("kimi-k2.6"), Some(32_768));
+        assert_eq!(max_output_tokens_for_model("kimi-for-coding"), Some(32_768));
+        assert_eq!(max_output_tokens_for_model("kimi-k3"), Some(131_072));
         assert_eq!(max_output_tokens_for_model("minimax-m3"), Some(524_288));
         assert_eq!(max_output_tokens_for_model("glm-5.1"), Some(131_072));
         assert_eq!(max_output_tokens_for_model("glm-5.2"), Some(131_072));
