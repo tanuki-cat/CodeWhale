@@ -14,6 +14,22 @@ use crate::config::{
 };
 use crate::models::{Usage, has_date_snapshot_suffix};
 
+/// Extract the origin (scheme + host) from a base URL, stripping any path
+/// suffix. This is used to build the DeepSeek balance endpoint from a
+/// user-configured base URL that may include a path prefix like `/v1` or
+/// `/api/v1/llmproxy`.
+pub fn balance_origin(base_url: &str) -> String {
+    match base_url.find("://") {
+        Some(scheme_end) => {
+            let after = scheme_end + 3;
+            let host = &base_url[after..];
+            let host_end = host.find('/').unwrap_or(host.len());
+            format!("{}{}", &base_url[..after], &host[..host_end])
+        }
+        None => base_url.trim_end_matches('/').to_string(),
+    }
+}
+
 /// Cost display currency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CostCurrency {

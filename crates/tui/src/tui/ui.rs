@@ -54,7 +54,7 @@ use crate::commands;
 use crate::compaction::CompactionConfig;
 use crate::compaction::{estimate_input_tokens_conservative, estimate_tokens};
 use crate::config::{
-    ApiProvider, Config, ProviderConfig, ProviderIdentity, ProvidersConfig, StatusItem,
+    ApiProvider, Config, ProviderConfig, ProviderIdentity, ProvidersConfig,
     UpdateConfig, persist_external_credential_consent_for_at,
     revoke_external_credential_consent_for_at,
 };
@@ -2283,7 +2283,8 @@ async fn fetch_deepseek_balance(
     api_key: &str,
     base_url: &str,
 ) -> Option<crate::pricing::BalanceInfo> {
-    let url = format!("{}/user/balance", base_url.trim_end_matches('/'));
+    let origin = crate::pricing::balance_origin(base_url);
+    let url = format!("{origin}/user/balance");
     let client = &*BALANCE_CLIENT;
     let response = client
         .get(url)
@@ -2305,11 +2306,12 @@ async fn fetch_deepseek_balance(
 }
 
 fn should_fetch_deepseek_balance(app: &App) -> bool {
-    app.status_items.contains(&StatusItem::Balance)
-        && matches!(
-            app.api_provider,
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN
-        )
+    // Always fetch balance for DeepSeek providers — it is now shown inline
+    // after the session cost in the status line, not only as a separate chip.
+    matches!(
+        app.api_provider,
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN
+    )
 }
 
 fn toggle_settings_view(app: &mut App) {

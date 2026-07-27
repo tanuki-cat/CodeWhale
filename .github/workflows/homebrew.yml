@@ -1,0 +1,65 @@
+name: Homebrew
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g. v0.8.61)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  update-tap:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.version }}"
+          else
+            TAG="$(gh release list -R tanuki-cat/CodeWhale -L 1 --json tagName -q '.[0].tagName')"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $TAG"
+
+      - name: Download checksum manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          MANIFEST_PATH="/tmp/codewhale-artifacts-sha256.txt"
+
+          for i in 1 2 3; do
+            if gh release download "$TAG" \
+              -R tanuki-cat/CodeWhale \
+              -p 'codewhale-artifacts-sha256.txt' \
+              -O "$MANIFEST_PATH" 2>/dev/null; then
+              echo "Downloaded manifest ($(wc -c < "$MANIFEST_PATH") bytes)"
+              exit 0
+            fi
+            echo "Attempt $i failed; retrying in 10s…"
+            sleep 10
+          done
+          echo "::error::Failed to download manifest after 3 attempts"
+          exit 1
+
+      - name: Update Homebrew tap
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          MANIFEST: /tmp/codewhale-artifacts-sha256.txt
+          TAP_REPO: tanuki-cat/homebrew-codewhale
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: bash .github/scripts/update-homebrew-tap.sh
