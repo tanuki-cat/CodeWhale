@@ -197,9 +197,12 @@ pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
     }
 
     // Show cost in the underwater phase strip when the user has opted
-    // in via status_items. Falls back to the billing-mode label (Local,
-    // Unknown, or "—") when there is no positive metered spend yet, so
-    // the chip never silently disappears.
+    // in via status_items. Preferred path is footer_cost_spans (which
+    // validates pricing). When that returns empty but the session has
+    // real accumulated cost, bypass the pricing gate and show the
+    // amount directly — same data the /cost command uses.  Only when
+    // there is genuinely zero cost do we fall back to the billing-mode
+    // label so the chip never silently disappears.
     if tier != ShellTier::Compact
         && app.status_items.contains(&crate::config::StatusItem::Cost)
     {
@@ -211,26 +214,41 @@ pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
             ));
             left.extend(cost_spans);
         } else {
-            // No positive spend yet: surface the billing mode so the
-            // user can see whether the route is metered/local/unknown.
-            let cost = app.displayed_session_cost_for_currency(app.cost_currency);
-            let chip = crate::route_billing::usage_chip(
-                app.billing_presentation,
-                app.api_provider,
-                &app.model,
-                cost,
-                app.cost_display_currency(app.cost_currency),
-                None,
-            );
-            let label = crate::route_billing::format_usage_line(&chip);
-            left.push(Span::styled(
-                " · ",
-                Style::default().fg(app.ui_theme.text_dim),
-            ));
-            left.push(Span::styled(
-                label,
-                Style::default().fg(app.ui_theme.text_muted),
-            ));
+            let total = app.displayed_session_cost_for_currency(app.cost_currency);
+            if total > 0.0 {
+                // Session has real spend but the pricing gate didn't
+                // return Money.  Show the accumulated amount directly
+                // so cost is never Unknown when data exists.
+                let currency = app.cost_display_currency(app.cost_currency);
+                let label = crate::pricing::format_cost_amount(total, currency);
+                left.push(Span::styled(
+                    " · ",
+                    Style::default().fg(app.ui_theme.text_dim),
+                ));
+                left.push(Span::styled(
+                    label,
+                    Style::default().fg(app.ui_theme.text_muted),
+                ));
+            } else {
+                // Zero cost so far: surface the billing mode.
+                let chip = crate::route_billing::usage_chip(
+                    app.billing_presentation,
+                    app.api_provider,
+                    &app.model,
+                    total,
+                    app.cost_display_currency(app.cost_currency),
+                    None,
+                );
+                let label = crate::route_billing::format_usage_line(&chip);
+                left.push(Span::styled(
+                    " · ",
+                    Style::default().fg(app.ui_theme.text_dim),
+                ));
+                left.push(Span::styled(
+                    label,
+                    Style::default().fg(app.ui_theme.text_muted),
+                ));
+            }
         }
     }
 
