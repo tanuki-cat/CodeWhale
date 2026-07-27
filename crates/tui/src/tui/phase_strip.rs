@@ -208,9 +208,14 @@ pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
     {
         let cost_spans = crate::tui::footer_ui::footer_cost_spans(app);
         if !cost_spans.is_empty() {
+            let prefix = app.tr(MessageId::FooterCostPrefix);
             left.push(Span::styled(
                 " · ",
                 Style::default().fg(app.ui_theme.text_dim),
+            ));
+            left.push(Span::styled(
+                format!("{prefix} "),
+                Style::default().fg(app.ui_theme.text_muted),
             ));
             left.extend(cost_spans);
         } else {
@@ -220,13 +225,14 @@ pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
                 // return Money.  Show the accumulated amount directly
                 // so cost is never Unknown when data exists.
                 let currency = app.cost_display_currency(app.cost_currency);
-                let label = crate::pricing::format_cost_amount(total, currency);
+                let amount = crate::pricing::format_cost_amount(total, currency);
+                let prefix = app.tr(MessageId::FooterCostPrefix);
                 left.push(Span::styled(
                     " · ",
                     Style::default().fg(app.ui_theme.text_dim),
                 ));
                 left.push(Span::styled(
-                    label,
+                    format!("{prefix} {amount}"),
                     Style::default().fg(app.ui_theme.text_muted),
                 ));
             } else {

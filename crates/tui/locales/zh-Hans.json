@@ -307,6 +307,7 @@
     "FooterPressCtrlCAgain": "再次按 Ctrl+C 退出",
     "FooterWorking": "工作中",
     "FooterBalancePrefix": "余额",
+    "FooterCostPrefix": "费用",
     "HelpSectionActions": "操作",
     "HelpSectionClipboard": "剪贴板",
     "HelpSectionEditing": "输入编辑",

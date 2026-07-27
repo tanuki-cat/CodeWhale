@@ -307,6 +307,7 @@
     "FooterPressCtrlCAgain": "종료하려면 Ctrl+C를 다시 누르세요",
     "FooterWorking": "작업 중",
     "FooterBalancePrefix": "잔액",
+    "FooterCostPrefix": "비용",
     "HelpSectionActions": "동작",
     "HelpSectionClipboard": "클립보드",
     "HelpSectionEditing": "입력 편집",

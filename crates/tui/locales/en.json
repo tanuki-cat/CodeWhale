@@ -307,6 +307,7 @@
     "FooterPressCtrlCAgain": "Press Ctrl+C again to quit",
     "FooterWorking": "working",
     "FooterBalancePrefix": "balance",
+    "FooterCostPrefix": "cost",
     "HelpSectionActions": "Actions",
     "HelpSectionClipboard": "Clipboard",
     "HelpSectionEditing": "Input editing",

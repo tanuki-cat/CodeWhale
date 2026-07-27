@@ -15,6 +15,7 @@
     "TranslationComplete": "翻譯完成",
     "TranslationFailed": "翻譯失敗",
     "FooterBalancePrefix": "餘額",
+    "FooterCostPrefix": "費用",
     "FanoutCounts": "{done} 已完成 · {running} 運行中 · {failed} 失敗 · {pending} 等待中",
     "AppModeAgent": "Act",
     "AppModeAuto": "自動",

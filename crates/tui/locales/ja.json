@@ -307,6 +307,7 @@
     "FooterPressCtrlCAgain": "もう一度 Ctrl+C で終了",
     "FooterWorking": "処理中",
     "FooterBalancePrefix": "残高",
+    "FooterCostPrefix": "コスト",
     "HelpSectionActions": "操作",
     "HelpSectionClipboard": "クリップボード",
     "HelpSectionEditing": "入力編集",
