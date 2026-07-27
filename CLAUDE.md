@@ -84,3 +84,53 @@ merge is an excavation, stop and apply "Intent is the artifact" instead.
 - See `AGENTS.md` → "Where to work right now" for build/test commands, known
   suite papercuts, and the removed-machinery guardrails (agent-only surface,
   no lifecycle/coherence systems).
+
+## 合并 `upstream/main` 到 `main-release` 注意事项
+
+每次从上游合并时，必须检查以下定制化功能是否被上游覆盖/删除：
+
+### CI / Workflow（必须保留 main-release 版本）
+
+| 文件 | 说明 |
+|------|------|
+| `.github/workflows/release.yml` | fork 专用（不含 docker/Homebrew 自动发布），parity 检查针对 `main-release` |
+| `.github/scripts/update-homebrew-tap.sh` | 指向 `tanuki-cat/homebrew-codewhale`，不是上游的 `Hmbown/homebrew-deepseek-tui` |
+| `.github/workflows/homebrew.yml` | main-release 独有的 Homebrew 自动更新 workflow |
+
+### Rust 源码定制（需重新集成）
+
+| 模块 | 说明 |
+|------|------|
+| `crates/tui/src/seam_manager.rs` | 追加式分层上下文管理。上游删除后需保留文件并加 `mod` 声明，待后续集成到 engine |
+| `crates/tui/src/tui/phase_strip.rs` | 上游 Ombre 路径只渲染 cost + cache。main-release 补齐了 balance、tokens、cost fallback |
+| `crates/tui/src/tui/ui.rs` | `should_fetch_deepseek_balance` 不检查 `StatusItem::Balance`，DeepSeek 始终查余额；`fetch_deepseek_balance` 使用 `balance_origin()` 剥离路径后缀 |
+| `crates/tui/src/pricing.rs` | 新增 `balance_origin()`；`provider_owned_hand_pricing_at` 中 DeepSeek 白名单改为 `starts_with("deepseek")` |
+| `crates/tui/src/config.rs` | 新增 `drop_trailing_context_hint()` 剥离 harness 追加的 `[1m]`/`[128k]` context hint |
+| `crates/tui/src/commands/groups/debug/balance.rs` | 上游替换为空壳 scaffold，需恢复 `balance_cell` 读取逻辑 |
+| `crates/tui/src/localization.rs` + `locales/*.json` | 新增 `FooterCostPrefix` 消息 ID |
+| `crates/tui/locales/` | 全部 8 个 locale 文件新增 `FooterCostPrefix` |
+
+### 合并后验证
+
+```bash
+# 编译检查
+RUSTFLAGS="-Dwarnings" cargo check --workspace --all-targets
+
+# 关键功能验证
+# 1. footer 中 cost / balance / tokens / cache 正常显示（Ombre 模式下）
+# 2. /cost 命令返回正确金额
+# 3. /balance 命令返回余额（非 scaffold 消息）
+# 4. DeepSeek provider 所有模型（v4-pro、v4-flash、r1 等）均有定价
+# 5. 模型名含 [1m] hint 时定价查找不受影响
+```
+
+### 上游已知删除了的 main-release 功能
+
+- `AppAction::FetchBalance` / `balance_endpoint()` / `ProviderBalance` — 上游用事件循环内自动获取替代
+- `plan_prompt.rs` — 上游 ModalKind/ViewEvent API 已重构，需重新适配
+
+### 版本管理
+
+- 合并后 bumper 次版本号（如 0.9.1 → 0.9.2）
+- 打 annotated tag：`git tag -a vX.Y.Z -m "vX.Y.Z: merge upstream/main + main-release customizations"`
+- Push：`git push origin main-release --tags`
