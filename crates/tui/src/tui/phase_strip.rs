@@ -196,9 +196,10 @@ pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
         ));
     }
 
-    // Show cost in the underwater strip when the user has opted in via
-    // status_items (or the default footer includes Cost). Use the same
-    // cost-span function as the classic footer so both paths stay in sync.
+    // Show cost in the underwater phase strip when the user has opted
+    // in via status_items. Falls back to the billing-mode label (Local,
+    // Unknown, or "—") when there is no positive metered spend yet, so
+    // the chip never silently disappears.
     if tier != ShellTier::Compact
         && app.status_items.contains(&crate::config::StatusItem::Cost)
     {
@@ -209,6 +210,27 @@ pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
                 Style::default().fg(app.ui_theme.text_dim),
             ));
             left.extend(cost_spans);
+        } else {
+            // No positive spend yet: surface the billing mode so the
+            // user can see whether the route is metered/local/unknown.
+            let cost = app.displayed_session_cost_for_currency(app.cost_currency);
+            let chip = crate::route_billing::usage_chip(
+                app.billing_presentation,
+                app.api_provider,
+                &app.model,
+                cost,
+                app.cost_display_currency(app.cost_currency),
+                None,
+            );
+            let label = crate::route_billing::format_usage_line(&chip);
+            left.push(Span::styled(
+                " · ",
+                Style::default().fg(app.ui_theme.text_dim),
+            ));
+            left.push(Span::styled(
+                label,
+                Style::default().fg(app.ui_theme.text_muted),
+            ));
         }
     }
 
@@ -226,59 +248,33 @@ pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
         ));
     }
 
-    // Balance chip: mirror footer_balance_spans so the underwater strip
-    // shows account balance inline after cost/cache (main-release parity).
+    // Balance chip: use the same footer_balance_spans as the classic
+    // footer so currency symbol, prefix, and precision stay in sync.
     if tier != ShellTier::Compact
         && app.status_items.contains(&crate::config::StatusItem::Balance)
     {
-        let info = match app.balance_cell.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => None,
-        };
-        if let Some(info) = info
-            && let Some(total) = info.total_balance_f64()
-            && total > 0.0
-        {
-            let symbol = match info.currency.as_str() {
-                "CNY" | "cny" => "¥",
-                _ => "$",
-            };
-            let label = if total >= 1000.0 {
-                format!("{symbol}{total:.0}")
-            } else if total >= 10.0 {
-                format!("{symbol}{total:.1}")
-            } else {
-                format!("{symbol}{total:.2}")
-            };
+        let balance_spans = crate::tui::footer_ui::footer_balance_spans(app);
+        if !balance_spans.is_empty() {
             left.push(Span::styled(
                 " · ",
                 Style::default().fg(app.ui_theme.text_dim),
             ));
-            left.push(Span::styled(
-                label,
-                Style::default().fg(app.ui_theme.text_muted),
-            ));
+            left.extend(balance_spans);
         }
     }
 
-    // Token usage chip: session-level input / cache-hit / output totals.
+    // Token usage chip: use the same footer_session_tokens_spans as the
+    // classic footer so formatting stays in one place.
     if tier != ShellTier::Compact
         && app.status_items.contains(&crate::config::StatusItem::Tokens)
     {
-        let session = &app.session;
-        let total = u64::from(session.total_input_tokens)
-            .saturating_add(u64::from(session.total_output_tokens));
-        if total > 0 {
-            let text =
-                crate::tui::footer_ui::format_token_count_compact(total);
+        let token_spans = crate::tui::footer_ui::footer_session_tokens_spans(app);
+        if !token_spans.is_empty() {
             left.push(Span::styled(
                 " · ",
                 Style::default().fg(app.ui_theme.text_dim),
             ));
-            left.push(Span::styled(
-                format!("tok {text}"),
-                Style::default().fg(app.ui_theme.text_muted),
-            ));
+            left.extend(token_spans);
         }
     }
 
