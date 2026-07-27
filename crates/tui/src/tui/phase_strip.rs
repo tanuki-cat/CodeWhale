@@ -232,6 +232,62 @@ pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
         ));
     }
 
+    // Balance chip: mirror footer_balance_spans so the underwater strip
+    // shows account balance inline after cost/cache (main-release parity).
+    if tier != ShellTier::Compact
+        && app.status_items.contains(&crate::config::StatusItem::Balance)
+    {
+        let info = match app.balance_cell.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        if let Some(info) = info
+            && let Some(total) = info.total_balance_f64()
+            && total > 0.0
+        {
+            let symbol = match info.currency.as_str() {
+                "CNY" | "cny" => "¥",
+                _ => "$",
+            };
+            let label = if total >= 1000.0 {
+                format!("{symbol}{total:.0}")
+            } else if total >= 10.0 {
+                format!("{symbol}{total:.1}")
+            } else {
+                format!("{symbol}{total:.2}")
+            };
+            left.push(Span::styled(
+                " · ",
+                Style::default().fg(app.ui_theme.text_dim),
+            ));
+            left.push(Span::styled(
+                label,
+                Style::default().fg(app.ui_theme.text_muted),
+            ));
+        }
+    }
+
+    // Token usage chip: session-level input / cache-hit / output totals.
+    if tier != ShellTier::Compact
+        && app.status_items.contains(&crate::config::StatusItem::Tokens)
+    {
+        let session = &app.session;
+        let total = u64::from(session.total_input_tokens)
+            .saturating_add(u64::from(session.total_output_tokens));
+        if total > 0 {
+            let text =
+                crate::tui::footer_ui::format_token_count_compact(total);
+            left.push(Span::styled(
+                " · ",
+                Style::default().fg(app.ui_theme.text_dim),
+            ));
+            left.push(Span::styled(
+                format!("tok {text}"),
+                Style::default().fg(app.ui_theme.text_muted),
+            ));
+        }
+    }
+
     // Live phases keep the strip quiet: no detail-key chorus competing with
     // the ledger. Idle/typing may advertise keys on the quiet footer.
     // Hints come from shell_key_routing so advertised chords match handlers;
