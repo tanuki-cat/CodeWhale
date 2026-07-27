@@ -196,26 +196,20 @@ pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
         ));
     }
 
-    let cost = app.displayed_session_cost_for_currency(app.cost_currency);
-    let chip = crate::route_billing::usage_chip(
-        app.billing_presentation,
-        app.api_provider,
-        &app.model,
-        cost,
-        app.cost_currency,
-        None,
-    );
-    if let crate::route_billing::UsageChip::Money(amount) = chip
-        && tier != ShellTier::Compact
+    // Show cost in the underwater strip when the user has opted in via
+    // status_items (or the default footer includes Cost). Use the same
+    // cost-span function as the classic footer so both paths stay in sync.
+    if tier != ShellTier::Compact
+        && app.status_items.contains(&crate::config::StatusItem::Cost)
     {
-        left.push(Span::styled(
-            " · ",
-            Style::default().fg(app.ui_theme.text_dim),
-        ));
-        left.push(Span::styled(
-            amount,
-            Style::default().fg(app.ui_theme.text_muted),
-        ));
+        let cost_spans = crate::tui::footer_ui::footer_cost_spans(app);
+        if !cost_spans.is_empty() {
+            left.push(Span::styled(
+                " · ",
+                Style::default().fg(app.ui_theme.text_dim),
+            ));
+            left.extend(cost_spans);
+        }
     }
 
     if tier != ShellTier::Compact
