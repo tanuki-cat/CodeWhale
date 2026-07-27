@@ -652,33 +652,63 @@ pub fn canonical_model_name(model: &str) -> Option<&'static str> {
 
 /// Normalize a configured/runtime model name.
 ///
-/// Trims whitespace, preserves caller-provided case for already-valid model
-/// IDs, and only canonicalizes compact aliases like `deepseek-v4pro`.
-/// Non-DeepSeek or malformed names return `None`; DeepSeek's `/v1/models`
-/// endpoint is the authority on valid model IDs.
+/// Trims whitespace, strips context-window hints like `[1m]` / `[128k]` that
+/// Claude Code and other harnesses append, preserves caller-provided case for
+/// already-valid model IDs, and only canonicalizes compact aliases like
+/// `deepseek-v4pro`. Non-DeepSeek or malformed names return `None`; DeepSeek's
+/// `/v1/models` endpoint is the authority on valid model IDs.
 #[must_use]
 pub fn normalize_model_name(model: &str) -> Option<String> {
     let trimmed = model.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if let Some(canonical) = canonical_model_name(trimmed) {
+    // Strip trailing context-window hint e.g. `[1m]`, `[128k]` so the
+    // underlying model id (e.g. `deepseek-v4-pro`) survives pricing
+    // lookups. The hint is a harness convention, not an API model id.
+    let stripped = drop_trailing_context_hint(trimmed);
+    if let Some(canonical) = canonical_model_name(stripped) {
         return Some(canonical.to_string());
     }
 
-    let normalized = trimmed.to_ascii_lowercase();
+    let normalized = stripped.to_ascii_lowercase();
     if !normalized.starts_with("deepseek") && !normalized.contains("/deepseek") {
         return None;
     }
 
-    if trimmed
+    if stripped
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/'))
     {
-        return Some(trimmed.to_string());
+        return Some(stripped.to_string());
     }
 
     None
+}
+
+/// Strip a trailing context-window hint like `[1m]` or `[128k]` from a
+/// model name. These are harness conventions (Claude Code, Codex), not part
+/// of the API model id.
+fn drop_trailing_context_hint(model: &str) -> &str {
+    let bytes = model.as_bytes();
+    let len = bytes.len();
+    // Pattern: `[` + digits + `k` or `m` + `]` at the very end
+    if len < 4 || bytes[len - 1] != b']' {
+        return model;
+    }
+    // Scan backwards for the matching `[`
+    let mut i = len - 2;
+    while i > 0 && bytes[i].is_ascii_digit() {
+        i -= 1;
+    }
+    if i > 0
+        && (bytes[i] == b'k' || bytes[i] == b'm')
+        && bytes[i - 1] == b'['
+        && i + 1 < len - 1
+    {
+        return &model[..i - 1];
+    }
+    model
 }
 
 #[must_use]
@@ -1081,6 +1111,10 @@ pub fn canonical_model_id_for_provider(provider: ApiProvider, model: &str) -> Op
     if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
         return None;
     }
+    // Strip trailing context-window hints (`[1m]`, `[128k]`, …) so
+    // pricing lookups see the real API model id regardless of which
+    // harness attached the hint.
+    let trimmed = drop_trailing_context_hint(trimmed);
 
     // OpenCode Go is a strict protocol slice: its live `/models` response also
     // advertises Anthropic-Messages-only models, but this provider sends OpenAI
