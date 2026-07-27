@@ -676,10 +676,12 @@ fn provider_owned_hand_pricing_at(
     let model_lower = model.trim().to_ascii_lowercase();
     let provider_owns_row = match provider {
         ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic => {
-            matches!(
-                model_lower.as_str(),
-                "deepseek-v4-pro" | "deepseek-v4-flash"
-            )
+            // `pricing_for_model_at` already routes every DeepSeek id to
+            // either v4-pro or v4-flash pricing (and rejects NIM-hosted
+            // `deepseek-ai/` prefixes).  Accept any model that starts
+            // with `deepseek` so cost is never Unknown for first-party
+            // DeepSeek routes.
+            model_lower.starts_with("deepseek")
         }
         ApiProvider::Openai => matches!(
             model_lower.as_str(),
